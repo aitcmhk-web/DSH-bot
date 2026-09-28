@@ -50,13 +50,22 @@
 | `weixinToken` / `weixinApiRoot` / `weixinAccountFile` | 微信入口（通常用扫码登录，不用填 token） |
 | `routes` + `defaultRouteKey` | 手工指定模型档位；留空 = 自动跟随 web 端「设置 → 模型」 |
 | `cwd` | 模型的工作目录 |
-| `memoryDir` / `memoryScript` | handoff 记忆接续的存储与脚本（不填就没有记忆） |
+| `memoryDir` / `memoryScript` | handoff 记忆接续：**默认开启**（`<工作目录>/memory` + 插件自带的记账程序），不用配；要关闭把 memoryDir 设成空串 |
 | `turnTimeoutMs` | 单轮超时，默认 30 分钟 |
 | `asrBackend` / `asrWhisperBin` / `asrPythonBin` | 语音转文字（不填则语音报"没配"） |
 
 ## 指令
 
 `/whoami` `/status` `/model` `/new`（新会话） `/help`
+
+## 记忆（流水账 + handoff）
+
+默认开启，什么都不用配：
+
+- **流水账**：每轮对话原文追加到 `<工作目录>/memory/conversation-cache/raw/ledger/`，按月一个文件，只增不删。
+- **handoff**：`/new`、切换模型（本次会话满 20 条才写，调试期反复切不会覆盖）和启动补写时，把最近 20 条进展落盘到 `<工作目录>/memory/handoff/handoff.md`。
+- 记账程序随插件自带（`vendor/conversation-cache/`），不依赖机器上是否装过 DSH 的其它项目。
+- 想换位置或关闭：配置里写 `memoryDir`（自定路径；**空串 = 关闭**）、`memoryScript`（自定程序路径）。
 
 ## 微信入口（扫码绑定）
 

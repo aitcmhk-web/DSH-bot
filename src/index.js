@@ -18,9 +18,11 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { writeFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Schema } from './schema.js';
 import { Telegram } from './telegram.js';
 import { Weixin } from './weixin.js';
@@ -63,8 +65,8 @@ export const Config = Schema.object({
 
   // ---- 工作区与记忆 ----
   cwd: Schema.string().description('会话工作目录。留空 = 用 DSH 当前目录'),
-  memoryDir: Schema.string().description('记忆目录（每项目独占）。留空 = 不启用 handoff'),
-  memoryScript: Schema.string().description('共享的 cache-manager.mjs 路径（记账用）'),
+  memoryDir: Schema.string().description('记忆目录（每项目独占）。不填 = 默认 <工作目录>/memory；显式填空串 = 关闭记忆'),
+  memoryScript: Schema.string().description('共享的 cache-manager.mjs 路径。不填 = 用插件自带的 vendor/conversation-cache/cache-manager.mjs'),
 
   // ---- 行为 ----
   backlogMaxAgeSeconds: Schema.number().default(2 * 60 * 60)
@@ -168,7 +170,14 @@ export function apply(ctx, config) {
     for (const [pid, p] of Object.entries(providers)) {
       const models = (Array.isArray(p?.models) ? p.models : []).filter((m) => m?.id);
       if (models.length === 0) continue;
-      if (live.size > 0 && !live.has(pid)) continue;
+      // ⚠️ 这里**刻意不**按 `llm.listProviders()` 过滤 —— 曾经写过
+      //    `if (live.size > 0 && !live.has(pid)) continue;`，后果是：
+      //    pi-ai 只在「provider 名单」变化时才重注册（dsh-llm-pi-ai/lib/index.js:2643
+      //    ensureRegistrationFacts → provider 集合没变就直接 return），
+      //    所以给**已有** provider 加模型、或 web 端刚加好 provider 还没重启时，
+      //    这个 live 集合是**旧的**，新档位会被静默剔出菜单 —— 菜单里点得到、
+      //    一切就 `SDK initialize failed: provider "zhipu" ...`（2026-09-28 实测）。
+      //    settings 是配置的单一事实源，live 集合只配当「可选诊断」，不配当过滤器。
       const label = p?.displayName ?? pid;
       for (const m of models) {
         list.push({
@@ -178,7 +187,14 @@ export function apply(ctx, config) {
           provider: pid,
           model: m.id,
           displayName: m.name ?? m.id,
-          reasoningEffort: p?.reasoning ?? 'off',
+          // ⚠️ 没声明就是**不发** reasoningEffort（undefined = 用模型自己的默认档）。
+          //    原先是 `p?.reasoning ?? 'off'`，当场上线就炸：pi-ai 把 glm-5.3-flash 的
+          //    thinkingLevelMap.off 钉成 null（只认 low/high/max），传 "off" 直接
+          //    UNSUPPORTED_REASONING_EFFORT，SDK initialize failed、整档切不过去。
+          //    ⛔ 别再用 undefined 表达"没声明"：JSON 会把值为 undefined 的键丢掉，
+          //    读的人分不清"没声明"和"没看见"，于是又落回兜底值 —— 当天踩过两遍。
+          //    统一写 'none'（= 一个字节都不发），与 sync-from-web.mjs 口径一致。
+          reasoningEffort: p?.reasoning ?? 'none',
           isDefault: def?.provider === pid && def?.model === m.id,
         });
       }
@@ -204,7 +220,9 @@ export function apply(ctx, config) {
           provider: 'deepseek-official',
           model: id,
           displayName: m?.name ?? id,
-          reasoningEffort: dsSection.reasoningEffort ?? 'off',
+          // 同上：deepseek 目录里 reasoningEffort 没配就是 'none' = 不发，交给模型默认。
+          // 配了才发（bot 的 web 端 settings.yaml 里 llm-deepseek.reasoningEffort: off 是显式配置）。
+          reasoningEffort: dsSection.reasoningEffort ?? 'none',
           isDefault: def?.provider === 'deepseek-official' && def?.model === id,
         });
       }
@@ -226,10 +244,23 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------------------
   // 记忆（handoff）
   // -------------------------------------------------------------------------
-  const memory = config.memoryDir
+  // 记忆默认「装上就开」：数据落在工作目录的 memory/，程序用插件自带的
+  // vendor/conversation-cache/（别的机器上没有 DSH 仓库，程序必须随包自带）。
+  // 用户显式填 memoryDir 就用他的；显式填**空串**才关闭（不填 = undefined = 用默认）。
+  const vendorMemoryScript = join(
+    dirname(fileURLToPath(import.meta.url)),
+    '..',
+    'vendor',
+    'conversation-cache',
+    'cache-manager.mjs',
+  );
+  const memoryDir = config.memoryDir === undefined
+    ? join(config.cwd || process.cwd(), 'memory')
+    : config.memoryDir || null;
+  const memory = memoryDir
     ? new Memory({
-        memoryDir: config.memoryDir,
-        memoryScript: config.memoryScript || null,
+        memoryDir,
+        memoryScript: config.memoryScript || (existsSync(vendorMemoryScript) ? vendorMemoryScript : null),
         log,
         error,
       })
@@ -660,6 +691,18 @@ export function apply(ctx, config) {
           return true;
         }
         const chatKey = `tg:${chatId}`;
+        // 切模型 = 旧会话即将作废（换档重建），断开前先写 handoff —— 与老 bot 同口径：
+        // 本次会话 ≥20 条才写，调试期间反复切模型不会覆盖已有记忆。
+        if (memory) {
+          memory.maybeWriteHandoff({
+            sessionId: runtime.sessionIdOf(chatKey) ?? chatKey,
+            reason: 'model',
+            currentRoute: () => activeRoute,
+            ownerUserId: state.ownerUserId,
+            workspace: config.cwd || process.cwd(),
+            sessionCreatedAt: sessionCreatedAt.get(chatKey) ?? 0,
+          });
+        }
         const switched = await runtime.switchRoute(chatKey, wanted);
         if (switched.ok) {
           if (!useHostRoutes) activeRoute = wanted;

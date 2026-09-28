@@ -31,16 +31,27 @@ export function isLocalRoute(provider, routes = BUILTIN_ROUTES) {
 }
 
 /**
- * 每档的思考强度。`null` = 不发该字段（用模型默认）；`undefined` = 用兜底值。
+ * 每档的思考强度。口径与根目录 models.js **必须逐字一致**（两份是同一个决定，别只改一份）。
  *
- * @param {{reasoningEffort?: string|null}|null|undefined} route
+ * 现象（2026-09-28 真炸过）：切到没声明思考强度的档，报了
+ *   `does not support reasoning effort "off"` —— 根因是"没声明"被当成了"按兜底值发"。
+ * pi-ai 判定的是**参数有没有出现**：不出现 = 可以，出现了（哪怕值是 off）= 拒。
+ *
+ * 口径：`'none'` / 空 / 没写 → 不发；`'off'` / `low` / `high` … → 原样发；
+ * 兜底值 `fallback` **只**给显式配置的档位兜底，没有兜底可言的档一律不发。
+ *
+ * @param {{key?:string, reasoningEffort?: string|null}|null|undefined} route
  * @param {string|undefined} fallback
- * @returns {string|undefined}
+ * @returns {string|undefined} undefined = 这个参数一个字节都不发
  */
 export function reasoningEffortFor(route, fallback) {
   if (!route) return fallback;
-  if (route.reasoningEffort === null) return undefined;
-  return route.reasoningEffort ?? fallback;
+  const declared = typeof route.reasoningEffort === 'string' ? route.reasoningEffort.trim() : '';
+  if (declared === 'none') return undefined;
+  if (declared) return declared;
+  // 显式配置进来的档位才算"有来源"，其余（宿主 web 端同步来的）没声明就是不发。
+  if (Array.isArray(route.__allRoutes) && route.__allRoutes.some((r) => r.key === route.key)) return undefined;
+  return fallback;
 }
 
 /**
