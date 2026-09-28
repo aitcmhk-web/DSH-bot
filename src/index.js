@@ -18,6 +18,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { writeFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -67,6 +68,7 @@ export const Config = Schema.object({
   cwd: Schema.string().description('会话工作目录。留空 = 用 DSH 当前目录'),
   memoryDir: Schema.string().description('记忆目录（每项目独占）。不填 = 默认 <工作目录>/memory；显式填空串 = 关闭记忆'),
   memoryScript: Schema.string().description('共享的 cache-manager.mjs 路径。不填 = 用插件自带的 vendor/conversation-cache/cache-manager.mjs'),
+  restartCommand: Schema.string().description('重启用的启动器 .command 路径。不填 = 默认找 <工作目录>/启动-mybot.command；找不到且拿不到原始命令行时，/restart 退化为只重开会话'),
 
   // ---- 行为 ----
   backlogMaxAgeSeconds: Schema.number().default(2 * 60 * 60)
@@ -665,6 +667,38 @@ export function apply(ctx, config) {
    *
    * @returns {Promise<boolean>} true = 已处理（调用方不要再当普通消息发）
    */
+  /**
+   * 组装重启接力脚本的环境变量；无法安全拉起时返回 null（/restart 退化为只重开会话）。
+   *
+   * 两条拉起路径：
+   *   ① 启动器（macOS 安装包用户）：配置 restartCommand 或 <工作目录>/启动-mybot.command，
+   *      helper 用 `open` 重开一个新的终端窗口；
+   *   ② 原始命令行：把本进程的 node + 脚本 + 参数原样交给 helper nohup 拉起（尽力而为，
+   *      宿主原先是终端窗口的话，那个窗口会结束、bot 转后台）。
+   */
+  function restartPlanEnv() {
+    const cwd = config.cwd || process.cwd();
+    const launcher = config.restartCommand || join(cwd, '启动-mybot.command');
+    const hasLauncher = Boolean(launcher) && existsSync(launcher);
+    const [, scriptPath, ...extraArgs] = process.argv;
+    if (!hasLauncher && !scriptPath) return null;
+    return {
+      RESTART_DELAY_SECONDS: '8',
+      RESTART_TARGET_PID: String(process.pid),
+      RESTART_LOG: join(cwd, 'dsh-restart.log'),
+      ...(hasLauncher ? { RESTART_LAUNCHER: launcher } : {}),
+      ...(scriptPath
+        ? {
+            RESTART_NODE: process.execPath,
+            RESTART_SCRIPT: scriptPath,
+            RESTART_ARGS: extraArgs.join(' '),
+            RESTART_CWD: cwd,
+          }
+        : {}),
+      ...(config.telegramToken ? { RESTART_TG_TOKEN: config.telegramToken } : {}),
+    };
+  }
+
   async function handleCommand(chatId, userId, command, arg = '') {
     switch (command) {
       case '/whoami':
@@ -758,12 +792,37 @@ export function apply(ctx, config) {
             workspace: config.cwd || process.cwd(),
           });
         }
+        // 真·重启：动作交给**进程外**的接力脚本（spawn detached → setsid 独立进程组），
+        // 由它延迟几秒后杀宿主进程树、再拉起新宿主 —— 与老 bot 的 restart-helper.sh 同路。
+        // 插件自己绝不能动手：自杀 = 当前回合被 dispose，连确认消息都发不出去。
+        const helper = join(dirname(fileURLToPath(import.meta.url)), '..', 'restart-helper.sh');
+        const planEnv = restartPlanEnv();
+        if (existsSync(helper) && planEnv) {
+          const child = spawn('/bin/bash', [helper], {
+            detached: true,
+            stdio: 'ignore',
+            env: { ...process.env, ...planEnv },
+          });
+          child.unref();
+          await telegram.sendMessage(
+            chatId,
+            [
+              '♻️ 已收到重启指令（上一段进展已留档）。',
+              `约 ${planEnv.RESTART_DELAY_SECONDS} 秒后重启进程，以加载新代码。`,
+              '',
+              '重启完成后请发任意一条消息唤醒 —— 新会话会自动带上刚才的记忆。',
+            ].join('\n'),
+          );
+          return true;
+        }
+        // 拉不起新进程（没有 helper/启动器/命令行）→ 退回「只重开会话」，
+        // 绝不能让 bot 凭空消失。
         await runtime.closeSession(chatKey);
         sessionCreatedAt.set(chatKey, Date.now());
         await telegram.sendMessage(
           chatId,
           '🔄 已重开会话，上一段进展已留档（下一条消息自动带回）。\n'
-          + '⚠️ 插件版重启不动进程 —— 要加载新代码：在启动窗口 Ctrl-C，再双击 启动-mybot.command。',
+          + '⚠️ 没找到重启接力脚本/启动器，进程没法自动拉起 —— 加载新代码请手动重启。',
         );
         return true;
       }
@@ -774,7 +833,7 @@ export function apply(ctx, config) {
           [
             '可用命令：',
             '/new — 开新会话（并写 handoff）',
-            '/restart — 重开会话（无条件写 handoff）',
+            '/restart — 重启进程加载新代码（先留档再重启）',
             '/model — 查看/切换模型',
             '/status — 查看插件状态',
             '/whoami — 查看你的用户 ID',

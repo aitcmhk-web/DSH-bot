@@ -51,14 +51,15 @@
 | `routes` + `defaultRouteKey` | 手工指定模型档位；留空 = 自动跟随 web 端「设置 → 模型」 |
 | `cwd` | 模型的工作目录 |
 | `memoryDir` / `memoryScript` | handoff 记忆接续：**默认开启**（`<工作目录>/memory` + 插件自带的记账程序），不用配；要关闭把 memoryDir 设成空串 |
+| `restartCommand` | 重启用的启动器 .command 路径；不填默认找 `<工作目录>/启动-mybot.command` |
 | `turnTimeoutMs` | 单轮超时，默认 30 分钟 |
 | `asrBackend` / `asrWhisperBin` / `asrPythonBin` | 语音转文字（不填则语音报"没配"） |
 
 ## 指令
 
-`/whoami` `/status` `/model` `/new`（新会话） `/restart`（重开会话+留档） `/help`
+`/whoami` `/status` `/model` `/new`（新会话） `/restart`（重启进程，先留档） `/help`
 
-> `/restart` 重开的是**会话**，不动进程（插件杀不掉宿主）。要加载新代码：启动窗口 Ctrl-C 后再双击 `启动-mybot.command`。
+> `/restart` 与老 bot 同路：先把进展写进 handoff，再由**进程外的接力脚本**延迟几秒杀掉宿主并重新拉起（有 `启动-mybot.command` 就重开终端窗口；没有就按原始命令行后台拉起）。两者都没有时退化为只重开会话。重启完成后发条消息，新会话自动带上刚才的记忆。
 
 ## 记忆（流水账 + handoff）
 
