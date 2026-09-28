@@ -2,7 +2,7 @@
  * 本插件自带的「消息构造」——**故意不 import DSH 的内部包**。
  *
  * ⭐ 为什么要自己写（而不是 `import { createUserMessage } from '@deepseek-ai/dsh-llm'`）：
- *   实测从插件目录向上**找不到**任何 `@deepseek-ai/*` 包（见 probe-resolution.mjs 的输出，
+ *   从插件目录向上找不到任何 @deepseek-ai/* 包（
  *   全部 MODULE_NOT_FOUND）。DSH 的包只装在 `~/.dsh/profiles/node_modules/` 和
  *   npx 缓存里，跟本插件不在同一条解析链上。
  *

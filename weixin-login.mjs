@@ -1,12 +1,8 @@
 #!/usr/bin/env node
 /**
- * 微信扫码登录（dsh-botplugin 版）—— 从 BOT 的 weixin-login.mjs 移植。
+ * 微信扫码登录（dsh-botplugin）。
  *
- * 与原版的**唯一差别**（其余流程逐行同构，含全部实测坑修复）：
- *   · 凭据落盘路径不写死在脚本目录 —— `--out <path>` 指定（安装器会生成
- *     指好的 启动命令），其次环境变量 WEIXIN_ACCOUNT_FILE，最后才回落
- *     当前目录 ./weixin-account.json。多用户/多实例各自指各自的文件。
- *   · 结尾提示改成「重启你的 bot」—— 插件没有 bot.sh。
+ * 凭据落盘路径：--out <path> > 环境变量 WEIXIN_ACCOUNT_FILE > ./weixin-account.json。
  *
  * 用法:
  *   node weixin-login.mjs                # 终端渲染二维码
@@ -22,13 +18,10 @@
  *
  * 扫码者 = bot 的「主人」，只允许他使用。
  *
- * ⚠️ 两个已知坑（2026-09-13 实测，原版注释照录）:
- *   - 接口返回的 `qrcode_img_content` **是 URL 不是图片**。必须把它编码成二维码
- *     去扫；直接把这个 URL 拷进**电脑浏览器**会显示「二维码已过期」——
- *     那个页面是给微信内打开的。要在手机上用时，把链接发到微信里再点开。
- *   - **二维码实测约 2 分钟就过期**（2026-09-13 探测：125.6s 时服务端返回
- *     `expired`）。过期后本脚本会自动刷新，旧码立即作废，以最新一次为准。
- *     所以别慢慢复制链接 —— 直接扫屏幕。
+ * 已知行为（重要）:
+ *   - 接口返回的 qrcode_img_content 是 URL 不是图片：把它编成二维码去扫。
+ *     备用链接发到手机微信里点开（电脑浏览器打开会显示「已过期」）。
+ *   - 二维码约 2 分钟过期，脚本会自动刷新，旧码作废 —— 直接扫屏幕。
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname, resolve as resolvePath } from 'node:path';
@@ -160,10 +153,8 @@ async function main() {
   console.log(`微信扫码登录 — 凭据将保存到：${ACCOUNT_FILE}`);
   console.log('正在向微信申请二维码…');
 
-  // ⚠️ 为什么默认**不回传**旧 botId（2026-09-19 实测，原版注释照录）：
-  //    旧 botId 若在服务端已失效，服务端直接拒绝整个申请（ret:-3），
-  //    连二维码都不给 —— 那正是「想重扫但扫不了」的真凶。
-  //    ⇒ 默认全新建 bot（空列表）。要沿用旧 bot 时用 `--reuse` 显式打开。
+  // 默认不回传旧 botId：旧凭据在服务端已失效时，整个申请会被拒绝（ret:-3），
+  //    连二维码都拿不到。要沿用旧 bot 时用 --reuse 显式打开。
   const REUSE = process.argv.includes('--reuse');
   let localTokenList = [];
   if (REUSE) {

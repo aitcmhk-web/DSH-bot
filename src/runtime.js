@@ -1,31 +1,18 @@
 /**
- * BotRuntime —— 插件版的「会话运行时」。
+ * BotRuntime —— 会话运行时。
  *
- * ⭐ 它替换掉 BOT 的 `dsh.js`（那个 spawn `dsh --profile sdk` 子进程、说 JSON-RPC 的桥）。
+ * 建会话、投递用户消息、把回答转成事件，全部通过宿主的 `ctx.agents` 服务完成
+ * （调用顺序与官方 dsh-sdk-jsonrpc-server 一致）。
  *
- *   为什么能替换：BOT 靠子进程做的事只有三件 ——
- *     ① 建会话；② 把用户消息塞进去；③ 把回答/状态转成事件。
- *   而插件**已经住在 DSH 进程里**，这三件事由宿主的 `ctx.agents` 服务直接提供
- *   （官方 `dsh-sdk-jsonrpc-server` 就是这么用的，本文件的调用顺序照抄它）。
- *   多出来的那个子进程在插件版里没有存在意义 —— 它是「进程外桥」，插件是进程内。
- *
- * ⚠️ 与 BOT 版的一处**行为差异**（必须记住，否则会当成 bug）：
- *   BOT 切模型 = 重启子进程（`DshRuntime.restart()`）。
- *   插件版**没有子进程可重启**，模型在 `agents.create({agentOptions})` 时就定死了；
- *   官方接口只提供 `resume(resumeSessionId)`（续一个**已持久化**的会话），
- *   没有「给活着的 agent 换模型」。
- *   因此切档实现为：**dispose 旧会话 → 按新档 create 新会话**。
- *   副作用是上下文不跨档保留（BOT 版重启后靠 handoff 接续，这里同理）。
- *
- * ⚠️ 本文件内的所有 ctx.* 调用均照抄官方 sdk-jsonrpc-server 的用法；
- *    未在本机实跑过（插件还没挂进 DSH），标 ⚠️ 推断。
+ * 切模型：模型在 agents.create({agentOptions}) 时定死，宿主接口只提供
+ * resume(resumeSessionId) 续已持久化的会话，没有「给活着的 agent 换模型」，
+ * 因此切档 = dispose 旧会话 → 按新档建新会话；上下文不跨档保留，
+ * 由 handoff 记忆负责衔接。
  */
 
-// ⚠️ 这里**故意不 import 任何 @deepseek-ai/* 包** —— 实测解析不到（probe-resolution.mjs）。
-//    需要的东西只有两样，都已本地实现：
-//      · brandString  → 官方实现就是 `return value`（dsh-brand/lib/index.js），纯类型标记，
-//                       运行时什么都不做 → 直接传字符串，连替代函数都不需要。
-//      · createUserMessage → 见 src/message.js。
+// 故意不 import 任何 @deepseek-ai/* 包；需要的东西都已本地实现：
+//   · brandString → 官方实现就是 return value（纯类型标记），直接传字符串即可。
+//   · createUserMessage → 见 src/message.js。
 import { createUserMessage, textContent } from './message.js';
 
 /** 会话 id 的插件内前缀，避免与宿主其它来源的会话撞名。 */
@@ -55,9 +42,7 @@ const logErr = (...args) => console.error('[botplugin]', ...args);
  * 一个 chat（Telegram 私聊 / 微信）对应一个 DSH 会话。
  *
  * chatKey：插件内部给会话起的稳定标识（TG 用 `tg:<userId>`，微信用 `wx:<id>`）。
- * 用字符串而不是裸数字，是因为 BOT 版有个历史包袱 —— TG 和微信**共用同一个
- * chatId**（都锚在 ownerUserId 上，见 BOT/bot.js:66）。插件版不要那个耦合：
- * 两端各自一个 key，谁先绑定谁先有会话。
+ * 两端各自一个 key，互不耦合；谁先绑定谁先有会话。
  */
 export class BotRuntime {
   /** @type {Map<string, {handle: object, routeKey: string|null}>} */
@@ -93,10 +78,8 @@ export class BotRuntime {
     this.#ctx = ctx ?? null;
     if (route) this.#defaultRoute = route;
     if (cwd) this.#cwd = cwd;
-    // ⚠️ ctx 级事件订阅必须在这里挂，不能等到第一个会话创建时再挂。
-    //    理由：`ctx.on('session/event')` 跟具体 agent 无关，
-    //    而建会话那一刻才挂 = 订阅之前的事件全部丢失（实测：挂载后
-    //    ctx 上监听数为 0，要靠 30 分钟超时才拿得到答案）。
+    // ctx 级事件订阅必须在构造时就挂上：ctx.on('session/event') 跟具体 agent
+    //    无关，等到建会话才挂会丢掉之前的事件。
     this.#bridgeCtxEvents();
   }
 
@@ -124,8 +107,7 @@ export class BotRuntime {
    *    `this.ctx.agents.create(...)` / `this.ctx.agents.get(...)`。
    *    之前写成 `ctx?.get('agents')` 是错的 —— 而且 `?.` 只挡 `ctx` 为 null，
    *    挡不住「没有 get 方法」，于是运行到建会话那一刻才炸：
-   *    `TypeError: this[#ctx]?.get is not a function`（实测复现）。
-   *    加 `typeof` 兜底，让缺服务时给出可读错误而不是 TypeError。
+   *    加 typeof 兜底，缺服务时给出可读错误而不是 TypeError。
    */
   #agents() {
     const ctx = this.#ctx;
@@ -150,9 +132,7 @@ export class BotRuntime {
   /**
    * 给某个 chat 发一条用户消息。会话不存在就按当前档位建一个。
    *
-   * ⚠️ 这是**排队**语义（`followup` 立即返回），回答要靠事件收 ——
-   *    与 BOT 版 `session/prompt` 的语义一致（那边也是发完等 `session.event`）。
-   *    调用方不要指望返回值里有回答。
+   * 这是排队语义（followup 立即返回），回答靠事件收，不在返回值里。
    *
    * @param {string} chatKey 会话标识，如 'tg:123456789'
    * @param {string|Array<object>} content 文本，或已构造好的内容块数组
@@ -239,17 +219,10 @@ export class BotRuntime {
   // 事件与「等一轮回答」
   // -------------------------------------------------------------------------
   //
-  // ⚠️ 为什么需要这一层：`agent.followup()` 是**排队语义**，它立刻返回，
-  //    回答不在返回值里 —— 只能靠订阅事件收。BOT 版对应的是
-  //    `DshRuntime.createTurnWaiter()` + `session-event`（bot.js:1041-1066）。
-  //
-  // ⚠️ BOT 里订阅的**事件名是 `session-event`**，但那是 BOT 自己的
-  //    `DshRuntime` 起的名字（它从子进程的 JSON-RPC 通知里转出来的）。
-  //    插件版活在 DSH 进程内，没有那层转发，所以要直接挂到 agent 身上。
-  //    DSH 的 agent 事件名**未在本机实跑验证**（插件还没挂进 DSH），
-  //    因此这里**三种挂法都试**（agent.on / ctx.on / ctx.agents.on 的
-  //    'session/event' 与 'session-event'），谁能收谁收，收不到就靠超时兜底。
-  //    ⚠️ 标 推断：事件名与 `event.type` 的取值需要挂载后实跑确认。
+  // agent.followup() 是排队语义，回答只能靠订阅事件收。
+  //    不同宿主版本的事件挂点与命名略有差异，所以三种挂法都试
+  //    （agent.on / ctx.on / ctx.agents.on 的 'session/event' 与 'session-event'），
+  //    谁能收谁收，收不到就靠超时兜底。
 
   /**
    * 挂上会话事件监听。
@@ -259,10 +232,8 @@ export class BotRuntime {
    */
   onSessionEvent(handler) {
     this.#subscribers.add(handler);
-    // ⚠️ 这里**只**登记到 #subscribers，不再往 agent.on 上直接挂。
-    //    两处都挂会让同一个 handler 被调用两次（agent 事件已由
-    //    #bridgeAgentEvents 转进 #emitSessionEvent），而且绕过错误隔离 ——
-    //    一个订阅者抛错会顺着 agent 的事件链把别的订阅者一起带崩（实测复现）。
+    // 只登记到 #subscribers，不往 agent.on 上重复挂：两处都挂同一个 handler
+    //    会被调两次，还绕过错误隔离（一个订阅者抛错会带崩事件链上的其他订阅者）。
     return () => {
       this.#subscribers.delete(handler);
     };
@@ -271,10 +242,8 @@ export class BotRuntime {
   /**
    * 把事件派发给所有订阅者。
    *
-   * ⚠️ **为什么要有这一层、而不是直接靠 agent.on**：会话是**懒建**的 ——
-   *    监听挂载的时刻可能还没有 agent，那时 `agent.on` 没东西可挂，
-   *    事件就永远收不到（实测复现：waitForTurn 先于 prompt 调用 → 挂不上）。
-   *    所以内部统一走这个口子，谁订阅谁收到，与会话建立的先后无关。
+   * 会话是懒建的：监听挂载时可能还没有 agent，直接挂 agent.on 会收不到事件。
+   *    统一走这个口子，谁订阅谁收到，与会话建立的先后无关。
    *
    * @param {{sessionId:string, event:object}} payload
    */
@@ -287,9 +256,8 @@ export class BotRuntime {
   /**
    * 等某个会话的一轮结束。
    *
-   * ⚠️ 必须带超时。BOT 用的就是 30 分钟（bot.js:1107「等待回复超时(30 分钟)」）——
-   *    没有超时的话，模型卡住会让这个 chat 的队列**永久堵死**，
-   *    表现就是「发消息永远不回、日志里什么都没」。
+   * 必须带超时（30 分钟）：模型卡住时没有超时会让这个 chat 的队列永久堵死，
+   *    表现就是发消息永远不回、日志里什么都没有。
    *
    * @param {string} chatKey
    * @param {number} timeoutMs
@@ -331,7 +299,7 @@ export class BotRuntime {
           return;
         }
 
-        // 助手文字：**整轮覆盖**，不是累加（与 BOT 一致，bot.js:1064）
+        // 助手文字按整轮覆盖，不是累加
         if (event?.type === 'assistant/message') {
           const content = event.data?.message?.content;
           if (!Array.isArray(content)) return;
@@ -352,8 +320,7 @@ export class BotRuntime {
   async #ensureSession(chatKey) {
     const existing = this.#sessions.get(chatKey);
     if (existing) {
-      // ⚠️ agent 可能被外部（宿主 / preset 卸载）dispose 掉，必须复查 ——
-      //    BOT 版踩过同类坑：pidfile 在 ≠ 进程活着（AGENTS.md 三.13）。
+      // agent 可能被宿主外部 dispose，必须复查它还活着
       const live = this.#ctx?.agents?.get(existing.handle.agent.id) === existing.handle.agent;
       if (live) return { ok: true, handle: existing.handle, created: false };
       log(`session for ${chatKey} was disposed outside botplugin; recreating`);
@@ -380,10 +347,9 @@ export class BotRuntime {
     if (!route?.provider || !route?.model) {
       return { ok: false, error: 'no model route configured for botplugin' };
     }
-    // ⚠️ 启动竞态（2026-09-28 真宿主实测）：`inject:['agents']` 只保证服务对象在，
-    //    不保证 agent-loop 已把工厂 setFactory 进去（dsh-agent-loop/lib/index.js:1533）。
+    // 启动时序：inject:['agents'] 只保证服务对象在，不保证 agent 工厂已注册。
     //    第一条消息可能赶在工厂注册前进来，create/resume 会抛
-    //    "no agent factory registered"。这是纯时序问题，等一等就好 —— 最多 30s。
+    //    "no agent factory registered" —— 纯时序问题，等一等就好（最多 30s）。
     const deadline = Date.now() + 30000;
     for (;;) {
       try {
@@ -442,12 +408,9 @@ export class BotRuntime {
    * ⚠️ 会话是懒建的，订阅却可能更早发生，所以每个新建的 agent 都要在这里
    *    "接线"，不能只在 onSessionEvent 里挂一次。
    *
-   * ✅ 依据官方写法（sdk-jsonrpc-server/lib/index.js:68）：事件挂在 **ctx** 上，
-   *    回调签名是 `(session, event)`。所以这里不再往 agent.on 上挂 ——
-   *    那是之前基于 BOT 的 `session-event` 猜测写出来的，挂不上也静默降级。
-   *
-   *    订阅一次即可（ctx 级），不用每个 agent 接线；但为了兼容「agent 上也能挂」
-   *    的宿主版本，仍然尝试 agent.on 作为补充，两条路都收，重复由调用方幂等处理。
+   * 官方写法（sdk-jsonrpc-server/lib/index.js:68）：事件挂在 ctx 上，
+   *    回调签名是 (session, event)。为了兼容「agent 上也能挂」的宿主版本，
+   *    仍尝试 agent.on 作为补充，两条路都收，重复由调用方幂等处理。
    *    挂不上只记日志，不抛错 —— 还有 waitForTurn 的超时兜底。
    */
   #bridgeAgentEvents(agent) {
@@ -455,12 +418,10 @@ export class BotRuntime {
     let bound = 0;
 
     // ① 首选：ctx 级订阅，官方签名 (session, event)
-    //    ⚠️ 只挂一次（构造函数里已挂）。重复挂会让同一条事件派发两次，
-    //       订阅者看到的答案虽然一样，但所有下游副作用都会翻倍。
-    //    ⚠️ #ctxBridged 只在**真的挂上**时才置位（2026-09-28 真宿主教训）：
-    //       构造期 ctx.on 可能抛 "cannot create effect on inactive context"
-    //       （sdk-app 组合的 stdin-EOF 关停竞态），提前置位会把第一次
-    //       #create 时的补挂机会也堵死 —— 那次实测 agent 级订阅救了场。
+    //    只挂一次（构造函数里已挂），重复挂会让同一条事件派发两次。
+    //    #ctxBridged 只在真的挂上时才置位：构造期 ctx.on 可能抛
+    //    "cannot create effect on inactive context"（宿主正在关停），
+    //    提前置位会堵死 #create 时的补挂机会。
     const ctx = this.#ctx;
     if (!this.#ctxBridged && ctx && typeof ctx.on === 'function') {
       let ctxBound = 0;

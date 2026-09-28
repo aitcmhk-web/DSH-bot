@@ -2,7 +2,7 @@
  * Schema —— Schemastery 的最小可用替身。
  *
  * ⚠️ **为什么需要这个文件**：官方插件用 `@deepseek-ai/schemastery` 的 `Schema`
- *    来声明 `Config`。但从插件目录**解析不到这个包**（实测见 probe-resolution.mjs：
+ *    来声明 Config。但从插件目录解析不到这个包（
  *    在 `botplugin/` 下 Node 向上找 node_modules 什么也找不到，而 `NODE_PATH`
  *    对 ESM 无效）。插件要能发布给别人，就不能依赖「恰好装在某台机器的某个位置」。
  *
@@ -144,12 +144,10 @@ class Field {
    *        else return result.value;
    *    它**不调** `.validate()`，只认 `'~standard'`。
    *
-   *    🔴 实测事故（2026-09-28，第一次真挂进 DSH）：本文件原先只有 `.validate()`，
-   *    宿主启动直接崩在 `Cannot read properties of undefined (reading 'validate')`
-   *    —— `Config['~standard']` 是 undefined。假宿主从不读这个属性，
-   *    所以 5 项自测全绿却挂不上，属于「自测覆盖不到真契约」的典型。
+   *    只有 .validate() 而没有这个 getter 的实现，宿主启动时会崩在
+   *    「Cannot read properties of undefined (reading 'validate')」。
    *
-   * ⚠️ 契约细节（照官方 resolveConfig 反推）：
+   *    契约细节（照官方 resolveConfig 反推）：
    *    - 返回**同步**对象；返回 Promise 会抛「Async config validation is not supported」。
    *    - 失败用 `issues` 表达，**不是**抛错。
    *    - 成功用 `value` 带出补好默认值的配置。

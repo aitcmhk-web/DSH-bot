@@ -1,37 +1,22 @@
 /**
- * 记忆/流水账读写 —— 从 BOT/bot.js 搬运而来。
+ * 记忆/流水账读写。
  *
- * ⚠️ 搬运时**唯一真正改动的语义**（其余是等价重写）：
+ * 设计要点：
+ *   ① 所有路径构造时传入（`memoryDir` 记忆数据目录、`memoryScript` 记忆程序），
+ *      不假设装在哪个目录。
+ *   ② 记忆程序是共享程序、数据按项目隔离：调用必须带 --memory-dir，
+ *      漏了会静默读到别的项目的账本（不报错）。
+ *   ③ 「程序」和「数据」分两个路径找，不要混成一个。
  *
- *   ① 所有路径从**写死在 BOT 目录**改成**构造时传入**。
- *      原版 `LEDGER_DIR = join(ROOT, 'memory/conversation-cache/raw/ledger')`，
- *      `MEMORY_SCRIPT = process.env.HARNESS_MEMORY_SCRIPT` —— 插件是给别人用的，
- *      记忆目录必须由配置给（`config.memoryDir`），不能假设装在哪个目录。
- *
- *   ② `ledgerRecord()` 的 `MEMORY_SCRIPT` 仍然是**共享程序、每项目数据**。
- *      ⚠️ 每次调用必须带 `--memory-dir`，漏了就静默读到**别人项目的账本**（不报错）。
- *      这条是 BOT 踩过的坑，原样保留注释。
- *
- *   ③ 保留原版对「程序」和「数据」的区分：程序从 `memoryScript` 找，
- *      数据从 `memoryDir` 找。⛔ 不要把两者混成一个路径。
- *
- * ⚠️ 关于 `classifyUserText`（语气词过滤）：
- *   原版 `readRecentLedgerEntries()` 调用了 `classifyUserText()`（来自
- *   摘要程序的 `summarizer.mjs`），用来筛掉「嗯」「好」「对」这类无信息量的用户消息，
- *   并把同轮的助手回复一并丢弃。插件版**没有**这份程序（它属于摘要链路，不在
- *   bot 插件职责内），所以这里退化为「**不过滤，直接取末尾 N 条**」。
- *
- *   ⚠️ 这是**有意的行为差异**，不是遗漏：少了它，handoff 里可能混进几句语气词，
- *      但**绝不会丢真内容**（过滤只做减法）。宁可多留，不可误杀 ——
- *      这也正是原版 `isFillerEntry()` 里那句 catch 的取向。
- *      如果将来要恢复过滤，注入一个 `filterUserText` 回调即可（见下）。
+ * 语气词过滤：本插件不带摘要链路的过滤程序，因此不过滤、直接取末尾 N 条。
+ * 宁可多留，不可误杀。将来要恢复过滤，注入一个 filterUserText 回调即可。
  */
 
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 
-/** 会话内不足这么多条 = 在频繁调试，不覆盖 handoff（用户 2026-09-16 定）。 */
+/** 会话内不足这么多条 = 在频繁调试，不覆盖 handoff。 */
 export const HANDOFF_MIN_TURNS = 20;
 
 /** handoff 触发原因的人话描述（写进正文，让新会话知道"上次是怎么断的"）。 */
@@ -116,10 +101,9 @@ export class Memory {
   /**
    * 记一条流水账（fire-and-forget）。
    *
-   * ⚠️ 两件事要分开看（2026-09-19 修）：
-   *   ① **程序**（cache-manager.mjs）是共享的 → 从 `memoryScript` 找
-   *   ② **数据**（流水账）落在 `memoryDir` → 用 `--memory-dir` 显式传给程序
-   * 漏传 `--memory-dir` 不报错，只是**静默读到别人项目的账本**。
+   * 两件事分开看：程序（cache-manager.mjs）共享，从 memoryScript 找；
+   *   数据（流水账）按项目隔离，落在 memoryDir，必须用 --memory-dir 传给程序。
+   * 漏传 --memory-dir 不报错，只是静默读到别的项目的账本。
    *
    * @param {'user'|'assistant'} role
    * @param {string} text
@@ -156,12 +140,8 @@ export class Memory {
   /**
    * 读流水账，从**最末尾往回倒数 N 条**对话原文（👤 用户 + 🤖 助手 都留）。
    *
-   * 用户 2026-09-16 定死（原话）：「重启前的文件是聊天记录最新开始倒数取 20 条」。
-   * 即：起点 = 流水账最新那条（不管是谁发的），往回数满 N 个条目就停。
-   *
-   * ⚠️ 别自作聪明加条件（原版连错两版，记在这里防复发）：
-   *   - ❌ 不要按「轮」配对成 20 轮 —— 就是字面的 N 个条目
-   *   - ❌ 不要按摘要生成时间切边界 —— 摘要不参与这个切分
+   * 起点 = 流水账最新一条，往回数满 N 个条目就停。
+   *   就是字面的 N 个条目：不要按「轮」配对，也不要按摘要时间切边界。
    *
    * @param {string|null} ledgerRaw 流水账**正文**（由 readLedgerText() 读好传入）
    * @param {number} maxEntries 取末尾多少条（默认 20）
@@ -185,9 +165,8 @@ export class Memory {
       }
       if (entries.length === 0) return '（流水账里没有可提取的对话条目）';
 
-      // 用户 2026-09-16 改定：取「**有用的**末尾 20 条」，不是机械数 20 条。
-      // 现改为：先筛掉无信息量的 👤，其所属那轮的 🤖 回复一并丢弃，再取末尾 20 条。
-      // ⚠️ 插件版在没有注入 filterUserText 时**不过滤**（见文件头 ③）。
+      // 取「有用的」末尾 20 条：先筛掉无信息量的 👤 条目（其所属那轮的
+      // 🤖 回复一并丢弃），再取末尾 20 条。未注入 filterUserText 时不过滤。
       const turns = [];
       for (const e of entries) {
         if (e.icon === '👤') {
@@ -251,8 +230,7 @@ export class Memory {
   /**
    * 生成 handoff 文件。失败返回 null（调用方降级）。
    *
-   * ⚠️ 用户 2026-09-16 改定：**不只是 /restart 写 handoff**。
-   * 任何「会话会断」的时机都要写：
+   * 不只是 /restart，任何「会话会断」的时机都要写 handoff：
    *   - `/restart`  断开前写（reason='restart'）
    *   - `/new`      断开前写（reason='new'，条数不足则跳过）
    *   - 切模型      断开前写（reason='model'，条数不足则跳过）
@@ -271,14 +249,10 @@ export class Memory {
       mkdirSync(handoffDir, { recursive: true });
 
       const now = new Date();
-      // ⚠️ 固定文件名，**永远覆盖，不新增**（用户 2026-09-16 定死）。
-      // 曾用 `${stamp}-restart.md`（时间戳命名）→ 每次重启新建一个，堆了 59 份历史垃圾。
-      // 与摘要（summaries/summary.md 单份覆盖）对齐：只保留**一份**。
+      // 固定文件名，永远覆盖不新增：只保留一份，与摘要文件对齐。
       const file = join(handoffDir, 'handoff.md');
 
-      // ⚠️ 用户 2026-09-16 定死：handoff **不是**模板，是「摘要之后 → 重启之前」
-      // 这一段的实录。旧代码这里写死了 3 条常量 → 每次重启都写同一份旧事，
-      // 新会话接不上真正进度（这就是"重启后忘光"的根因）。现改为读流水账。
+      // handoff 不是模板，是「摘要之后 → 重启之前」这段的实录，从流水账取。
       const ledgerText = this.readLedgerText();
       const recent = this.readRecentLedgerEntries(ledgerText, 20); // 末尾往回 20 条
       const ledgerRel = `memory/conversation-cache/raw/ledger/${ledgerMonthFile()}`;
@@ -319,9 +293,7 @@ export class Memory {
         ``,
       ].join('\n');
 
-      // ⚠️ 必须**直接覆盖**，不能用 `{ flag: 'wx' }`（用户 2026-09-16 定死）。
-      // 改成固定名 `handoff.md` 后还留着 `wx`，语义就反转成「只写第一次，之后永远
-      // EEXIST 拒绝」—— 2026-09-16 那次 /restart 就是这样静默失败的。
+      // 必须直接覆盖：带 { flag: 'wx' } 会在第二次写入时 EEXIST 拒绝。
       writeFileSync(file, lines); // 固定单份，每次直接覆盖
       this.log(`[handoff] (${reason}) 已写入 ${file}`);
       return file;
@@ -334,9 +306,8 @@ export class Memory {
   /**
    * 断开「之前」写 handoff，但**只在本次会话真的聊过东西时才写**。
    *
-   * ⚠️ 用户 2026-09-16 定死的判据：会话内**不足 20 条**说明是在频繁调试
-   * （刚开就 /new、反复切模型），**不要覆盖**已有的好记忆。
-   * 判据必须是「本次会话 createdAt 之后」的条数 —— 流水账总数永远 ≥ 20，数它没意义。
+   * 会话内不足 20 条 = 频繁调试（刚开就 /new、反复切模型），不要覆盖已有记忆。
+   * 判据必须是「本次会话 createdAt 之后」的条数 —— 流水账总数永远 ≥ 20。
    *
    * @returns {'written'|'skipped'|'failed'} 实际结果（便于回话里如实交代）
    */
@@ -367,9 +338,7 @@ export class Memory {
       if (ledgerText === null) return;
 
       // 流水账最后一条的时间（本地时间格式，与写入端一致）
-      // ⚠️ 正则必须用 [ \t]+ 而不是单个空格：写入端是 `## 时间  👤 用户`
-      //    （**两个**空格），写 `## 时间 ` 会漏配 → 匹配数恒为 0 → 恒判"已是最新"。
-      //    这一字之差让 boot 补写自 2026-09-16 起就没生效过（2026-09-16 实测修复）。
+      // 正则必须用 [ \t]+：写入端的时间后是两个空格，单个空格会恒判"已是最新"。
       let lastEntryMs = 0;
       try {
         const heads = ledgerText.match(/^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[ \t]/gm);

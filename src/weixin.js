@@ -1,29 +1,14 @@
 /**
- * Weixin iLink 接入层 —— 从 BOT/weixin.js 搬运而来。
+ * Weixin iLink 接入层。
  *
- * 协议对齐官方 `@tencent-weixin/openclaw-weixin@2.4.8`：
+ * 协议对齐官方 @tencent-weixin/openclaw-weixin@2.4.8：
  *   - 长轮询收消息（getupdates，带 get_updates_buf 游标）
  *   - 发文字消息（sendmessage）
  *   - 发送"正在输入"（getconfig + sendtyping）
  *
- * ⚠️ 与原版的差异（全部是「必须改」，没有一条是「我想改」）：
- *
- *   ① **凭据来源从「磁盘文件」改成「调用方传入」**。
- *      原版把 token 存在 `weixin-account.json` 里、路径写死在模块旁。
- *      插件是发布给别人的，凭据该由宿主（插件配置）持有，不该让插件自己
- *      决定往哪儿读写文件。所以 `load()` 依旧保留（兼容读文件），
- *      但更推荐 `adopt({token, baseUrl, botId, ownerWxUserId})` 直接注入。
- *
- *   ② `baseUrl` / 账号文件路径从 `process.env` 改走 `options`。
- *      理由同 telegram.js：多用户/多实例不能靠共享的进程环境变量区分。
- *      env 读取保留为**回退**，只为了不破坏现有测试脚本的用法。
- *
- *   ③ ⚠️ 原版 `reconnect()` 里写 `this._contextToken = null` 和
- *      `this._typingTicket = null` —— 但这**两个字段在类里根本不存在**
- *      （类只声明了 token/baseUrl/botId/ownerWxUserId/enabled）。
- *      也就是说它清的是两个**临时属性**，真正的上下文缓存如果存在别处就清不掉。
- *      搬运时**保持原样**（不改行为），但把这一点标出来 —— 见下方 TODO 注释。
- *      这是「搬的时候发现了但没擅自改」的东西，需要用户（我）确认真正的缓存位置。
+ * 凭据来源：推荐 adopt({token, baseUrl, botId, ownerWxUserId}) 由宿主注入；
+ * load() 保留，从账号文件读凭据。baseUrl / 账号路径走 options（env 仅作回退）。
+ * context_token 缓存由调用方持有；重连时本类广播 invalidate 事件让持有者清缓存。
  */
 
 import { existsSync, readFileSync } from 'node:fs';
@@ -75,7 +60,7 @@ export function isUserMessage(message) {
  * Weixin iLink 客户端。
  *
  * 两种启用方式：
- *   · `new Weixin({accountFile})` + `load()`       —— 从文件读凭据（原版行为）
+ *   · `new Weixin({accountFile})` + `load()`       —— 从文件读凭据
  *   · `new Weixin(...)` + `adopt({token, ...})`    —— 由调用方直接给凭据（插件推荐）
  */
 export class Weixin {
@@ -107,7 +92,7 @@ export class Weixin {
     return true;
   }
 
-  /** 加载本地凭据文件。返回 true 表示可用。（原版行为，保留兼容） */
+  /** 加载本地凭据文件。返回 true 表示可用。 */
   load() {
     // env 回退只为不破坏现有测试脚本；插件里请用 options.accountFile。
     const accountFile = this.#accountFile ?? process.env.WEIXIN_ACCOUNT_FILE;
@@ -229,9 +214,8 @@ export class Weixin {
 
   /**
    * 发一条文字消息给用户，必须回传 context_token。
-   * ⚠️ 必须带 `client_id`（每次随机生成）+ `from_user_id: ""` ——
-   *    缺 `client_id` 时服务端返回 HTTP 200 + message_id 但**静默不投递**
-   *    （2026-09-13 A/B 实测：带 client_id 能收到，不带收不到）。
+   * 必须带 client_id（每次随机生成）+ from_user_id: ""——
+   *    缺 client_id 时服务端返回 HTTP 200 + message_id 但静默不投递。
    */
   async sendText(toUserId, text, contextToken) {
     const body = {
@@ -239,18 +223,15 @@ export class Weixin {
         from_user_id: '',
         to_user_id: toUserId,
         client_id: randomUUID(),
-        message_type: 2, // BOT 发出
+        message_type: 2, // bot 发出
         message_state: 2, // FINISH
         ...(contextToken ? { context_token: contextToken } : {}),
         item_list: [{ type: WX_ITEM_TYPE.TEXT, text_item: { text: String(text) } }],
       },
       base_info: this.#baseInfo(),
     };
-    // ⚠️ 必须校验 `ret`：服务端业务失败（如 sessions/通道失效）也回 HTTP 200，
-    // 不查 `ret` 会静默吞掉（用户端收不到、bot 端还不报错）。2026-09-13 实测
-    // 本通道 sendmessage 返回 `{"ret":-2,"errmsg":"prepare failed"}`。
-    // ⚠️ 必须 `return`：原版以前没有 return，导致 sendText() **永远返回 undefined**
-    //    （2026-09-19 实测发现）—— 任何依赖返回值查 message_id / 判投递的代码都会静默失效。
+    // 必须校验 ret 并把结果 return：服务端业务失败（如通道失效）也回 HTTP 200，
+    // 不查 ret 会静默吞掉（用户端收不到、bot 端不报错）。
     return this.#expectOk(await this.#post('ilink/bot/sendmessage', body), 'sendText');
   }
 
@@ -283,22 +264,10 @@ export class Weixin {
    * 当 sendmessage 返回 ret=-2（prepare failed）或 getUpdates 返回 ret=-2 时调用，
    * 等价于「伪过期」场景下的强制重连。
    *
-   * ⚠️ 重要限制（2026-09-14 实证）：
-   *   notifyStart() 只是通知服务端"我开始接收了"，它**不能刷新会话 / 获取新的 context_token**。
-   *   当通道已经彻底失效时（ret=-2），notifystart 本身也返回 ret=-2 → 重连必然失败。
-   *   真正的恢复方式是：**等待用户主动发一条消息给 bot**，getUpdates 长轮询收到新消息后，
-   *   消息携带新鲜的 context_token → 通道自然恢复。
-   *   因此本 reconnect() 只负责清除本地缓存（让旧 token 不再污染后续发送），
-   *   实际恢复依赖入站消息触发。如果 reconnect() 本身也失败（notifyStart ret=-2），
-   *   至少清除了缓存，不影响后续入站消息处理。
-   *
-   * ⚠️ 与 BOT 原版的差异（**这里改了行为，不是照抄**）：
-   *   原版清的是 `this._contextToken` / `this._typingTicket`，但这两个字段
-   *   在类里**根本不存在**（类字段只有 token/baseUrl/botId/ownerWxUserId/enabled）——
-   *   也就是说原版的「清除缓存」是空操作，什么都没清。
-   *   真正的 context_token 缓存由调用方持有（插件版在 index.js 的 wxContextTokens），
-   *   所以本类改为：**广播一个 invalidate 事件**，让持有缓存的人自己清。
-   *   照抄原样等于保留一个骗人的空操作。
+   * 重要限制：notifyStart() 不能刷新会话 / 获取新的 context_token。
+   *   通道彻底失效（ret=-2）时，唯一恢复途径是用户下一条入站消息带来的
+   *   新鲜 context_token。因此 reconnect() 只负责清除本地缓存并尝试重新握手，
+   *   实际恢复依赖入站消息触发。
    */
   async reconnect() {
     // 1. 通知缓存持有者：所有 context_token / typing_ticket 已失效
@@ -321,6 +290,6 @@ export class Weixin {
     } catch {}
   }
 
-  // sendHeartbeat() 已于 2026-09-15 删除：向 filehelper 发空消息并不能绕过
-  // ret=-2，无法"激活"通道。通道恢复的唯一途径是用户入站消息刷新 context_token。
+  // 通道恢复的唯一途径是用户入站消息刷新 context_token
+  // （向 filehelper 发心跳不能激活失效通道，故无心跳逻辑）。
 }

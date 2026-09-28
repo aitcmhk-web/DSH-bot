@@ -1,26 +1,20 @@
 /**
  * dsh-botplugin — Telegram / WeChat 接入层 + handoff 记忆衔接。
  *
- * 三样功能（用户 2026-09-27 定的范围）：
+ * 三样主要功能：
  *   ① Telegram 入口（长轮询）
  *   ② 微信入口（iLink 长轮询）
  *   ③ handoff（会话断开前把进展落盘，新会话读回来接上）
  *
- * ⚠️ 与 `BOT/` 的关系：这是**另一个项目**，把 BOT 里已经验证过的逻辑搬过来，
- *    改造成「装在 DSH 进程里的插件」。BOT 本体不受影响、继续照跑。
- *    两者的根本差别：BOT 是**独立进程**（`dsh.js` spawn 一个 `dsh --profile sdk`
- *    子进程，靠 stdio JSON-RPC 说话）；插件**活在 DSH 进程内部**，
- *    所以那一整层子进程管理代码在这里不存在，直接调 `ctx.agents`。
+ * 架构：插件活在 DSH 进程内部，直接调用 `ctx.agents`，没有子进程管理层。
  *
  * Cordis 插件约定：
- *   - 具名导出 `name` / `inject` / `Config` / `apply`，**不要 default 导出**
+ *   - 具名导出 `name` / `inject` / `Config` / `apply`，不要 default 导出
  *     （Loader 的 unwrapExports 靠具名导出保留插件身份）。
- *   - `name` 是插件在 loader 树里的名字，与 `cordis.patch.yml` 里的行 id 分开。
  *   - `inject` 列出依赖的服务名；服务齐了 `apply()` 才会被调用。
  *
- * ⚠️ 本插件**不 import 任何 `@deepseek-ai/*` 内部包**（除了可选的 schemastery）。
- *    实测从插件目录解析不到那些包（见 probe-resolution.mjs），且 `NODE_PATH`
- *    对 ESM 无效。需要的东西全部经由 `ctx` 服务和本地实现拿。
+ * 本插件不 import 任何 `@deepseek-ai/*` 内部包：需要的东�西
+ * 全部经由 `ctx` 服务和本目录的本地实现拿。
  */
 
 import { randomUUID } from 'node:crypto';
@@ -80,8 +74,7 @@ export const Config = Schema.object({
   logLabel: Schema.string().default('botplugin').description('日志前缀'),
 
   // ---- 语音转文字 ----
-  // ⚠️ 这三个路径**没有默认值**，因为默认值只能是作者本机的布局（Homebrew）。
-  //    留空时收到语音会给一条「请设置 xxx」的可操作报错，而不是 ENOENT。
+  // 这三个路径没有默认值：留空时收到语音会给「请设置 xxx」的可操作报错，而不是 ENOENT。
   asrBackend: Schema.string().default('whisper')
     .description('语音转文字后端：whisper 或 sensevoice（中文更准）'),
   asrWhisperBin: Schema.string().description('whisper 可执行文件路径，如 /opt/homebrew/bin/whisper'),
@@ -109,10 +102,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /**
  * Telegram 返回 409 时另一个进程正在轮询同一个 bot token。
  *
- * ⚠️ 这一个 token 只能有一个进程 —— 第二个进程会让先启动的那个收 409，
- *    而它「收不到消息」的表现看起来就像 bot 随机不理人。
- *    插件版**不能**像 BOT 那样 `process.exit(3)`（那是宿主进程，会拖垮整个 DSH），
- *    所以这里只报错并**停掉自己的轮询**，把问题留在明面上。
+ * ⚠️ 一个 token 只能有一个进程 —— 第二个进程会让先启动的那个收 409，
+ *    表现就像 bot 随机不理人。
+ *    插件运行在宿主进程里，不能 process.exit 拖垮整个 DSH，
+ *    所以这里只报错并停掉自己的轮询。
  */
 function isConflict(err) {
   return err?.errorCode === 409
@@ -150,10 +143,8 @@ export function apply(ctx, config) {
   let activeRoute = configuredDefault ? routeByKey(routes, configuredDefault) : null;
   const useHostRoutes = routeList.length === 0;
 
-  // ── 宿主模型表：与 BOT 的 sync-from-web.mjs **同一套规则**（用户 2026-09-19 定死）──
-  //    单一事实源 = web 端「设置 → 模型」；插件在宿主进程内，直接读 settings 服务，
-  //    连 BOT 需要的 web-models.json 同步缓存都省了。差别只有这一点。
-  //    key 规则照抄 sync-from-web.mjs:177：单模型 provider 用别名，多模型 `<别名>:<模型id>`。
+  // ── 宿主模型表：跟随 web 端「设置 → 模型」（settings.yaml），加减模型即时生效 ──
+  //    key 规则：单模型 provider 用别名，多模型 `<别名>:<模型id>`。
   const KEY_ALIAS = { alibailian: 'ali', 'deepseek-official': 'ds', qwen36vq: 'local', qwen36iq4xs: 'iq4' };
   const menuKey = (pid) => KEY_ALIAS[pid] ?? pid;
   const routeKeyFor = (pid, modelId, isOnlyModel) => {
@@ -193,7 +184,7 @@ export function apply(ctx, config) {
       }
     }
 
-    // ② 内置 deepseek（llm-deepseek）—— 与 sync-from-web.mjs:256 同构。
+    // ② 内置 deepseek（llm-deepseek）。
     //    web 端通常不声明 models；声明了以声明为准，否则向 llm 服务查动态目录
     //    （sync 脚本是从插件源码读 DEFAULT_MODELS，进程内直接调 listModels 更准）。
     const dsSection = readSection('llm-deepseek') ?? {};
@@ -270,14 +261,13 @@ export function apply(ctx, config) {
   const weixin = new Weixin({
     apiRoot: config.weixinApiRoot || undefined,
     accountFile: config.weixinAccountFile || undefined,
-    // 重连时让缓存真的被清掉。BOT 原版在 reconnect() 里清两个**不存在**的字段，
-    // 等于空操作；插件版把缓存放在下面的 wxContextTokens，所以在这里挂钩子。
+    // 重连时清空 context_token 缓存（见下方 wxContextTokens）。
     onInvalidate: () => {
       wxContextTokens.clear();
       log('微信 context_token 缓存已清空（重连）');
     },
   });
-  // 微信凭据：优先配置里的 token；没有则回落到凭据文件（原版行为）。
+  // 微信凭据：优先配置里的 token；没有则读凭据文件。
   const weixinReady = config.weixinToken
     ? weixin.adopt({ token: config.weixinToken, baseUrl: config.weixinApiRoot })
     : weixin.load();
@@ -297,11 +287,7 @@ export function apply(ctx, config) {
   /**
    * 判断这个人能不能用。
    *
-   * ⚠️ 白名单通过的同时**也要认领主人锚点**。BOT 原逻辑：白名单分支直接 return，
-   *    **从不执行认领** → ownerUserId 永远是 null →
-   *    ① 微信入口拿到 null 锚点，回「尚未绑定主人」
-   *    ② 节点广播「微信入站 → TG」时没有投递目标 → `chat not found`
-   *    （BOT 2026-09-19 实测踩过）。白名单里的人天然可信，认领不会放宽权限。
+   * 白名单里的人天然可信：通过校验的同时认领主人锚点，后续微信入口才有投递目标。
    */
   function authorize(userId) {
     const allow = config.telegramAllowedUsers ?? [];
@@ -329,11 +315,7 @@ export function apply(ctx, config) {
     log,
     // 入站：端点 → 节点 → ① DSH ② 其他所有端点
     onInbound: async (msg) => {
-      // ⚠️ 这里**不能**按 source 过滤。
-      //    曾经的写法是「TG 的入站在 pollLoop 里自己交给 DSH」，那是搬运时
-      //    留下的错注释 —— handleTelegramMessage 只调 hub.inbound，没有第二条路。
-      //    结果：TG 消息全部被静默丢弃（实测复现：用户发消息，日志有
-      //    「[hub] 入站」，但既不建会话也不回话）。两端都走同一条路。
+      // 所有端点统一走这一条路：任何来源都不做第二入口，避免漏派发。
       // ⚠️ 队列键必须带 source 前缀。只用 chatId 的话，TG 的 12345 和微信的
       //    12345 会排进同一条队列 —— 两个不相干的人互相阻塞。
       await enqueue(`${msg.source}:${msg.chatId}`, () => promptFromHub(msg));
@@ -374,8 +356,7 @@ export function apply(ctx, config) {
   /**
    * 把任务排进某会话的队列。
    *
-   * ⚠️ 为什么必须串行：DSH 的 `agent.followup()` 是**排队语义**，同一个 agent
-   *    同时收到两条 prompt 会交错。BOT 当年也有一层同样的队列。
+   * 必须串行：agent.followup() 是排队语义，同一个 agent 同时收到两条 prompt 会交错。
    */
   function enqueue(chatKey, task) {
     const key = String(chatKey);
@@ -452,15 +433,13 @@ export function apply(ctx, config) {
   let pollAbort = null;
 
   /**
-   * Telegram 轮询主循环 —— 从 BOT/bot.js 的 `pollLoop()` 搬运。
+   * Telegram 轮询主循环。
    *
-   * ⚠️ 游标语义（BOT 踩过的坑，原样保留）：
-   *    - **不能**用 `getUpdates(-1)` 去"探一下最新" —— 那等于告诉 Telegram
-   *      中间那些更新都收到了，停机期间的消息会被**静默丢弃**，日志还很干净。
-   *    - `offset` 推进和 `lastUpdateId` 持久化**两半都要**。只持久化不推进，
-   *      `getUpdates` 每轮都把同一批还回来 → 无限重放刷屏（BOT 2026-09-12 出过）。
-   *      插件版暂无自己的持久化文件，所以 offset 只在内存里（进程重启会重来，
-   *      但这比写错文件安全；要持久化应走 DSH 的存储服务，另开一轮做）。
+   * 游标语义：
+   *    - 不要用 getUpdates(-1)「探最新」—— 那等于告诉 Telegram 中间的更新
+   *      都收到了，停机期间的消息会被静默丢弃。
+   *    - offset 只在内存里：进程重启从当前时刻开始拉，不补发旧消息。
+   *      要持久化应走 DSH 的存储服务，另开一轮做。
    */
   async function pollLoop() {
     if (!telegram) return;
@@ -475,7 +454,7 @@ export function apply(ctx, config) {
           error('');
           error('❌ 409 Conflict：另一个进程正在用同一个 bot token 收消息。');
           error('   本插件的 Telegram 轮询**已停止**（没有退出 DSH 进程）。');
-          error('   常见原因：BOT 本体也在用这个 token 跑，或者起了两份插件。');
+          error('   常见原因：同一个 token 有别的进程在用（例如另一个 bot 或另一份插件）。');
           error('   ⛔ 同一个 token 只能有一个进程 —— 请只留一个。');
           return; // ⚠️ 不能 process.exit：那是宿主进程
         }
@@ -521,12 +500,8 @@ export function apply(ctx, config) {
   /**
    * 处理一条 Telegram 消息。
    *
-   * ⚠️ 与 BOT 的差异：BOT 里 TG 的消息走向是
-   *      TG → (mirror) hub → 微信   然后   TG → DSH
-   *    插件版统一成**一条路**：TG → hub.inbound → ① DSH ② 其他端点。
-   *    这正是 hub.js 文件头写的架构（「端点 → 节点 → ① DSH ② 其他所有端点」），
-   *    也是 BOT 当年没走完的那半步（bot.js:3011 注释：「入站归一化是下一步」）。
-   *    ⛔ 不要再写成对镜像（mirrorTgToWeixin 那种）—— 那是 O(n²)。
+   * 统一路径：TG → hub.inbound → ① 交给 DSH ② 镜像到其他端点。
+   *    不要写成对镜像（mirrorTgToWeixin 那种）—— 那是 O(n²)。
    */
   async function handleTelegramMessage(message) {
     const chatId = message.chat.id;
@@ -557,8 +532,7 @@ export function apply(ctx, config) {
     // ---- 图片 ----
     // SDK 约定（@deepseek-ai/dsh-sdk-jsonrpc-server 的 encodedImage 判据）：
     //   { type: 'image', data: <canonical base64>, mimeType: 'image/png' }
-    // ⚠️ BOT 踩过：只声明了 inputModalities 却**从没把图片块压进 blocks**，
-    //    所以无论配置怎么改，图片都被静默丢掉，模型只收到文字。
+    // 图片块必须真的压进 blocks：只声明 inputModalities 是没用的。
     const photo = message.photo?.[message.photo.length - 1];
     const imageDocument =
       message.document && String(message.document.mime_type ?? '').startsWith('image/')
@@ -642,9 +616,8 @@ export function apply(ctx, config) {
   /**
    * 斜杠命令。
    *
-   * ⚠️ 已实现的是**插件自己就能完成**的那几个。/restart、/new 这类需要
-   *    「重启 DSH 进程」或「清空会话」的命令，语义与独立进程的 BOT 不同，
-   *    留到后面单独定（见 plan.md）。
+   * 已实现的是插件自己就能完成的那几个；/restart 这类需要重启宿主进程的
+   *    命令语义不同，留待后续。
    *
    * @returns {Promise<boolean>} true = 已处理（调用方不要再当普通消息发）
    */
@@ -760,7 +733,7 @@ export function apply(ctx, config) {
         continue;
       }
 
-      // ⚠️ 即使 ret≠0 也要推进游标，否则后续调用一直用空 cursor 重试（BOT 注释原话）。
+      // 即使 ret≠0 也要推进游标，否则后续调用一直用空 cursor 重试。
       if (batch.get_updates_buf) wxCursor = batch.get_updates_buf;
       // ret=-2 = 通道「伪过期」，清掉本地缓存等用户下一条消息带新 token 恢复。
       if (batch.ret === -2) {
@@ -782,7 +755,7 @@ export function apply(ctx, config) {
     const fromUserId = String(message.from_user_id ?? message.from_user ?? '');
     if (!fromUserId) return;
 
-    // 新鲜 context_token 必存 —— 通道恢复靠的就是它（BOT 实证：notifystart 没用）。
+    // 新鲜 context_token 必存 —— 通道恢复靠它。
     if (message.context_token) wxContextTokens.set(fromUserId, message.context_token);
 
     // 白名单：配了就只认那一个

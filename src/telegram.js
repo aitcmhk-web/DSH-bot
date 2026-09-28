@@ -1,27 +1,9 @@
 /**
- * Telegram 客户端 —— 从 BOT/telegram.js 搬运而来，**只改必要的部分**。
+ * Telegram 客户端（Bot API 长轮询 + 发消息 + Markdown→HTML 排版）。
  *
- * ⭐ 搬运原则：这个文件里绝大多数是**与业务无关的纯逻辑**
- *   （Markdown→HTML 转、标签感知切分、400 降级重发），那些坑是踩出来的，
- *   **一行都不改** —— 改了就是重新踩一遍。改动逐条列在下面。
- *
- * ⚠️ 与原版的差异（全部是「必须改」，没有一条是「我想改」）：
- *
- *   ① `API_ROOT` 由**构造参数**决定，不再读 `process.env.TELEGRAM_API_ROOT`。
- *      原因：插件是发布的，多个用户各自的 token/环境不该互相污染；
- *      宿主进程的 env 也不该被插件的读法绑架。原来的 env 覆盖留给测试用。
- *
- *   ② `getFileBytes` 的 curl 兜底分支修了两个真 bug：
- *      · 原版用 `require('node:fs')` —— 但这是 ESM 文件，`require` **未定义**，
- *        走到这个分支会抛 `ReferenceError`，而不是它想给的「curl 也失败了」。
- *        也就是说这个兜底路径**从来没真正工作过**。
- *      · 原版用了 `require` 却没 `unlinkSync` 成功后的临时文件 → 会往 /tmp 漏文件。
- *      改成 top-level `import { readFileSync, unlinkSync } from 'node:fs'`，
- *      并且在成功/失败两条路径上都清理临时文件。
- *      ⚠️ 这是**行为修复**，不是等价搬运 —— 原版这条路径是坏的，没法「保持一致」。
- *
- *   ③ `sendMessage` 支持 `extra` 里的 `disable_notification` 等原样透传 —— 原版已支持，
- *      未改，只是记一笔确认过。
+ *   ① API_ROOT 由构造参数决定（env 仅测试回退），多用户不共享环境变量。
+ *   ② getFileBytes 的 curl 兜底走 ESM import，临时文件成功/失败都清理。
+ *   ③ sendMessage 支持透传 disable_notification 等 extra 参数。
  */
 
 // Force direct connection — bypass macOS system proxy / NE routing that may
@@ -108,13 +90,9 @@ export class Telegram {
    * @returns {Promise<{ok:boolean, mode:'html'|'plain', chunks:number, fallback?:string}>}
    */
   async sendRich(chatId, markdown, extra = {}) {
-    // ⚠️ 2026-09-19 修「回答重复两遍」（原版注释，坑照抄保留）：
-    // 旧版逐块发 HTML，catch 里却从 plainParts[0] **整份重发** ——
-    // 第 2 块失败时，第 1 块已经发出去了，又被纯文本重发一遍 = 用户看到重复。
-    //
-    // 修法：切分仍在 HTML 之后做（保证表格转换/转义膨胀都已定型，
-    // 且 splitMessageHtml 保证每块标签闭合），但**记录已成功发送的块数**，
-    // 降级时只补发「失败的那块及其后」，绝不回头重发。
+    // 降级重发只补「失败的那块及其后」，绝不从头重发 ——
+    // 前面的块已经发出去了，整份重发用户会看到重复。
+    // 切分在 HTML 之后做：表格转换/转义膨胀都已定型，每块标签闭合。
     const html = markdownToHtml(markdown);
     const parts = splitMessageHtml(html);
     const { parse_mode: _drop, ...cleanExtra } = extra;
@@ -179,7 +157,7 @@ export class Telegram {
         if (code !== '200') throw new Error(`curl download failed: HTTP ${code}`);
         return readFileSync(tmp);
       } finally {
-        // 原版漏了成功路径的清理，这里两条路径都清。
+        // 成功/失败两条路径都清理临时文件。
         try {
           unlinkSync(tmp);
         } catch {
@@ -224,7 +202,7 @@ export function splitMessageHtmlPlain(htmlChunks, limit = 4000) {
 }
 
 // ---------------------------------------------------------------------------
-// HTML 排版支持（原版 2026-09-13 加，坑照抄保留）
+// HTML 排版支持
 //
 // 为什么用 HTML 而不是 Markdown/MarkdownV2：MarkdownV2 要求转义
 // `_ * [ ] ( ) ~ ` > # + - = | { } . !` 每个符号，agent 的中文回答里满地都是，
@@ -269,7 +247,7 @@ const ALLOWED_TAGS = new Set([
  *   2. 其中**存在**一行是分隔行（单元格只含 `-`、`:`、空格）。
  * 没有分隔行就不认，原样返回 —— 这是区分「真表格」和「正文里写了竖线」的关键。
  *
- * ⚠️ 首列做标题行且**不加粗**（用户实测：加粗后字宽变化反而更容易看歪）。
+ * 首列做标题行且不加粗（加粗后字宽变化反而对不齐）。
  * ⚠️ 值里若原本有 `**粗体**`/`` `代码` ``，此处不动它，交给外层后续的行内规则处理。
  */
 function convertTables(text) {
@@ -302,12 +280,9 @@ function convertTables(text) {
         j++;
       }
 
-      // 每个数据行 → 一个「条目」，条目之间空一行。
-      // 形态（用户 2026-09-15 选定）：
-      //     ● 条目名          ← `● `(U+25CF 大圆点) 前缀 + 加粗，条目边界一眼可辨
-      //     字段: 值          ← 顶格，不缩进（缩进版用户觉得像没对齐）
-      // ⚠️ 符号是 `●`(U+25CF) 不是 `•`(U+2022，列表用的那个) 也不是 `▪`(U+25AA)。
-      //    用户明确挑的大圆点：既区别于列表圆点，又比方块轻。
+      // 每个数据行 → 一个「条目」，条目之间空一行：
+      //     ● 条目名   ← `●`(U+25CF) 前缀 + 加粗，区别于列表圆点
+      //     字段: 值   ← 顶格，不缩进
       const entries = rows.map((row) => {
         const parts = [];
         row.forEach((value, col) => {
@@ -340,18 +315,15 @@ function convertTables(text) {
  * __粗体__、*斜体*、~~删除线~~、# 标题、> 引用、- 列表。
  * **先转义，后插标签**。
  *
- * ⚠️ 2026-09-15 加标题/引用/列表。**块级规则必须放在 keep() 占位符之后**：
- *    否则代码块里的 `# 注释`、`> 引用`、`- 参数` 会被当成真的语法改写。
- *    这是铁律 1 的延伸 —— 不光是转义顺序，块级规则也有先后。
+ * 块级规则必须放在 keep() 占位符之后：否则代码块里的 `# 注释`、
+ *    `> 引用`、`- 参数` 会被当成真的语法改写。
  *
  * ⚠️ Telegram **没有** <h1>~<h6>，标题只能用 <b> 模拟（ALLOWED_TAGS 里也没有 h*）。
  *    所以 `## 标题` 渲染成加粗、去掉 `#` 号；`###` 及以上额外缩进两空格保留层级感。
  *    想要"像微信那样显示真标题"在 TG 做不到，这是平台限制，不是实现偷懒。
  *
- * ⚠️ 2026-09-15 表格改为「键值条目」形态（原先是**故意不处理**）：
- *    TG 无 <table>；实测「包进 <pre>」也不可行 —— 等宽字体对中文基本无效，
- *    按「中文=2 宽」补空格只能做到"大致齐"，换设备/换字号立刻崩。
- *    所以彻底放弃列对齐，改用不依赖对齐的形态。
+ * 表格没有 <table> 可用：等宽字体对中文无效、列对齐换设备就崩，
+ *    所以用不依赖对齐的「键值条目」形态。
  */
 export function markdownToHtml(text) {
   let s = escapeHtml(text);

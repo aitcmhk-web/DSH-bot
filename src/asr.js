@@ -1,23 +1,15 @@
 /**
- * asr.js —— 语音转文字后端分派层（插件版）
+ * asr.js —— 语音转文字后端分派层。
  *
- * 来源：BOT/asr.js（300 行）的 ESM 搬运。语义保持，**路径改为可配置**。
- *
- * ⚠️ 与 BOT 版的差异（为什么必须改，不能照抄）：
- *   BOT 把三个绝对路径写死在源码里 —— `/opt/homebrew/bin/whisper`、
- *   `/opt/homebrew/bin/python3.11`、以及同目录的 `asr-server.py`。
- *   那是**本机 Homebrew 布局**，插件是要发布给别人用的：别人可能用
- *   pip 装的 whisper、可能在 Linux、可能根本没有 whisper。
- *   照抄的结果是「插件在作者机器上能用，在任何人机器上都报 ENOENT」——
- *   而且报错发生在收到语音的那一刻，最难排查。
- *   因此：路径全部走 options，`null` 表示没配（会给出可操作的报错，而不是 ENOENT）。
+ * 可执行文件路径全部走 options（构造时传入），不写死：
+ * 没配时收到语音会给「请设置 xxx」的可操作报错，而不是 ENOENT。
  *
  * 两个后端：
  *   · whisper     —— openai-whisper CLI（默认）
  *   · sensevoice  —— 阿里 FunASR SenseVoice-Small，中文更准、自带标点
  *
  * 常驻服务（可选加速）：走 TCP 本机回环问一个常驻 python 进程，
- *   省掉每次 ~7s 的模型加载。没起时**静默回退**冷启动，功能不受影响。
+ *   省掉每次 ~7s 的模型加载。没起时静默回退冷启动，功能不受影响。
  */
 
 import { execFileSync, spawn } from 'node:child_process';
@@ -32,11 +24,8 @@ const log = (...args) => console.log('[botplugin:asr]', ...args);
 const logErr = (...args) => console.error('[botplugin:asr]', ...args);
 
 /**
- * 运行期选项。由 `configure()` 注入（插件版不再读 process.env ——
- * 宿主进程的环境变量属于**装插件的人**，不是插件的配置面）。
- *
- * 🔴 本模块内的外部命令全部未在本机实跑（本机没装 whisper CLI 的插件化调用路径）；
- *    标 推断：参数与 BOT 版逐字一致，只换了可执行文件来源。
+ * 运行期选项。由 configure() 注入（不读 process.env —— 宿主进程的环境变量
+ * 属于装插件的人，不是插件的配置面）。
  */
 let opts = {
   whisperBin: null,
@@ -92,10 +81,9 @@ export function stripSenseVoiceTags(s) {
  * = (Anonymous + Wired + Compressor) 页 × 页大小
  * 只算进程真正占住、不可回收的部分（**排除 file-backed 文件缓存**）。
  *
- * ⚠️ 判据来源（BOT 版 2026-09-16 实测，沿用）：
- *   ⛔ 不要用 top 的 PhysMem used —— 它把文件缓存算进去，
- *      会把 mmap 的模型文件当成"已用"，永远判成高内存。
- *   ⛔ 不要用 ps RSS —— 大模型进程恒报十几 GB（含 mapped file）判不出来。
+ * 判据注意：
+ *   - 不要用 top 的 PhysMem used —— 它把文件缓存算进去，会误判。
+ *   - 不要用 ps RSS —— 大模型进程恒报十几 GB（含 mapped file）判不出来。
  *
  * @returns {number} GB；取不到返回 0（视为充裕 → 允许常驻）
  */
@@ -230,7 +218,7 @@ function requireBin(which) {
   return bin;
 }
 
-/** openai-whisper CLI。参数与 BOT 版逐字一致（--model base / txt / /tmp）。 */
+/** openai-whisper CLI（--model base / txt / /tmp）。 */
 function transcribeWithWhisper(wavPath) {
   return execFileSync(
     requireBin('whisper'),
@@ -262,7 +250,6 @@ res = model.generate(
     use_itn=True,       # 逆文本正则化：数字/日期等转成可读形式
     batch_size_s=60,
     merge_vad=False,    # 短语音不切 VAD：merge_vad=True 会吞掉句首弱起音
-                        # （实测「是今天天气巴适得很…」开头 6 字被吃掉）
 )
 if not res:
     sys.exit(0)
@@ -288,7 +275,7 @@ print(res[0].get("text", ""))
 /**
  * 统一入口：把 16kHz 单声道 WAV 转成文本。
  *
- * 常驻策略（沿用 BOT 2026-09-16 定的判据）：
+ * 常驻策略：
  *   1. 内存超阈值（本地大模型占着）→ 不常驻，冷启动；
  *   2. 内存充裕 → 常驻（首次自动拉起，之后每次仅 ~0.45s）；
  *   3. 常驻服务空闲超时 → 自己退出。
