@@ -303,9 +303,11 @@ export class BotRuntime {
         if (event?.type === 'assistant/message') {
           const content = event.data?.message?.content;
           if (!Array.isArray(content)) return;
+          // 只取正文：reasoning（思考过程）不进正文 —— 否则会一起发到 TG、
+          // 并记进流水账/handoff，用户看到的就是"小作文"。
           const t = content
-            .filter((b) => b?.type === 'text' || b?.type === 'reasoning')
-            .map((b) => b.text ?? b.reasoning ?? '')
+            .filter((b) => b?.type === 'text')
+            .map((b) => b.text ?? '')
             .join('');
           if (t.trim()) text = t;
         }

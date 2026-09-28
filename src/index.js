@@ -20,7 +20,7 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { writeFile, unlink } from 'node:fs/promises';
+import { readFile, writeFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,8 +30,10 @@ import { Weixin } from './weixin.js';
 import { Memory } from './memory.js';
 import { BotRuntime } from './runtime.js';
 import { Hub, makeMessage, markAsHubOutput } from './hub.js';
-import { buildRoutes, routeByKey, routeFor, describeRoute, isRouteFailure } from './models.js';
+import { buildRoutes, routeByKey, routeFor, describeRoute, isRouteFailure, reasoningEffortFor } from './models.js';
+import { LiveStatus, describeTool } from './status.js';
 import { transcribe, configure as configureAsr, currentBackend } from './asr.js';
+import { installApprovalBridge } from './approval-bridge.js';
 
 /** Cordis 插件名。 */
 export const name = 'botplugin';
@@ -90,6 +92,10 @@ export const Config = Schema.object({
     .description('常驻转写服务的脚本路径（asr-server.py）。不填则不用常驻'),
   asrMemoryLimitGb: Schema.number().default(16)
     .description('内存超过这么多 GB 就不启用常驻服务（避免和本地大模型抢内存）'),
+
+  // ---- 识图自动探测 ----
+  visionAutoDetect: Schema.boolean().default(true)
+    .description('启动时后台自动探测各模型是否支持识图：通的继承识图，不通的自动标记纯文字（写 ~/.dsh/settings.yaml，自动备份；不阻塞启动）'),
 });
 
 /** 日志小工具。 */
@@ -104,16 +110,150 @@ function makeLog(label) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * 可被 abort 打断的 sleep。
+ *
+ * 为什么不用裸 sleep：拿不到单实例锁时要等 60 秒再重试，而宿主可能正好在这段
+ * 等待里卸载插件（dispose）—— 裸 sleep 会让卸载卡在这个定时器上，「插件已卸载」
+ * 迟迟不出现。abort 一到就立刻醒。
+ */
+const sleepAbortable = (ms, signal) =>
+  new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const timer = setTimeout(finish, ms);
+    function finish() {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    }
+    signal?.addEventListener('abort', finish, { once: true });
+  });
+
+/** 单实例锁的重试间隔：拿不到锁就每分钟来看一眼（持锁的那份退了就自动接上）。 */
+const LOCK_RETRY_MS = 60 * 1000;
+
+/**
+ * 409 之后的重试间隔。
+ *
+ * 为什么是「暂停 + 重试」而不是停死：409 只说明**此刻**有别人在 getUpdates，
+ * 对方随时可能自己退。停死则等于「进程活着但哑了」——systemd 的 Restart=always、
+ * launchd 的 KeepAlive 都只对「进程退出」生效，没有任何托管者会来救它。
+ */
+const CONFLICT_RETRY_MS = 30 * 1000;
+
+/** 409 时发给主人的通知：说人话 —— 发生了什么、我打算怎么做、你该去查什么。 */
+const CONFLICT_NOTICE = '⚠️ 检测到另一个进程在用同一个 bot token（409）。我这边暂停轮询、稍后自动重试。如果机器人一直不回话，请检查是否有两份实例在跑（比如重复双击了启动器）。';
+
+/** 单实例锁被别人持有时发给主人的通知（同上口径）。 */
+const LOCK_BUSY_NOTICE = '⚠️ 检测到已有另一份实例在跑（单实例锁被占）。我这边先不轮询，每 60 秒重试一次，等它退出后自动接上。如果机器人一直不回话，请检查是否有两份实例在跑（比如重复双击了启动器）。';
+
+/**
  * Telegram 返回 409 时另一个进程正在轮询同一个 bot token。
  *
  * ⚠️ 一个 token 只能有一个进程 —— 第二个进程会让先启动的那个收 409，
  *    表现就像 bot 随机不理人。
  *    插件运行在宿主进程里，不能 process.exit 拖垮整个 DSH，
- *    所以这里只报错并停掉自己的轮询。
+ *    所以收到 409 只**暂停自己的轮询、稍后自动重试**（对方可能自己退），
+ *    绝不停死：停死 = 进程还活着但不再收消息，日志里只有一行 409，
+ *    而托管者只看「进程退出」，谁都不会来救 → 静默变哑。
  */
 function isConflict(err) {
   return err?.errorCode === 409
     || /terminated by other getUpdates/i.test(String(err?.description ?? err?.message ?? ''));
+}
+
+/**
+ * 单实例锁 —— 第 1 层防护：从源头避免 409。
+ *
+ * 为什么放在「开始轮询之前」：同一个 bot token 只允许一个进程 getUpdates。
+ *   第二个进程会让先启动的那个收到 409；而 409 原先只停轮询、不退进程，
+ *   于是机器人静默变哑、服务状态还显示 running。与其事后救火，不如先决出唯一。
+ *
+ * 判定规则（锁文件内容就是一行 pid）：
+ *   - 文件不存在        → 独占创建（flag 'wx' 原子：两个实例同时启动也只有一个赢）；
+ *   - 里面的 pid 还活着 → 让位：本次不轮询，由调用方 60 秒后再来（见 LOCK_RETRY_MS）；
+ *   - pid 已死 / 内容坏 / 就是自己 → 陈旧残留（断电、被 kill 留下的），直接接管。
+ *
+ * ⚠️ fail-open：锁相关的任何异常都不许把插件弄崩，也不许让 bot 彻底不工作 ——
+ *    读不了写不了就记日志、当作拿到了锁继续跑，只是失去这层保护。
+ *    宁可偶尔撞一次 409（第 2 层会兜住），也不要「锁坏了所以 bot 永远不说话」。
+ *
+ * @param {{lockPath: string, log: Function, error: Function}} opts
+ */
+export function createInstanceLock({ lockPath, log, error }) {
+  /** 本实例是否认为自己持有锁（release 只在这个前提下才动手）。 */
+  let held = false;
+
+  /**
+   * pid 是否活着。
+   *
+   * `process.kill(pid, 0)` 不发信号，只做存在性/权限检查。
+   * ⚠️ 必须捕获异常：进程不存在时它抛 ESRCH，不捕获会把启动流程炸掉。
+   */
+  const pidAlive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      // EPERM = 进程确实在，只是当前用户没权限给它发信号 → 也算活着（别抢）；
+      // ESRCH = 没有这个进程 → 陈旧残留。
+      return err?.code === 'EPERM';
+    }
+  };
+
+  /** 尝试获取。true = 现在可以轮询（含 fail-open 的情况）。 */
+  async function acquire() {
+    try {
+      try {
+        // 'wx' = 独占创建：文件已存在就 EEXIST，绝不覆盖别人写的 pid。
+        await writeFile(lockPath, String(process.pid), { flag: 'wx' });
+        held = true;
+        log(`已取得单实例锁（${lockPath}，pid ${process.pid}）`);
+        return true;
+      } catch (err) {
+        if (err?.code !== 'EEXIST') throw err;
+      }
+
+      const raw = String(await readFile(lockPath, 'utf8').catch(() => '')).trim();
+      const pid = Number.parseInt(raw, 10);
+      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && pidAlive(pid)) {
+        log(`单实例锁被活着的 pid ${pid} 持有 —— 本实例先不轮询，${LOCK_RETRY_MS / 1000} 秒后再看`);
+        return false;
+      }
+
+      // pid 是死的（僵尸残留）/ 内容坏掉 / 就是自己（不可能有两个同 pid 的进程）→ 接管。
+      await writeFile(lockPath, String(process.pid));
+      held = true;
+      log(`单实例锁是陈旧残留（文件里的 pid：${raw || '(空)'}）—— 已接管（pid ${process.pid}）`);
+      return true;
+    } catch (err) {
+      // fail-open：拿锁本身出问题，不能连累 bot 不工作。
+      error(`单实例锁不可用（${err?.message}）—— 继续运行，只是失去这层保护`);
+      held = true;
+      return true;
+    }
+  }
+
+  /**
+   * 释放：**只删自己的锁**。
+   *
+   * ⚠️ 必须核对文件内容：这期间锁可能已被别的实例接管，
+   *    无脑 unlink 会把新实例的锁删掉，等于把两个进程同时放进来。
+   */
+  async function release() {
+    if (!held) return;
+    held = false;
+    try {
+      const raw = await readFile(lockPath, 'utf8').catch(() => null);
+      if (raw === null) return; // 文件已经不在了
+      if (Number.parseInt(String(raw).trim(), 10) !== process.pid) return; // 已经是别人的锁
+      await unlink(lockPath);
+      log('已释放单实例锁');
+    } catch (err) {
+      if (err?.code !== 'ENOENT') error(`释放单实例锁失败: ${err?.message}`);
+    }
+  }
+
+  return { acquire, release, path: lockPath, get held() { return held; } };
 }
 
 /**
@@ -285,6 +425,30 @@ export function apply(ctx, config) {
   const telegram = config.telegramToken
     ? new Telegram(config.telegramToken, { apiRoot: config.telegramApiRoot })
     : null;
+
+  /**
+   * 给主人发一条 Telegram 私聊通知（409、单实例锁被占这类「人必须知道」的事件）。
+   *
+   * ⚠️ 为什么要单独一个函数而不是复用 hub/端点：这些都是**轮询层面**的故障，
+   *    发生在消息流之外，走 hub 会被队列和端点状态牵连。
+   *
+   * 约定：私聊里 chat id == user id（与 tgEndpoint 同款），所以只需要 ownerUserId。
+   * - 没配 Telegram、或主人还没被认领（ownerUserId 为 null）→ 静默跳过，这不是错误：
+   *   没有投递目标，硬发只会得到 400。
+   * - ⚠️ 必须自己吞掉所有异常：通知失败绝不能反过来影响轮询主流程
+   *   （否则「409 之后的告警」会变成新的崩溃点）。
+   */
+  async function notifyOwner(text) {
+    if (!telegram || state.ownerUserId === null) return;
+    try {
+      await telegram.sendMessage(state.ownerUserId, text);
+    } catch (err) {
+      error(`通知主人失败: ${err?.message}`);
+    }
+  }
+
+  /** 审批桥（在入口就绪后安装；见下方 installApprovalBridge）。 */
+  let approvalBridge = null;
   /** 微信的 context_token 缓存：userId → token。入站消息带来新鲜的。 */
   // ⚠️ 必须在 Weixin 构造**之前**声明：构造函数会把下面的 onInvalidate
   //    闭包存起来，虽然它要到重连时才执行（那时已初始化完），但把声明
@@ -381,6 +545,19 @@ export function apply(ctx, config) {
   if (weixinReady) hub.add(wxEndpoint);
 
   // -------------------------------------------------------------------------
+  // 审批桥：DSH 的 approval/request → Telegram 内联按钮
+  // -------------------------------------------------------------------------
+  // 主人所在会话：私聊里 chat id == user id（与 tgEndpoint 同款约定）。
+  // 主人还没认领（ownerUserId 为 null）时返回 null → 桥不接管，走失败关闭。
+  approvalBridge = installApprovalBridge({
+    ctx,
+    telegram,
+    getChatId: () => (telegram && state.ownerUserId !== null ? state.ownerUserId : null),
+    log,
+    error,
+  });
+
+  // -------------------------------------------------------------------------
   // 排队：同一个会话的回合必须串行
   // -------------------------------------------------------------------------
   /** chatKey → Promise 链尾。 */
@@ -412,6 +589,44 @@ export function apply(ctx, config) {
   const sessionCreatedAt = new Map();
 
   /**
+   * 会话键。微信消息并入**主人的 TG 会话**（与老 bot 的 owner anchor 同口径）：
+   * TG 和微信聊的是同一段上下文，微信里 /new、/model 操作的也是同一个会话。
+   * 主人还没认领时各归各（wx:xxx）。队列键在 hub.onInbound 里仍按源分开排，
+   * 两个入口不会互相阻塞。
+   */
+  function hubChatKey(msg) {
+    if (msg.source === 'wx' && state.ownerUserId !== null) return `tg:${state.ownerUserId}`;
+    return `${msg.source}:${msg.chatId}`;
+  }
+
+  /**
+   * 回合内的「活状态」：TG = 占位消息 + 打字续期 + 进度编辑；
+   * 微信 = 只有「正在输入」（无编辑接口）。造不出来返回 null，退回干等。
+   */
+  function makeLiveStatus(msg) {
+    try {
+      if (msg.source === 'tg') {
+        if (!telegram) return null;
+        return new LiveStatus({ kind: 'tg', telegram, chatId: msg.chatId, log, error });
+      }
+      if (msg.source === 'wx' && weixin.enabled) {
+        const contextToken = msg.raw?.context_token ?? wxContextTokens.get(String(msg.chatId));
+        return new LiveStatus({
+          kind: 'wx',
+          weixin,
+          wxUserId: String(msg.chatId),
+          contextToken,
+          log,
+          error,
+        });
+      }
+    } catch (err) {
+      error(`活状态初始化失败(本轮没有进度显示,不影响回答): ${err.message}`);
+    }
+    return null;
+  }
+
+  /**
    * 把一条用户消息交给 DSH，并把回答送回来。
    *
    * ⚠️ **顺序至关重要**：`waitForTurn()` 必须在 `runtime.prompt()` **之前**订阅。
@@ -421,9 +636,29 @@ export function apply(ctx, config) {
    * @returns {Promise<{ok:boolean, error?:string}>}
    */
   async function promptFromHub(msg) {
-    const chatKey = `${msg.source}:${msg.chatId}`;
+    const chatKey = hubChatKey(msg);
     const text = String(msg.text ?? '').trim();
     if (!text) return { ok: false, error: '空消息' };
+
+    // 微信侧的命令解析：TG 在自己的入口里解析过了，这里补微信这一半
+    // （老 bot 的 handleWeixinCommand 同款）。命令不进模型、不记账。
+    if (msg.source === 'wx' && text.startsWith('/')) {
+      const parts = text.split(/\s+/);
+      const reply = (t) =>
+        weixin
+          .sendText(String(msg.chatId), t, wxContextTokens.get(String(msg.chatId)) ?? undefined)
+          .catch((err) => error(`微信命令回话失败: ${err.message}`));
+      const handled = await handleCommand(
+        reply,
+        msg.chatId,
+        msg.chatId,
+        chatKey,
+        parts[0].toLowerCase().split('@')[0],
+        parts.slice(1).join(' '),
+        'wx',
+      );
+      if (handled) return { ok: true };
+    }
 
     if (!sessionCreatedAt.has(chatKey)) sessionCreatedAt.set(chatKey, Date.now());
     memory?.ledgerRecord('user', text, chatKey);
@@ -432,6 +667,11 @@ export function apply(ctx, config) {
     await refreshHostRoute();
 
     const ep = msg.source === 'tg' ? tgEndpoint : wxEndpoint;
+
+    // 回合内的「活状态」：TG = 占位消息 + 打字续期 + 进度编辑；
+    // 微信 = 只有「正在输入」。造不出来就退回老样子（干等，不影响回答）。
+    const status = makeLiveStatus(msg);
+    if (status) await status.begin();
 
     // 冷启动记忆：会话还不存在（即将新建）= 上一段已随 /new、/restart、切模型
     // 或进程重启断开 —— 把 handoff 塞进第一条消息前面，模型不用用户复述上文。
@@ -449,9 +689,36 @@ export function apply(ctx, config) {
     // ① 先订阅，后发消息
     const waiting = runtime.waitForTurn(chatKey, config.turnTimeoutMs);
 
+    // 会话事件 → 活状态（工具动态 + 吐字速度采样），口径与老 bot 的 onSessionEvent 一致。
+    const offEvents = status
+      ? runtime.onSessionEvent((payload) => {
+          const sid = runtime.sessionIdOf(chatKey);
+          if (sid === null || payload?.sessionId !== sid) return;
+          const { event } = payload ?? {};
+          if (event?.type === 'tool/call') {
+            status.addNote(describeTool(event.data?.name, event.data?.arguments));
+            return;
+          }
+          if (event?.type === 'assistant/message') {
+            const content = event.data?.message?.content;
+            if (!Array.isArray(content)) return;
+            const t = content
+              .filter((b) => b?.type === 'text' || b?.type === 'reasoning')
+              .map((b) => b.text ?? b.reasoning ?? '')
+              .join('');
+            if (t.trim()) {
+              status.trackProgress(t.length);
+              status.addNote(t);
+            }
+          }
+        })
+      : null;
+
     // ② 发给 DSH
     const sent = await runtime.prompt(chatKey, promptText);
     if (!sent.ok) {
+      offEvents?.();
+      await status?.fail(sent.error);
       error(`交给 DSH 失败（${chatKey}）: ${sent.error}`);
       await ep.send({ text: `❌ 处理失败：${sent.error}` }).catch(() => {});
       return sent;
@@ -459,16 +726,24 @@ export function apply(ctx, config) {
 
     // ③ 等回答
     const answer = await waiting;
+    offEvents?.();
     if (!answer.ok) {
+      await status?.fail(answer.error);
       error(`等回答失败（${chatKey}）: ${answer.error}`);
       await ep.send({ text: `❌ ${answer.error}` }).catch(() => {});
       return { ok: false, error: answer.error };
     }
 
     const body = answer.text || '(本轮没有文字输出)';
+    // 流水账记**不带小尾巴**的回答原文（老 bot 同口径：速度尾巴是采样元数据，不是对话）。
     memory?.ledgerRecord('assistant', body, chatKey);
-    // 交给用户 —— 走端点自己的发送能力（TG 会做 markdown 转换和长度切分）
-    await ep.send({ text: body }).catch((err) => error(`发送失败（${chatKey}）: ${err?.message}`));
+    // 收尾交付：TG 由 status.finish 把回答（含速度小尾巴）**编辑进占位消息**（返回 null）；
+    // 微信由 status 取消「正在输入」并返回小尾巴，回答照常走端点发送、小尾巴拼在后面。
+    const tail = status ? await status.finish(body) : null;
+    if (!(status && msg.source === 'tg')) {
+      const outText = tail ? `${body}\n\n${tail}` : body;
+      await ep.send({ text: outText }).catch((err) => error(`发送失败（${chatKey}）: ${err?.message}`));
+    }
     return { ok: true };
   }
 
@@ -490,19 +765,36 @@ export function apply(ctx, config) {
   async function pollLoop() {
     if (!telegram) return;
     log('Telegram 轮询启动');
+    /**
+     * 连续冲突计数。
+     *
+     * 用途有二：① 通知节流（第 1 次 + 之后每 10 次一次）；② 成功轮询一次就归零 ——
+     * 这样「冲突 → 恢复 → 再冲突」时，主人会重新立刻收到第 1 次通知，而不是被
+     * 上一轮遗留的计数压到第 10 次才响。
+     */
+    let conflictStreak = 0;
     while (!state.stopped) {
       let updates;
       try {
         updates = await telegram.getUpdates(offset, 30, pollAbort?.signal);
+        // 这一轮拿到了（哪怕是空数组）说明此刻没人和我们抢 → 冲突计数归零。
+        conflictStreak = 0;
       } catch (err) {
         if (state.stopped) break;
         if (isConflict(err)) {
+          conflictStreak += 1;
           error('');
           error('❌ 409 Conflict：另一个进程正在用同一个 bot token 收消息。');
-          error('   本插件的 Telegram 轮询**已停止**（没有退出 DSH 进程）。');
+          error(`   本实例暂停轮询 ${CONFLICT_RETRY_MS / 1000} 秒后自动重试（不退出进程 —— 这里是宿主进程）。`);
           error('   常见原因：同一个 token 有别的进程在用（例如另一个 bot 或另一份插件）。');
           error('   ⛔ 同一个 token 只能有一个进程 —— 请只留一个。');
-          return; // ⚠️ 不能 process.exit：那是宿主进程
+          // 通知节流：第 1 次 + 之后每 10 次一次，避免主人被每分钟一条刷屏。
+          if (conflictStreak === 1 || conflictStreak % 10 === 0) {
+            await notifyOwner(CONFLICT_NOTICE);
+          }
+          // ⚠️ 这里**不能 return**：对方可能下一秒就自己退了，停死等于永久哑掉。
+          await sleep(CONFLICT_RETRY_MS);
+          continue;
         }
         if (!/abort/i.test(err.message ?? '')) {
           error(`getUpdates 失败: ${err.message}`);
@@ -566,8 +858,16 @@ export function apply(ctx, config) {
     const rawText = (message.text ?? message.caption ?? '').trim();
 
     if (rawText.startsWith('/')) {
-      const [command] = rawText.split(/\s+/);
-      const handled = await handleCommand(chatId, userId, command.toLowerCase().split('@')[0]);
+      const parts = rawText.split(/\s+/);
+      const handled = await handleCommand(
+        (t) => telegram.sendMessage(chatId, t),
+        chatId,
+        userId,
+        `tg:${chatId}`,
+        parts[0].toLowerCase().split('@')[0],
+        parts.slice(1).join(' '),
+        'tg',
+      );
       if (handled) return;
     }
 
@@ -654,8 +954,18 @@ export function apply(ctx, config) {
     const userId = query.from?.id;
     if (!authorize(userId).ok) return;
     const data = String(query.data ?? '');
+    // 审批按钮（appr:ok:/appr:no:）优先于模型菜单处理。
+    if (approvalBridge?.handleApprovalCallback(data, query)) return;
     if (data.startsWith('model:')) {
-      await handleCommand(query.message.chat.id, userId, '/model', data.slice(6));
+      await handleCommand(
+        (t) => telegram.sendMessage(query.message.chat.id, t),
+        query.message.chat.id,
+        userId,
+        `tg:${query.message.chat.id}`,
+        '/model',
+        data.slice(6),
+        'tg',
+      );
     }
   }
 
@@ -681,70 +991,161 @@ export function apply(ctx, config) {
     const launcher = config.restartCommand || join(cwd, '启动-mybot.command');
     const hasLauncher = Boolean(launcher) && existsSync(launcher);
     const [, scriptPath, ...extraArgs] = process.argv;
-    if (!hasLauncher && !scriptPath) return null;
+    // 托管者检测：systemd 给每个 unit 进程注入 INVOCATION_ID；launchd 注入 XPC_SERVICE_NAME。
+    // ⚠️ 被托管时**绝不能**再 nohup 拉一份：托管者自己会把新实例拉起来，
+    //    两份会抢同一个 bot token → 409，而 409 只让其中一份停轮询、进程不退，
+    //    表现就是「机器人静默变哑、systemd 还显示 running」。
+    const supervisor = process.env.INVOCATION_ID
+      ? 'systemd'
+      : process.env.XPC_SERVICE_NAME
+        ? 'launchd'
+        : null;
+    if (!hasLauncher && !scriptPath && !supervisor) return null;
     return {
       RESTART_DELAY_SECONDS: '8',
       RESTART_TARGET_PID: String(process.pid),
       RESTART_LOG: join(cwd, 'dsh-restart.log'),
-      ...(hasLauncher ? { RESTART_LAUNCHER: launcher } : {}),
-      ...(scriptPath
-        ? {
-            RESTART_NODE: process.execPath,
-            RESTART_SCRIPT: scriptPath,
-            RESTART_ARGS: extraArgs.join(' '),
-            RESTART_CWD: cwd,
-          }
-        : {}),
+      // 被托管：只杀宿主，交给托管者拉起（helper 内不再 nohup / 不再 open 启动器）
+      ...(supervisor
+        ? { RESTART_SUPERVISED: supervisor }
+        : hasLauncher
+          ? { RESTART_LAUNCHER: launcher }
+          : {
+              RESTART_NODE: process.execPath,
+              RESTART_SCRIPT: scriptPath,
+              RESTART_ARGS: extraArgs.join(' '),
+              RESTART_CWD: cwd,
+            }),
       ...(config.telegramToken ? { RESTART_TG_TOKEN: config.telegramToken } : {}),
     };
   }
 
-  async function handleCommand(chatId, userId, command, arg = '') {
+  async function handleCommand(reply, chatId, userId, chatKey, command, arg = '', source = 'tg') {
     switch (command) {
       case '/whoami':
-        await telegram.sendMessage(chatId, `你的 Telegram 用户 ID：${userId}`);
+        await reply(
+          source === 'wx'
+            ? `你的微信用户 ID: ${userId}\n本聊天 ID: wx-${userId}`
+            : `你的用户 ID: ${userId}\n本聊天 ID: ${chatId}`,
+        );
         return true;
 
       case '/status': {
+        // 老 bot 同款字段：会话 ID / 已存在 / 工作目录 / 模型（含思考强度）/ 权限模式 / 进程状态。
+        const sid = runtime.sessionIdOf(chatKey);
+        const createdAt = sessionCreatedAt.get(chatKey) ?? 0;
+        const ageMinutes = createdAt ? Math.round((Date.now() - createdAt) / 60000) : null;
+        const current = useHostRoutes ? await refreshHostRoute() : activeRoute;
+        const effort = current ? reasoningEffortFor(current, undefined) : undefined;
+        const effortText = effort === 'off' ? ' (思考已关闭)' : effort ? ` (思考强度 ${effort})` : '';
         const lines = [
-          '📊 插件状态',
-          `• 会话数：${runtime.sessionCount}`,
-          `• 当前模型：${activeRoute ? describeRoute(activeRoute) : '(未配置)'}`,
-          `• 工作目录：${config.cwd || process.cwd()}`,
-          `• 入口：${hub.ids().join(' + ') || '(无)'}`,
-          `• 记忆：${memory ? config.memoryDir : '未配置'}`,
+          '📊 当前状态',
+          `会话 ID: ${sid ?? '(未建立)'}`,
+          ageMinutes !== null ? `已存在: ${ageMinutes} 分钟` : '已存在: (未知)',
+          `工作目录: ${config.cwd || process.cwd()}`,
+          `模型: ${current ? `${current.key} — ${current.provider} / ${current.model}` : '(未配置)'}${current ? effortText : ''}`,
+          '权限模式: 由 ~/.dsh/settings.yaml 的 permission.defaultPreset 决定（bot 不覆盖）',
+          `DSH 进程: ${runtime.ready ? '运行中 ✅' : '未运行 ⚠️'}`,
         ];
-        await telegram.sendMessage(chatId, lines.join('\n'));
+        await reply(lines.join('\n'));
         return true;
       }
 
       case '/model': {
         // 宿主模式下实时重建表单：web 端刚加的模型立刻能看到。
         const table = useHostRoutes ? await hostModelTable() : { list: routeList };
-        const lookup = (key) =>
-          useHostRoutes ? table.list.find((r) => r.key === key) : routeByKey(routes, key);
         const current = useHostRoutes ? await refreshHostRoute() : activeRoute;
+        const picks = table.list;
         if (!arg) {
-          const list = table.list.map((r) => `• ${r.key} — ${describeRoute(r)}`).join('\n');
-          await telegram.sendMessage(
-            chatId,
-            `当前：${current ? current.key : '(未配置)'}\n\n可用模型：\n${list || '(未配置任何模型 —— 在 web 端的模型页添加，或在本插件 config.routes 里手写)'}\n\n用法：/model <key>`,
+          if (source === 'tg') {
+            // 老 bot 同款：菜单文 + 内联按钮（当前档 ✅ 后缀，点按钮直接切）。
+            const menu = [
+              '🧠 选择模型',
+              '',
+              `当前：${current ? describeRoute(current) : '(未配置)'}`,
+              '',
+              '点上面的按钮切换。DSH 的模型在一个运行进程内是固定的，切换会重启 DSH 子进程并清空当前会话上下文。',
+              '',
+              '启动回退顺序：',
+              ...picks.map((r) => `  ${r.short}`),
+              '',
+              '需要远程重启 bot 加载新代码，请在命令列表里选「重启」（位于「切换模型」与「查看当前会话」之间，效果等同 /restart，会断开当前会话）。',
+            ].join('\n');
+            await telegram.sendMessage(chatId, menu, {
+              reply_markup: {
+                inline_keyboard: picks.map((r) => [
+                  {
+                    // ✅ 放**后缀**不放前缀 —— 前缀会把那一行文字整体右推（老 bot 2026-09-19 的结论）。
+                    text: `${r.short}${current && r.key === current.key ? ' ✅' : ''}`,
+                    callback_data: `model:${r.key}`,
+                  },
+                ]),
+              },
+            });
+          } else {
+            // 老 bot 微信同款：编号清单，回 /model <编号> 直接切。
+            const lines = [
+              '🧠 选择模型',
+              '',
+              `当前: ${current ? describeRoute(current) : '(未配置)'}`,
+              '',
+              '可用模型:',
+              ...picks.map(
+                (r, i) =>
+                  `${i + 1}. ${current && r.key === current.key ? '✅ ' : ''}${r.key} (${r.provider} / ${r.model})`,
+              ),
+              '',
+              '回复 /model <编号> 直接切换，例如 /model 2',
+              `（也认 key，例如 /model ${(picks.find((r) => !current || r.key !== current.key) ?? picks[0])?.key ?? ''}）`,
+              '',
+              '自动回退顺序:' + picks.map((r) => `\n- ${r.short}`).join(''),
+              '',
+              '⚠️ 切换模型会重启 DSH 子进程并清空当前会话上下文。',
+            ].join('\n');
+            await reply(lines);
+          }
+          return true;
+        }
+        // 带参数：纯数字按编号，否则按 key/label 模糊匹配（老 bot 微信同款）。
+        let wanted = null;
+        if (/^\d+$/.test(arg.trim())) {
+          const idx = Number(arg.trim()) - 1;
+          if (idx >= 0 && idx < picks.length) wanted = picks[idx];
+        } else {
+          const low = arg.trim().toLowerCase();
+          wanted =
+            picks.find((r) => r.key.toLowerCase() === low) ??
+            picks.find((r) => (r.label ?? '').toLowerCase() === low) ??
+            picks.find((r) => r.key.toLowerCase().startsWith(low)) ??
+            null;
+        }
+        if (!wanted) {
+          if (source === 'wx') {
+            await reply(
+              `❓ 不认识「${arg.trim()}」。\n` +
+                '可用编号:' +
+                picks.map((r, i) => `\n${i + 1}. ${r.label}`).join('') +
+                '\n\n发 /model 看完整清单。',
+            );
+          } else {
+            await reply(`没有这条路由：${arg.trim()}`);
+          }
+          return true;
+        }
+        if (current && wanted.key === current.key && runtime.ready) {
+          await reply(
+            source === 'tg' ? `当前已经是「${wanted.short}」了。` : `当前已经是「${wanted.label}」了。`,
           );
           return true;
         }
-        const wanted = lookup(arg);
-        if (!wanted) {
-          await telegram.sendMessage(chatId, `没有这条路由：${arg}`);
-          return true;
-        }
-        const chatKey = `tg:${chatId}`;
+        await reply(`⏳ 正在切换到「${wanted.label}」…`);
         // 切模型 = 旧会话即将作废（换档重建），断开前先写 handoff —— 与老 bot 同口径：
         // 本次会话 ≥20 条才写，调试期间反复切模型不会覆盖已有记忆。
         if (memory) {
           memory.maybeWriteHandoff({
             sessionId: runtime.sessionIdOf(chatKey) ?? chatKey,
             reason: 'model',
-            currentRoute: () => activeRoute,
+            currentRoute: () => current,
             ownerUserId: state.ownerUserId,
             workspace: config.cwd || process.cwd(),
             sessionCreatedAt: sessionCreatedAt.get(chatKey) ?? 0,
@@ -753,15 +1154,16 @@ export function apply(ctx, config) {
         const switched = await runtime.switchRoute(chatKey, wanted);
         if (switched.ok) {
           if (!useHostRoutes) activeRoute = wanted;
-          await telegram.sendMessage(chatId, `✅ 已切到 ${wanted.key} — ${describeRoute(wanted)}`);
+          await reply(
+            `✅ 已切换到「${wanted.label}」\n${wanted.provider} / ${wanted.model}\n\n会话已重置,直接发消息即可。`,
+          );
         } else {
-          await telegram.sendMessage(chatId, `❌ 切换失败：${switched.error}`);
+          await reply(`❌ 切换到「${wanted.label}」失败:${switched.error}`);
         }
         return true;
       }
 
       case '/new': {
-        const chatKey = `tg:${chatId}`;
         // 断开前写 handoff —— 这正是「handoff」这个功能的第二半。
         if (memory) {
           memory.maybeWriteHandoff({
@@ -780,7 +1182,6 @@ export function apply(ctx, config) {
       }
 
       case '/restart': {
-        const chatKey = `tg:${chatId}`;
         // 与老 bot 同口径：重启前**无条件**写 handoff —— 用户明确要留档，
         // 不设 20 条门槛（刚聊两句也要重启时，恰恰最需要把这两句留下）。
         if (memory) {
@@ -827,20 +1228,29 @@ export function apply(ctx, config) {
         return true;
       }
 
-      case '/help':
-        await telegram.sendMessage(
-          chatId,
+      case '/start':
+      case '/help': {
+        // 老 bot 同款文案（/model 一行列出所有模型 label）。
+        const labels = (useHostRoutes ? (await hostModelTable()).list : routeList)
+          .map((r) => r.label ?? r.key)
+          .join(' / ');
+        await reply(
           [
-            '可用命令：',
-            '/new — 开新会话（并写 handoff）',
-            '/restart — 重启进程加载新代码（先留档再重启）',
-            '/model — 查看/切换模型',
-            '/status — 查看插件状态',
-            '/whoami — 查看你的用户 ID',
-            '/help — 这条帮助',
+            '👋 我是接在 DeepSeek Harness 上的助手,直接发消息就能用。',
+            '',
+            '可用命令:',
+            '/new — 开启一个全新会话(清空上下文)',
+            `/model — 切换模型(${labels})`,
+            '/restart — 重启 bot 加载新代码（会断开当前会话）',
+            '/status — 查看当前会话和运行状态',
+            source === 'wx' ? '/whoami — 查看你的用户 ID' : '/whoami — 查看你的 Telegram 用户 ID',
+            '/help — 显示这份帮助',
+            '',
+            '也可以直接发图片、语音给我。',
           ].join('\n'),
         );
         return true;
+      }
 
       default:
         return false; // 不认识的命令 → 当普通消息交给模型
@@ -928,7 +1338,7 @@ export function apply(ctx, config) {
     telegram
       .setMyCommands([
         { command: 'new', description: '开启新会话' },
-        { command: 'restart', description: '重开会话（自动留档）' },
+        { command: 'restart', description: '重启 bot 加载新代码' },
         { command: 'model', description: '切换模型' },
         { command: 'status', description: '查看当前状态' },
         { command: 'whoami', description: '查看我的用户 ID' },
@@ -940,6 +1350,28 @@ export function apply(ctx, config) {
       .getMe()
       .then((info) => log(`Telegram 已登录：@${info.username} (${info.id})`))
       .catch((err) => error(`连不上 Telegram：${err.message}`));
+
+    // ---- 识图能力自动探测（与老 bot 的 bot.sh 启动钩子同款）----
+    // 后台跑一次 vision-auto：假设所有模型都识图（defaultInput），真发一张测试图逐个验证，
+    // 不支持的自动标记 input: [text]。⚠️ 刻意**不阻断启动**：无网/超时/脚本挂了只警告，
+    // 探测脚本自己保证「只加不删 + 自动备份 + 幂等」。走 detached 子进程，不占插件生命周期。
+    if (config.visionAutoDetect) {
+      try {
+        const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'vendor', 'vision-auto.mjs');
+        if (existsSync(script)) {
+          const child = spawn(process.execPath, [script, '--quiet'], {
+            detached: true,
+            stdio: 'ignore',
+          });
+          child.unref();
+          log('识图自动探测已在后台启动（vision-auto）');
+        } else {
+          log('未找到 vendor/vision-auto.mjs，跳过识图探测');
+        }
+      } catch (err) {
+        error(`识图探测启动失败（不影响运行）: ${err?.message}`);
+      }
+    }
   }
 
   /**
@@ -958,8 +1390,51 @@ export function apply(ctx, config) {
 
   pollAbort = new AbortController();
   wxAbort = new AbortController();
+
+  // ---- 第 1 层：单实例锁（开始轮询之前决出唯一）----
+  // 只在配了 Telegram 时才需要：409 只属于 getUpdates，微信通道不会因为多一份实例
+  // 而打架 —— 不配 TG 的实例不该去占这把锁，否则会把同目录下真正要收 TG 的实例挡住。
+  const lock = telegram
+    ? createInstanceLock({
+        lockPath: join(config.cwd || process.cwd(), '.botplugin.lock'),
+        log,
+        error,
+      })
+    : null;
+
+  /**
+   * 等锁 → 轮询（Telegram 专用）。
+   *
+   * 拿不到锁（另一个活着的实例正在用同一个 token）时**不退出进程**，而是每 60 秒
+   * 重试获取：那份实例一旦死掉，本实例就自动接上，全程不会 409。
+   * 微信不受 409 影响，所以不参与这把锁，照原样立刻开始轮询。
+   */
+  async function telegramPollWhenLocked() {
+    if (!telegram || !lock) return;
+    let waits = 0;
+    while (!state.stopped && !(await lock.acquire())) {
+      waits += 1;
+      // 大声说一次就够，重试本身每 60 秒都会在 acquire 里留下可读的日志。
+      if (waits === 1) {
+        error('');
+        error('❌ 单实例锁被另一个活着的进程持有 —— 本实例暂不轮询（不会退出进程）。');
+        error('   常见原因：同一个 token 有两份实例在跑（比如重复双击了启动器）。');
+        error(`   每 ${LOCK_RETRY_MS / 1000} 秒重试一次，那份实例退出后本实例会自动接上。`);
+      }
+      // 通知同样节流：第 1 次 + 之后每 10 次一次（≈10 分钟），别刷屏。
+      if (waits === 1 || waits % 10 === 0) await notifyOwner(LOCK_BUSY_NOTICE);
+      await sleepAbortable(LOCK_RETRY_MS, pollAbort?.signal);
+    }
+    if (state.stopped) {
+      // 等锁期间被卸载：锁若刚好被自己拿到就还回去，别给下一个进程留僵尸锁。
+      await lock.release();
+      return;
+    }
+    await pollLoop();
+  }
+
   // 两个轮询并行跑；单个挂掉不影响另一个（微信没登录也必须让 TG 照跑）。
-  Promise.all([pollLoop(), weixinPollLoop()]).catch((err) =>
+  Promise.all([telegramPollWhenLocked(), weixinPollLoop()]).catch((err) =>
     error(`轮询循环异常退出: ${err?.stack ?? err?.message}`),
   );
 
@@ -968,8 +1443,11 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------------------
   ctx.on('dispose', async () => {
     state.stopped = true;
+    approvalBridge?.dispose();
     pollAbort?.abort();
     wxAbort?.abort();
+    // 锁是自己的才删（release 内部核对 pid）：这期间可能已被别的实例接管。
+    await lock?.release();
     await hub.stop().catch(() => {});
     await runtime.stop().catch((err) => error(`关闭运行时失败: ${err?.message}`));
     log('插件已卸载，轮询已停止');
@@ -1002,4 +1480,5 @@ export function apply(ctx, config) {
 }
 
 // 保留导出，方便别处（测试）复用
+// （createInstanceLock 在上面就地具名导出：单实例锁要能被隔离测试直接调用）
 export { markAsHubOutput, makeMessage, isRouteFailure, routeFor };

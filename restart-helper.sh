@@ -11,11 +11,13 @@
 #   RESTART_NODE/RESTART_SCRIPT/RESTART_ARGS/RESTART_CWD
 #                          没有启动器时按原始命令行 nohup 拉起（尽力而为）
 #   RESTART_TG_TOKEN       Telegram token（用于等旧进程真正释放 token，防 409；可选）
+#   RESTART_SUPERVISED     托管者名（systemd / launchd）。有它时**只杀宿主、不再拉起** ——
+#                          托管者会把新实例拉起来，再 nohup 一份就是双实例抢 token（409）。
 #   RESTART_LOG            日志文件（默认 <工作目录>/dsh-restart.log）
 #   RESTART_DELAY_SECONDS  动手前的延迟（默认 8s：让确认消息发出、当前回合走完）
 #
-# ⚠️ 已知边界：宿主若是 launchd 托管（KeepAlive），杀掉后 launchd 会自动拉起一份，
-#   此时不要再走 nohup（会双实例抢 token）。检测不了 launchd，只能靠用户别这样装。
+# 托管者检测（在 src/index.js 里做，这里只消费结果）：
+#   systemd 给每个 unit 进程注入 INVOCATION_ID；launchd 注入 XPC_SERVICE_NAME。
 
 DELAY="${RESTART_DELAY_SECONDS:-8}"
 TARGET_PID="${RESTART_TARGET_PID:-}"
@@ -45,29 +47,57 @@ kill_tree() {
     grandkids="$grandkids $(pgrep -P "$k" 2>/dev/null || true)"
   done
 
+  local mypgid=""
+  mypgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)"
+
   for p in $grandkids $kids "$pid"; do
     [ -n "$p" ] || continue
+    # ⚠️ 绝不能杀自己。本 helper 是宿主的**子进程**（detached 只改了会话/进程组，PPID 仍是宿主），
+    #    所以它必然出现在 $kids 里 —— 不跳过的话会在杀到宿主之前先把自己杀掉，循环随即中断，
+    #    症状是「日志停在『停止旧宿主』，宿主纹丝不动、进程从没重启」。同一进程组的也跳过。
+    [ "$p" = "$$" ] && continue
+    if [ -n "$mypgid" ]; then
+      local ppg=""
+      ppg="$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ' || true)"
+      [ -n "$ppg" ] && [ "$ppg" = "$mypgid" ] && continue
+    fi
     kill -"$sig" "$p" 2>/dev/null || true
   done
 
-  local mypgid=""
-  mypgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)"
   if [ -n "$pgid" ] && [ "$pgid" != "$mypgid" ]; then
     kill -"$sig" -- "-$pgid" 2>/dev/null || true
   fi
 }
 
 if kill -0 "$TARGET_PID" 2>/dev/null; then
-  log "停止旧宿主 pid=$TARGET_PID（含子孙进程）"
-  kill_tree "$TARGET_PID" TERM
-  for _ in $(seq 1 15); do
-    kill -0 "$TARGET_PID" 2>/dev/null || break
-    sleep 1
-  done
-  if kill -0 "$TARGET_PID" 2>/dev/null; then
-    log "⚠️ pid=$TARGET_PID 未退出，发 SIGKILL（整组）"
-    kill_tree "$TARGET_PID" KILL
-    sleep 2
+  if [ -n "${RESTART_SUPERVISED:-}" ]; then
+    # 被托管：只杀**本体**，不遍历进程树 —— 进程组/残留由托管者清理（systemd 是 cgroup 整组杀）。
+    # 遍历树的另一个坏处：连自己一起杀（见 kill_tree 注释），以及可能顺手打断在飞的其它子进程。
+    # ⚠️ 这行要写在 kill **之前**：宿主一死，systemd 会按 cgroup 整组清理，
+    #    本 helper 也在同一 cgroup 里 → 会被一起杀掉，之后的日志永远来不及写。
+    log "ℹ️ 宿主由 ${RESTART_SUPERVISED} 托管：停止旧宿主 pid=$TARGET_PID（只杀本体，进程组由它清理并拉起；本 helper 不再 nohup，避免双实例抢 token）"
+    kill -TERM "$TARGET_PID" 2>/dev/null || true
+    for _ in $(seq 1 15); do
+      kill -0 "$TARGET_PID" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "$TARGET_PID" 2>/dev/null; then
+      log "⚠️ pid=$TARGET_PID 未退出，发 SIGKILL"
+      kill -KILL "$TARGET_PID" 2>/dev/null || true
+      sleep 2
+    fi
+  else
+    log "停止旧宿主 pid=$TARGET_PID（含子孙进程）"
+    kill_tree "$TARGET_PID" TERM
+    for _ in $(seq 1 15); do
+      kill -0 "$TARGET_PID" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "$TARGET_PID" 2>/dev/null; then
+      log "⚠️ pid=$TARGET_PID 未退出，发 SIGKILL（整组）"
+      kill_tree "$TARGET_PID" KILL
+      sleep 2
+    fi
   fi
 fi
 
@@ -93,6 +123,16 @@ if [ -n "${RESTART_TG_TOKEN:-}" ]; then
 fi
 
 sleep 1
+
+# 被托管（systemd / launchd）：托管者会把新实例拉起来，这里只负责"停"，不负责"拉"。
+# 再拉一份的后果：两份抢同一个 bot token → 其中一份吃 409 → 它只停轮询、进程不退，
+# 表现就是「机器人静默变哑，而 systemctl 还显示 running」。
+if [ -n "${RESTART_SUPERVISED:-}" ]; then
+  log "ℹ️ 宿主由 ${RESTART_SUPERVISED} 托管：已停止旧宿主，新实例交由它拉起（本 helper 不再 nohup，避免双实例抢 token）"
+  sleep 3
+  log "restart-helper 结束"
+  exit 0
+fi
 
 # 拉起新宿主：优先启动器（macOS `open` 会开一个新的终端窗口，用户看得见）；
 # 没有启动器就按原始命令行 nohup 后台拉起（日志进 RESTART_LOG）。
