@@ -8,7 +8,7 @@
 - 机器上装好 DSH（有 `dsh` 命令）
 - 一个 Telegram bot token（在 Telegram 里找 @BotFather 发送 `/newbot` 新建，不要和其他 bot 共用）
 
-## 安装方式一：远程一条命令（推荐）
+## 安装方式一：在线安装（会敲命令的，推荐）
 
 1. 装进目标 profile（下面以 `mybot` 为例，没有就先建一个）：
 
@@ -32,16 +32,14 @@
 
 以后升级也是同一条命令（重新 add 会拉最新版本）。npm 发布后还可以用 `dsh plugin --profile mybot add dsh-botplugin`。
 
-## 安装方式二：本地目录
+## 安装方式二：下载安装包（不想敲命令的）
 
-1. 把整个 `botplugin/` 目录拷到机器任意路径，比如 `~/botplugin`。
-2. 装进目标 profile：
+1. 下载安装包：[dsh-mybot-安装包.zip](dsh-mybot-安装包.zip)（在本页文件列表里，点它再点 Download / Download raw）。
+2. 解压，双击里面的 `安装-mybot.command` —— 它会自动装到 `~/DSH/mybot` 并弹出图文说明。
+3. 按弹出的说明填 token（打开 `~/DSH/mybot/profiles/mybot/cordis.patch.yml`，把 telegramToken 换成你的）。
+4. 以后每次使用：双击 `~/DSH/mybot/启动-mybot.command`。想加微信：双击 `登录微信.command` 扫码。
 
-   ```
-   dsh plugin --profile mybot add ~/botplugin
-   ```
-
-3. 配置和启动同方式一的第 2、3 步。
+> 两种方式装出来的是同一个插件，选一种就行。安装包方式自带图文说明和启动器，适合第一次接触命令行的人；在线方式升级最省事（重跑一条命令）。
 
 ## 配置项速查
 
