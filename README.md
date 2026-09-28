@@ -56,14 +56,17 @@
 
 ## 指令
 
-`/whoami` `/status` `/model` `/new`（新会话） `/help`
+`/whoami` `/status` `/model` `/new`（新会话） `/restart`（重开会话+留档） `/help`
+
+> `/restart` 重开的是**会话**，不动进程（插件杀不掉宿主）。要加载新代码：启动窗口 Ctrl-C 后再双击 `启动-mybot.command`。
 
 ## 记忆（流水账 + handoff）
 
 默认开启，什么都不用配：
 
 - **流水账**：每轮对话原文追加到 `<工作目录>/memory/conversation-cache/raw/ledger/`，按月一个文件，只增不删。
-- **handoff**：`/new`、切换模型（本次会话满 20 条才写，调试期反复切不会覆盖）和启动补写时，把最近 20 条进展落盘到 `<工作目录>/memory/handoff/handoff.md`。
+- **handoff**：`/new`、切换模型（本次会话满 20 条才写，调试期反复切不会覆盖）、`/restart`（无条件）和启动补写时，把最近 20 条进展落盘到 `<工作目录>/memory/handoff/handoff.md`。
+- **冷启动注入**：新会话的第一条消息会自动带上最近一次 handoff，模型直接接着上段干，不用你复述上文。
 - 记账程序随插件自带（`vendor/conversation-cache/`），不依赖机器上是否装过 DSH 的其它项目。
 - 想换位置或关闭：配置里写 `memoryDir`（自定路径；**空串 = 关闭**）、`memoryScript`（自定程序路径）。
 

@@ -304,6 +304,26 @@ export class Memory {
   }
 
   /**
+   * 读回 handoff —— 新会话第一条消息前的「冷启动记忆」。
+   *
+   * 只写不读的话 handoff 就是装饰：老 bot 在新会话首条消息前注入 handoff 正文，
+   * 这里给插件补上同一环。没有 handoff 文件就返回 null
+   * （全新安装的第一句话本来就没有上文可接，属正常）。
+   * @returns {string|null}
+   */
+  readBootstrapContext() {
+    try {
+      const file = join(this.memoryDir, 'handoff', 'handoff.md');
+      if (!existsSync(file)) return null;
+      const text = readFileSync(file, 'utf8').trim();
+      return text || null;
+    } catch (err) {
+      this.error(`[handoff] 读回失败(已忽略,不影响对话): ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
    * 断开「之前」写 handoff，但**只在本次会话真的聊过东西时才写**。
    *
    * 会话内不足 20 条 = 频繁调试（刚开就 /new、反复切模型），不要覆盖已有记忆。

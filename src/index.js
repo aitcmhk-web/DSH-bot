@@ -431,11 +431,24 @@ export function apply(ctx, config) {
 
     const ep = msg.source === 'tg' ? tgEndpoint : wxEndpoint;
 
+    // 冷启动记忆：会话还不存在（即将新建）= 上一段已随 /new、/restart、切模型
+    // 或进程重启断开 —— 把 handoff 塞进第一条消息前面，模型不用用户复述上文。
+    // 会话一旦存在 sessionIdOf 就非空，天然「每个会话只注一次」；
+    // 记账在上一行已用原文落账，不受注入影响。
+    let promptText = text;
+    if (memory && runtime.sessionIdOf(chatKey) === null) {
+      const boot = memory.readBootstrapContext();
+      if (boot) {
+        promptText = `<冷启动记忆（系统自动注入，无需回复此段）>\n${boot}\n</冷启动记忆>\n\n${text}`;
+        log(`[mem] 已注入冷启动记忆（${chatKey}）`);
+      }
+    }
+
     // ① 先订阅，后发消息
     const waiting = runtime.waitForTurn(chatKey, config.turnTimeoutMs);
 
     // ② 发给 DSH
-    const sent = await runtime.prompt(chatKey, text);
+    const sent = await runtime.prompt(chatKey, promptText);
     if (!sent.ok) {
       error(`交给 DSH 失败（${chatKey}）: ${sent.error}`);
       await ep.send({ text: `❌ 处理失败：${sent.error}` }).catch(() => {});
@@ -732,12 +745,36 @@ export function apply(ctx, config) {
         return true;
       }
 
+      case '/restart': {
+        const chatKey = `tg:${chatId}`;
+        // 与老 bot 同口径：重启前**无条件**写 handoff —— 用户明确要留档，
+        // 不设 20 条门槛（刚聊两句也要重启时，恰恰最需要把这两句留下）。
+        if (memory) {
+          memory.writeHandoff({
+            sessionId: runtime.sessionIdOf(chatKey) ?? chatKey,
+            reason: 'restart',
+            currentRoute: () => activeRoute,
+            ownerUserId: state.ownerUserId,
+            workspace: config.cwd || process.cwd(),
+          });
+        }
+        await runtime.closeSession(chatKey);
+        sessionCreatedAt.set(chatKey, Date.now());
+        await telegram.sendMessage(
+          chatId,
+          '🔄 已重开会话，上一段进展已留档（下一条消息自动带回）。\n'
+          + '⚠️ 插件版重启不动进程 —— 要加载新代码：在启动窗口 Ctrl-C，再双击 启动-mybot.command。',
+        );
+        return true;
+      }
+
       case '/help':
         await telegram.sendMessage(
           chatId,
           [
             '可用命令：',
             '/new — 开新会话（并写 handoff）',
+            '/restart — 重开会话（无条件写 handoff）',
             '/model — 查看/切换模型',
             '/status — 查看插件状态',
             '/whoami — 查看你的用户 ID',
@@ -832,6 +869,7 @@ export function apply(ctx, config) {
     telegram
       .setMyCommands([
         { command: 'new', description: '开启新会话' },
+        { command: 'restart', description: '重开会话（自动留档）' },
         { command: 'model', description: '切换模型' },
         { command: 'status', description: '查看当前状态' },
         { command: 'whoami', description: '查看我的用户 ID' },
