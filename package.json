@@ -16,6 +16,8 @@
     "weixin-login.mjs",
     "qr-terminal.mjs",
     "restart-helper.sh",
+    "功能说明.txt",
+    "使用说明.txt",
     "test-image-admit.mjs",
     "test-image-e2e.mjs"
   ],

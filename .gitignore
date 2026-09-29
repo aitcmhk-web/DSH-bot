@@ -5,3 +5,4 @@ weixin-account.json
 *.bak.*
 probe-resolution.mjs
 test-telegram-parity.mjs
+.staging/
