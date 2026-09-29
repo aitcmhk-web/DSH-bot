@@ -110,6 +110,15 @@ function findEntry(lines, modelId) {
 
 const entryHasInput = (lines, r) => lines.slice(r.start, r.end + 1).some((l) => /^ {8,}input:/.test(l));
 
+/** 摘掉条目里的纯文字标记（input: 行 + 紧随的 - text 行）。从区间尾部往前删，行号不失效。 */
+function removeMark(lines, r) {
+  for (let i = r.end; i >= r.start; i--) {
+    if (/^ {10,}input:/.test(lines[i])) {
+      lines.splice(i, /^ {12,}- /.test(lines[i + 1] ?? '') ? 2 : 1);
+    }
+  }
+}
+
 async function main() {
   YAML = await loadYaml();
   if (!YAML) {
@@ -162,26 +171,47 @@ async function main() {
     j.result = await j.run;
   }));
 
-  // ── 第 3 步：汇总；为「不通」的模型插入 `input: [text]` 标记 ──
-  const marks = [];
+  // ── 第 3 步：汇总；「不通」插标记 / --force 复测翻案的摘旧标记 ──
+  const ops = [];
   for (const j of jobs) {
     if (!j.run) { say(`⏭ ${j.name}/${j.id}: ${j.note}`); continue; }
     const v = j.result.verdict;
-    if (v === 'vision') say(`✅ ${j.name}/${j.id}: 识图正常`);
-    else if (v === 'no') {
-      marks.push(j);
+    const hasMark = j.entry ? entryHasInput(work, j.entry) : false;
+    if (v === 'vision') {
+      if (hasMark && FORCE) {
+        // 复测翻案：原来标了纯文字、现在通了 —— 不摘旧标记就永远用不上识图。
+        ops.push({ pos: j.entry.end, entry: j.entry, kind: 'remove' });
+        say(`🔄 ${j.name}/${j.id}: 复测识图正常 → 摘除旧纯文字标记`);
+      } else say(`✅ ${j.name}/${j.id}: 识图正常`);
+    } else if (v === 'no') {
+      if (hasMark) {
+        // ⛔ 2026-09-29 远端实爆修复：--force 复测「仍不支持」时条目里已有 input:，
+        //    老代码不查重再插一次 = 重复键 = 整份 settings.yaml 变非法 YAML。
+        say(`⏭ ${j.name}/${j.id}: 仍不支持，维持原标记（不重复插入）`);
+        continue;
+      }
+      ops.push({ pos: j.entry.end + 1, kind: 'insert' });
       say(`⛔ ${j.name}/${j.id}: 不支持识图（${j.result.why}）→ 将标记纯文字`);
     } else say(`⚠️ ${j.name}/${j.id}: 未知（${j.result.why}）→ 不动`);
   }
-  marks.sort((a, b) => b.entry.start - a.entry.start); // 从后往前插，行号不失效
-  for (const j of marks) {
+  ops.sort((a, b) => b.pos - a.pos); // 从后往前，行号不失效
+  for (const op of ops) {
     if (CHECK) continue;
-    work.splice(j.entry.end + 1, 0, '          input:', '            - text');
+    if (op.kind === 'insert') work.splice(op.pos, 0, '          input:', '            - text');
+    else removeMark(work, op.entry);
     changed = true;
   }
 
   if (CHECK) { say('（--check 未写文件）'); return; }
   if (!changed) { say('无改动。'); return; }
+  // ⛔ 最后一道闸：写回前必须能整体重新解析成合法 YAML，解析不过一字不写。
+  //   （settings.yaml 坏一份 = providers/permission 全丢，2026-09-29 远端实爆过一回。）
+  try {
+    YAML.parse(work.join('\n'));
+  } catch (err) {
+    console.error(`⛔ 生成的 YAML 解析失败（${err.message}）—— 已放弃写回，原文件未动。`);
+    process.exit(1);
+  }
   const ts = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
   const backup = `${target}.bak.visionauto-${ts}`;
   copyFileSync(target, backup);
