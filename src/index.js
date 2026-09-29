@@ -638,7 +638,12 @@ export function apply(ctx, config) {
   async function promptFromHub(msg) {
     const chatKey = hubChatKey(msg);
     const text = String(msg.text ?? '').trim();
-    if (!text) return { ok: false, error: '空消息' };
+    // 端点若已构造好内容块（TG 的图文块在 msg.raw.blocks），直接把它送进 DSH。
+    // ⚠️ 只认 raw.blocks：微信那侧的 raw 是原始消息对象，形状不同，不能当块用。
+    //    空数组/非数组一律退回纯文本路径，行为与改动前完全一致。
+    const rawBlocks = Array.isArray(msg.raw?.blocks) ? msg.raw.blocks : null;
+    const blocks = rawBlocks && rawBlocks.length > 0 ? rawBlocks : null;
+    if (!text && !blocks) return { ok: false, error: '空消息' };
 
     // 微信侧的命令解析：TG 在自己的入口里解析过了，这里补微信这一半
     // （老 bot 的 handleWeixinCommand 同款）。命令不进模型、不记账。
@@ -678,11 +683,27 @@ export function apply(ctx, config) {
     // 会话一旦存在 sessionIdOf 就非空，天然「每个会话只注一次」；
     // 记账在上一行已用原文落账，不受注入影响。
     let promptText = text;
+    let bootPrefix = '';
     if (memory && runtime.sessionIdOf(chatKey) === null) {
       const boot = memory.readBootstrapContext();
       if (boot) {
-        promptText = `<冷启动记忆（系统自动注入，无需回复此段）>\n${boot}\n</冷启动记忆>\n\n${text}`;
+        bootPrefix = `<冷启动记忆（系统自动注入，无需回复此段）>\n${boot}\n</冷启动记忆>\n\n`;
+        promptText = `${bootPrefix}${text}`;
         log(`[mem] 已注入冷启动记忆（${chatKey}）`);
+      }
+    }
+
+    // 真内容走块通道：有块就发块，记忆前言并进第一个 text 块（块模式下 promptText 不参与投递）。
+    // ⚠️ 块是从 msg.raw.blocks 直接取来的对象，host 侧会深冻结，所以这里必须给新对象、
+    //    不能原地改 raw.blocks（否则冻结后再碰会炸，且会影响 hub 的广播那一半）。
+    let promptContent = promptText;
+    if (blocks) {
+      promptContent = blocks.map((b) => (b?.type === 'text' && typeof b.text === 'string'
+        ? { ...b, text: `${bootPrefix}${b.text}` }
+        : { ...b }));
+      // 块里一个 text 都没有（纯图）却要带记忆前言 → 补一个文字块顶在最前。
+      if (bootPrefix && !blocks.some((b) => b?.type === 'text' && typeof b.text === 'string')) {
+        promptContent.unshift({ type: 'text', text: `${bootPrefix}${text}`.trim() });
       }
     }
 
@@ -714,8 +735,8 @@ export function apply(ctx, config) {
         })
       : null;
 
-    // ② 发给 DSH
-    const sent = await runtime.prompt(chatKey, promptText);
+    // ② 发给 DSH（有内容块就发块，否则退回纯文本；runtime.prompt 两条路都收）
+    const sent = await runtime.prompt(chatKey, promptContent);
     if (!sent.ok) {
       offEvents?.();
       await status?.fail(sent.error);
