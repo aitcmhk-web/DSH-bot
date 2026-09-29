@@ -1064,7 +1064,7 @@ export function apply(ctx, config) {
               '',
               `当前：${current ? describeRoute(current) : '(未配置)'}`,
               '',
-              '点上面的按钮切换。DSH 的模型在一个运行进程内是固定的，切换会重启 DSH 子进程并清空当前会话上下文。',
+              '点上面的按钮切换。切换后当前会话的完整历史由新模型接着用（上下文保留，不会丢）。',
               '',
               '启动回退顺序：',
               ...picks.map((r) => `  ${r.short}`),
@@ -1100,7 +1100,7 @@ export function apply(ctx, config) {
               '',
               '自动回退顺序:' + picks.map((r) => `\n- ${r.short}`).join(''),
               '',
-              '⚠️ 切换模型会重启 DSH 子进程并清空当前会话上下文。',
+              '⚠️ 切换后当前会话历史由新模型接着用（上下文保留）。',
             ].join('\n');
             await reply(lines);
           }
@@ -1139,7 +1139,7 @@ export function apply(ctx, config) {
           return true;
         }
         await reply(`⏳ 正在切换到「${wanted.label}」…`);
-        // 切模型 = 旧会话即将作废（换档重建），断开前先写 handoff —— 与老 bot 同口径：
+        // 切模型 = 重建句柄并 resume 同一会话（历史保留、新模型接着聊），handoff 照写作记忆兜底：
         // 本次会话 ≥20 条才写，调试期间反复切模型不会覆盖已有记忆。
         if (memory) {
           memory.maybeWriteHandoff({
@@ -1155,7 +1155,7 @@ export function apply(ctx, config) {
         if (switched.ok) {
           if (!useHostRoutes) activeRoute = wanted;
           await reply(
-            `✅ 已切换到「${wanted.label}」\n${wanted.provider} / ${wanted.model}\n\n会话已重置,直接发消息即可。`,
+            `✅ 已切换到「${wanted.label}」\n${wanted.provider} / ${wanted.model}\n\n当前会话历史已带过去，直接接着聊即可。`,
           );
         } else {
           await reply(`❌ 切换到「${wanted.label}」失败:${switched.error}`);

@@ -6,8 +6,11 @@
  *
  * 切模型：模型在 agents.create({agentOptions}) 时定死，宿主接口只提供
  * resume(resumeSessionId) 续已持久化的会话，没有「给活着的 agent 换模型」，
- * 因此切档 = dispose 旧会话 → 按新档建新会话；上下文不跨档保留，
- * 由 handoff 记忆负责衔接。
+ * 因此切档 = dispose 旧句柄 → 用同一个会话 ID 重建。
+ * ✅ 2026-09-29 查 SDK 源码修正：dispose 只关句柄、不删日志（persistence 对
+ *    session/disposed 只做最后冲刷），重建时 create 抛 already exists → 走
+ *    resume —— 完整历史回放给新模型接着聊，上下文跨档保留；handoff 只是
+ *    记忆兜底，不是衔接必需。
  */
 
 // 故意不 import 任何 @deepseek-ai/* 包；需要的东西都已本地实现：
@@ -156,9 +159,11 @@ export class BotRuntime {
   }
 
   /**
-   * 切档位：关掉这个 chat 的旧会话，按新档位建一个新的。
+   * 切档位：关掉这个 chat 的旧句柄，按新档位重建同一会话。
    *
-   * ⚠️ 上下文不跨档保留 —— 见文件头说明（插件版没有「给活着的 agent 换模型」）。
+   * ⚠️ 宿主没有「给活着的 agent 换模型」，只能走 dispose → 重建；
+   *    重建会命中 already exists → resume，**历史保留、新模型接着聊**
+   *    （2026-09-29 查 SDK 源码确认，见文件头）。
    *
    * @param {string} chatKey
    * @param {{provider:string, model:string, reasoningEffort?:string}} route
