@@ -132,6 +132,81 @@ export class BotRuntime {
     return ctx.agents ?? (typeof ctx.get === 'function' ? ctx.get('agents') : undefined);
   }
 
+  /**
+   * 取宿主的附件服务（`ctx.attachments`）。
+   *
+   * ⚠️ 这是**图片能被模型看见**的关键一步，之前整条链是断的：
+   *    `{type:'image', data:<base64>, mimeType}` 只是**半成品**，
+   *    必须换成 `{type:'image', attachment:<durable ref>}` 模型才读得到内容。
+   *    官方 `durablePromptContent` 干的就是这件事
+   *    （`@deepseek-ai/dsh-sdk-jsonrpc-server/lib/index.js:19-33`）——
+   *    但它挂在 JSON-RPC 的 session/prompt 路上，本插件直接 `agent.followup()`
+   *    绕过了那一层，于是图片静默丢掉（用户侧表现为"知道有图但不知道内容"）。
+   *
+   * ⚠️ 走 `ctx.attachments`（属性）优先，`ctx.get('attachments')` 兜底 ——
+   *    与 #agents() 同一套写法，依据同样是官方源码里 `ctx.attachments` 的用法
+   *    （`dsh-api-session-controller/lib/types/commands.js:316`）。
+   */
+  #attachments() {
+    const ctx = this.#ctx;
+    if (!ctx) return undefined;
+    return ctx.attachments ?? (typeof ctx.get === 'function' ? ctx.get('attachments') : undefined);
+  }
+
+  /**
+   * 把内容块里的 base64 图片换成宿主持久化引用（**唯一**的转换入口）。
+   *
+   * 语义照抄官方 `durablePromptContent`（出处见 {@link #attachments} 注释）：
+   *   ① 没有任何 `{type:'image', data}` 块 → **原样返回，一次存储都不做**；
+   *   ② 有 → `admitEncodedImages(store, [{data, mediaType}])` 拿回引用数组；
+   *   ③ 按原顺序把每个图片块替换成 `{type:'image', attachment}`，其余块不动。
+   *
+   * ⚠️ 为什么优先调 `admitPromptContent`（宿主的公开入口）而不是自己拼：
+   *    官方两条路（`dsh-api-session-controller/lib/types/commands.js:316`）用的都是它，
+   *    它内部会 preserve 文本/文件块的顺序。只有它不存在时才退回
+   *    `admitEncodedImages` + 手写替换（两者等价，见 dsh-attachment:99-101 / 228-245）。
+   *
+   * ⚠️ 拿不到附件服务时**必须报错，不许静默放行** —— 静默放行的结果就是
+   *    用户发了图、模型说没看见，而日志里一片正常。
+   *
+   * @param {Array<object>} blocks 原始内容块
+   * @returns {Promise<Array<object>>} 可直接投给 agent 的内容块
+   */
+  async #durableContent(blocks) {
+    const hasEncodedImage = blocks.some(
+      (b) => b && b.type === 'image' && typeof b.data === 'string',
+    );
+    if (!hasEncodedImage) return blocks;
+    const store = this.#attachments();
+    if (!store) {
+      throw new Error(
+        '有图片块，但拿不到宿主的 attachments 服务（ctx.attachments）—— 图片无法持久化，' +
+          '继续投递只会让模型看到一张空图。请检查宿主是否加载了 attachment 插件。',
+      );
+    }
+    if (typeof store.admitPromptContent === 'function') {
+      return await store.admitPromptContent(blocks);
+    }
+    return await this.#durableContentFallback(store, blocks);
+  }
+
+  /** `admitPromptContent` 缺席时的等价兜底：逐块替换，其余原样。 */
+  async #durableContentFallback(store, blocks) {
+    const images = blocks.filter((b) => b && b.type === 'image' && typeof b.data === 'string');
+    const refs = await store.saveImages(
+      images.map((image) => ({
+        data: Buffer.from(image.data, 'base64'),
+        mediaType: image.mimeType ?? 'image/jpeg',
+      })),
+    );
+    let next = 0;
+    return blocks.map((block) =>
+      block && block.type === 'image' && typeof block.data === 'string'
+        ? { type: 'image', attachment: refs[next++] }
+        : block,
+    );
+  }
+
   /** 当前活着的会话数，供 /status 显示。 */
   get sessionCount() {
     return this.#sessions.size;
@@ -160,8 +235,13 @@ export class BotRuntime {
     const rec = await this.#ensureSession(chatKey);
     if (!rec.ok) return rec;
     try {
+      const raw = typeof content === 'string' ? textContent(content) : content;
+      // ⚠️ 图片块必须在这里换成宿主持久化引用 —— 详见 #durableContent 注释。
+      //    这一步放在 createUserMessage 之前：转换抛错时消息根本没投出去，
+      //    用户会收到明确的失败提示，而不是一条"静默丢图的成功"。
+      const admitted = await this.#durableContent(raw);
       const message = createUserMessage({
-        content: typeof content === 'string' ? textContent(content) : content,
+        content: admitted,
         source: { kind: 'user' },
       });
       rec.handle.agent.followup(message);

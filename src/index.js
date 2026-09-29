@@ -638,7 +638,10 @@ export function apply(ctx, config) {
   async function promptFromHub(msg) {
     const chatKey = hubChatKey(msg);
     const text = String(msg.text ?? '').trim();
-    if (!text) return { ok: false, error: '空消息' };
+    // ⚠️ 空文本**不能**直接判死：带图无字的消息 `text` 是 `"[图片]"` 占位，
+    //    但真正的图在 msg.raw.blocks 里。只有"既没字又没块"才是空消息。
+    const inboundBlocks = Array.isArray(msg.raw?.blocks) ? msg.raw.blocks : null;
+    if (!text && !inboundBlocks) return { ok: false, error: '空消息' };
 
     // 微信侧的命令解析：TG 在自己的入口里解析过了，这里补微信这一半
     // （老 bot 的 handleWeixinCommand 同款）。命令不进模型、不记账。
@@ -677,13 +680,39 @@ export function apply(ctx, config) {
     // 或进程重启断开 —— 把 handoff 塞进第一条消息前面，模型不用用户复述上文。
     // 会话一旦存在 sessionIdOf 就非空，天然「每个会话只注一次」；
     // 记账在上一行已用原文落账，不受注入影响。
-    let promptText = text;
-    if (memory && runtime.sessionIdOf(chatKey) === null) {
-      const boot = memory.readBootstrapContext();
-      if (boot) {
-        promptText = `<冷启动记忆（系统自动注入，无需回复此段）>\n${boot}\n</冷启动记忆>\n\n${text}`;
+    //
+    // ⚠️ 这里同时决定**送给 DSH 的是字符串还是内容块数组**：
+    //    没有内容块（纯文字）→ 仍是字符串，路径与以前完全一致；
+    //    有内容块（带图）→ 用块数组，冷启动记忆作为**第一个文本块**插到最前，
+    //    顺序与注入字符串时相同（记忆在前、用户正文在后）。
+    //    0.0.11 那次之所以没生效，就是因为图片块只塞进了 `msg.raw`，
+    //    而这一行只把 `promptText`（字符串）送下去 —— 块从头到尾没被用过。
+    const injectBoot =
+      Boolean(memory) && runtime.sessionIdOf(chatKey) === null
+        ? (memory.readBootstrapContext() ?? '')
+        : '';
+    let promptPayload;
+    if (inboundBlocks) {
+      promptPayload = [];
+      if (injectBoot) {
+        promptPayload.push({
+          type: 'text',
+          text: `<冷启动记忆（系统自动注入，无需回复此段）>\n${injectBoot}\n</冷启动记忆>`,
+        });
+      }
+      promptPayload.push(...inboundBlocks);
+      log(
+        `[mem] 带内容块投递：${inboundBlocks.length} 块` +
+          `${inboundBlocks.some((b) => b?.type === 'image') ? '（含图片）' : ''}` +
+          `${injectBoot ? ' + 冷启动记忆' : ''}（${chatKey}）`,
+      );
+    } else {
+      let promptText = text;
+      if (injectBoot) {
+        promptText = `<冷启动记忆（系统自动注入，无需回复此段）>\n${injectBoot}\n</冷启动记忆>\n\n${text}`;
         log(`[mem] 已注入冷启动记忆（${chatKey}）`);
       }
+      promptPayload = promptText;
     }
 
     // ① 先订阅，后发消息
@@ -715,7 +744,7 @@ export function apply(ctx, config) {
       : null;
 
     // ② 发给 DSH
-    const sent = await runtime.prompt(chatKey, promptText);
+    const sent = await runtime.prompt(chatKey, promptPayload);
     if (!sent.ok) {
       offEvents?.();
       await status?.fail(sent.error);
@@ -1262,6 +1291,8 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------------------
   let wxCursor = '';
   let wxAbort = null;
+  /** 未登录时的 ret=-2 只提示一次，避免每 30 秒刷一条日志。 */
+  let wxRetMinus2Noted = false;
 
   async function weixinPollLoop() {
     if (!weixinReady) {
@@ -1285,9 +1316,19 @@ export function apply(ctx, config) {
       // 即使 ret≠0 也要推进游标，否则后续调用一直用空 cursor 重试。
       if (batch.get_updates_buf) wxCursor = batch.get_updates_buf;
       // ret=-2 = 通道「伪过期」，清掉本地缓存等用户下一条消息带新 token 恢复。
+      //
+      // ⚠️ 分级上报：**没登录过**（从没拿到过主人的 context_token）时这是常态，
+      //    每 30 秒报一条 `error` 只会淹掉真问题 —— 用户看到满屏红字以为坏了。
+      //    此时降级成 `log` 并只报一次；真的登录过又掉线才是 error（那要修）。
       if (batch.ret === -2) {
-        error('微信通道 ret=-2（伪过期），清除本地缓存，等用户下一条消息恢复');
-        await weixin.reconnect().catch(() => {});
+        const everConnected = wxContextTokens.size > 0 || Boolean(weixin.ownerWxUserId);
+        if (everConnected) {
+          error('微信通道 ret=-2（伪过期），清除本地缓存，等用户下一条消息恢复');
+          await weixin.reconnect().catch(() => {});
+        } else if (!wxRetMinus2Noted) {
+          wxRetMinus2Noted = true;
+          log('微信未登录（ret=-2），跳过轮询恢复；登录后自动转为正常');
+        }
         continue;
       }
 
