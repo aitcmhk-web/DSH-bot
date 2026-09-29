@@ -19,7 +19,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, openSync, appendFileSync } from 'node:fs';
 import { readFile, writeFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -1359,12 +1359,26 @@ export function apply(ctx, config) {
       try {
         const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'vendor', 'vision-auto.mjs');
         if (existsSync(script)) {
-          const child = spawn(process.execPath, [script, '--quiet'], {
+          // 输出落 <cwd>/vision-auto.log —— 静默失败最坑（2026-09-29 评审 #2）：必须留痕。
+          // 不带 --quiet：探测的每一行结论都进日志，出事能查。
+          const logPath = join(config.cwd || process.cwd(), 'vision-auto.log');
+          let fd = null;
+          try {
+            appendFileSync(logPath, `\n──── ${new Date().toISOString()} 探测开始 ────\n`);
+            fd = openSync(logPath, 'a');
+          } catch {}
+          const child = spawn(process.execPath, [script], {
             detached: true,
-            stdio: 'ignore',
+            stdio: fd === null ? 'ignore' : ['ignore', fd, fd],
           });
           child.unref();
-          log('识图自动探测已在后台启动（vision-auto）');
+          // unref 只是不让子进程拖住宿主退出，exit 事件照发 —— 退出码必须上报，
+          // 否则「已启动」和「成功」分不清。
+          child.on('exit', (code, signal) => {
+            if (code === 0) log('识图探测完成');
+            else error(`识图探测失败（${signal ? `信号 ${signal}` : `退出码 ${code}`}），详见 ${logPath}`);
+          });
+          log('识图自动探测已在后台启动（输出: vision-auto.log）');
         } else {
           log('未找到 vendor/vision-auto.mjs，跳过识图探测');
         }

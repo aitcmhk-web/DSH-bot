@@ -60,7 +60,7 @@ const LATEST_SUMMARY_PATH = join(SUMMARY_DIR, LATEST_SUMMARY_FILE);
 // 存放：raw/ledger/ 下**按月一个文件**，纯追加，永不覆盖。
 //
 // ⚠️ 2026-09-17 用户定死：文件名用**纯年月**（`2026-09.md`），不再带 chat id 前缀。
-//    原文件名形如 `7934872283-dialogue.md`，那个数字是 chat id；但 TG 与微信走的是
+//    原文件名形如 `<chatId>-dialogue.md`，那段数字是 chat id；但 TG 与微信走的是
 //    **同一个 chatId**（bot.js 四处 ledgerRecord 都传 state.ownerUserId），
 //    所以前缀纯属多余，用户明确要求去掉。
 const LEDGER_DIR = join(RAW_DIR, 'ledger');
@@ -684,7 +684,7 @@ async function main() {
 示例:
   node cache-manager.mjs append my-session '{"role":"user","content":"你好"}'
   node cache-manager.mjs summarize-v3 --last 3
-  node cache-manager.mjs summarize-v3 --session tg-7934872283-1789137640823-0j8r16
+  node cache-manager.mjs summarize-v3 --session tg-<chatId>-<时间戳>-<随机串>
   node cache-manager.mjs get-latest
   node cache-manager.mjs get-recent 3`);
     return;

@@ -31,8 +31,25 @@ const FORCE = process.argv.includes('--force');
 const QUIET = process.argv.includes('--quiet');
 
 const say = (msg) => { if (!QUIET) console.log(msg); };
-const require2 = createRequire(join(HOME, '.dsh/profiles/node_modules/'));
-const YAML = require2('yaml');
+
+/** YAML 解析器，main() 里赋值；两处解析都失败时保持 null（调用方明确跳过，绝不崩）。 */
+let YAML = null;
+
+/**
+ * 拿 YAML 解析器，两步：
+ *   ① 正路 —— 作为包依赖解析（插件正确装好依赖时，或脚本目录向上能走到 node_modules/yaml）；
+ *   ② 兼容本机 DSH 安装 —— ~/.dsh/profiles/node_modules 里常备 yaml（DSH 全家桶）。
+ * 都拿不到返回 null —— 只跳过，绝不崩（2026-09-29：老写法硬编码 ②，别的机器上启动即崩）。
+ */
+async function loadYaml() {
+  try {
+    return await import('yaml');
+  } catch {}
+  try {
+    return createRequire(join(HOME, '.dsh/profiles/node_modules/'))('yaml');
+  } catch {}
+  return null;
+}
 
 /** 1x1 红色 PNG。 */
 const TINY_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
@@ -94,7 +111,19 @@ function findEntry(lines, modelId) {
 const entryHasInput = (lines, r) => lines.slice(r.start, r.end + 1).some((l) => /^ {8,}input:/.test(l));
 
 async function main() {
-  const src = readFileSync(target, 'utf8');
+  YAML = await loadYaml();
+  if (!YAML) {
+    // ⚠️ 用 console.log 而非 say()：跳过原因即使在 --quiet 下也要留痕。
+    console.log('⏭ 没有 YAML 解析器（插件依赖未安装，本机也没有 DSH 自带的）—— 跳过识图探测。');
+    return;
+  }
+  let src;
+  try {
+    src = readFileSync(target, 'utf8');
+  } catch {
+    console.log(`⏭ 未找到 ${target}（web 端未配模型）—— 跳过识图探测。`);
+    return;
+  }
   const doc = YAML.parse(src);
   const providers = doc?.['llm-pi-ai']?.providers ?? {};
   const keys = loadKeys();

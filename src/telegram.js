@@ -6,18 +6,14 @@
  *   ③ sendMessage 支持透传 disable_notification 等 extra 参数。
  */
 
-// Force direct connection — bypass macOS system proxy / NE routing that may
-// resolve api.telegram.org to a mainland-China CDN node (e.g. 183.192.195.196)
-// which is unreachable from this host.
-import https from 'node:https';
+// ⚠️ 历史遗留说明（2026-09-29 评审 #8）：这里曾有个 DIRECT_AGENT（https.Agent）挂在
+//    fetch 的 options.agent 上 —— 但 fetch 是 undici，**不认 agent，只认 dispatcher**，
+//    所以它从来就是个空操作（Node 22 实测），连带着上面那段「绕过系统代理」的注释
+//    也从未真正生效过。已删。真要固定 DNS/绕代理，用 undici 的 Agent + dispatcher，
+//    那是行为变更，另开一轮做。
 import { readFileSync, unlinkSync } from 'node:fs';
 
 const DEFAULT_API_ROOT = 'https://api.telegram.org';
-
-const DIRECT_AGENT = new https.Agent({
-  proxy: undefined,
-  keepAlive: true,
-});
 
 export class Telegram {
   /**
@@ -38,7 +34,6 @@ export class Telegram {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
       signal: options.signal,
-      agent: DIRECT_AGENT,
     });
     let body;
     try {
