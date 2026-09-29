@@ -21,6 +21,12 @@
    dsh plugin --profile mybot add github:aitcmhk-web/DSH-bot
    ```
 
+   > ⚠️ `mybot` 只是**示例名**，要换成**你自己的 profile 名**。
+   > profile 名 = `~/.dsh/profiles/` 下的目录名，用 `ls ~/.dsh/profiles/` 看有哪些
+   > （常见的是 `bot`、`web`、`tui`）。
+   > **填错名字不会报错** —— DSH 会新建一个空 profile，插件装进去，
+   > 但你原来的会话一点变化都没有。
+
 2. 编辑该 profile 的 `cordis.patch.yml`，加上配置（**token 必填**）：
 
    ```yaml
