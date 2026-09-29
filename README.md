@@ -8,7 +8,12 @@
 - 机器上装好 DSH（有 `dsh` 命令）
 - 一个 Telegram bot token（在 Telegram 里找 @BotFather 发送 `/newbot` 新建，不要和其他 bot 共用）
 
-## 安装方式一：在线安装（会敲命令的，推荐）
+## 安装方式一：在线安装（从 git 装，会敲命令的，推荐）
+
+> ⚠️ **必须用 `dsh plugin`，不要用裸 `pnpm add`。**
+> 插件只有装进 **profile 的 `node_modules`**（`~/.dsh/profiles/<profile>/node_modules/`）才会被 DSH 加载。
+> `dsh plugin` 会自动切到 profile 目录再装，所以**在哪个目录打开终端都行**；
+> 裸 `pnpm add` 会装到你当前所在目录，DSH 看不见，插件静默失效。
 
 1. 装进目标 profile（下面以 `mybot` 为例，没有就先建一个）：
 
@@ -32,6 +37,27 @@
 
 以后升级也是同一条命令（重新 add 会拉最新版本）。npm 发布后还可以用 `dsh plugin --profile mybot add dsh-botplugin`。
 
+## 安装方式一之二：本地安装（用你手上这份源码）
+
+已经有一份源码（比如你自己 clone 下来的、或者要改着调试的），就用 `file:` 指向**那个目录**：
+
+```
+dsh plugin --profile mybot add file:/绝对路径/dsh-botplugin
+```
+
+例如源码在 `/Users/tcm/DSH/BOT/botplugin`：
+
+```
+dsh plugin --profile mybot add file:/Users/tcm/DSH/BOT/botplugin
+```
+
+> 用 `file:` 装出来的是**软链** —— 改完源码不用重装，重启 profile 就生效。
+> 调试的时候用这个；平时用上面的 git 方式。**两种选一种，别都装**
+> （会装出两份同名插件，加载哪份不好说）。
+>
+> ⚠️ 路径必须是**绝对路径**，且指向**含 `package.json` 的那一层**（也就是仓库根），
+> 不要指到 `src/` 或上一层。
+
 ## 安装方式二：下载安装包（不想敲命令的）
 
 1. 下载安装包：[dsh-mybot-安装包.zip](dsh-mybot-安装包.zip)（在本页文件列表里，点它再点 Download / Download raw）。
@@ -39,7 +65,14 @@
 3. 按弹出的说明填 token（打开 `~/DSH/mybot/profiles/mybot/cordis.patch.yml`，把 telegramToken 换成你的）。
 4. 以后每次使用：双击 `~/DSH/mybot/启动-mybot.command`。想加微信：双击 `登录微信.command` 扫码。
 
-> 两种方式装出来的是同一个插件，选一种就行。安装包方式自带图文说明和启动器，适合第一次接触命令行的人；在线方式升级最省事（重跑一条命令）。
+> 三种方式装出来的是同一个插件，选一种就行。安装包方式自带图文说明和启动器，适合第一次接触命令行的人；git 方式升级最省事（重跑一条命令）；本地方式改了源码立刻生效，适合调试。
+
+## 怎么确认装对了
+
+插件**装对了**的话，`ls ~/.dsh/profiles/mybot/node_modules/` 里能看到 `dsh-botplugin`。
+
+看不到 = 装到别处去了，插件不会生效（而且**不报错**，只会静默什么都没发生）。
+把装错的那份删掉，再用 `dsh plugin --profile mybot add ...` 重装一次。
 
 ## 配置项速查
 
