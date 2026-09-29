@@ -136,7 +136,7 @@ export class BotRuntime {
    * 取宿主的附件服务（`ctx.attachments`）。
    *
    * ⚠️ 这是**图片能被模型看见**的关键一步，之前整条链是断的：
-   *    `{type:'image', data:<base64>, mimeType}` 只是**半成品**，
+   *    `{type:'image', data:<base64>, mediaType}` 只是**半成品**，
    *    必须换成 `{type:'image', attachment:<durable ref>}` 模型才读得到内容。
    *    官方 `durablePromptContent` 干的就是这件事
    *    （`@deepseek-ai/dsh-sdk-jsonrpc-server/lib/index.js:19-33`）——
@@ -146,11 +146,23 @@ export class BotRuntime {
    * ⚠️ 走 `ctx.attachments`（属性）优先，`ctx.get('attachments')` 兜底 ——
    *    与 #agents() 同一套写法，依据同样是官方源码里 `ctx.attachments` 的用法
    *    （`dsh-api-session-controller/lib/types/commands.js:316`）。
+   *
+   * ⚠️ 属性访问**包 try/catch**：Cordis 的 `ctx.x` 受 inject 门禁，未声明时**抛**
+   *    `cannot get property "attachments" without inject`，而不是返回 undefined ——
+   *    没有这层保护，`?? ctx.get(...)` 兜底根本没机会执行，异常直接冒到 prompt()。
+   *    inject 已在 index.js 声明（= 正路），这里是**第二道保险**：
+   *    万一宿主/未来版本门禁行为有变，仍能拿到服务而不是整条消息失败。
+   *    真拿不到时返回 undefined，由 #durableContent 报明确错误。
    */
   #attachments() {
     const ctx = this.#ctx;
     if (!ctx) return undefined;
-    return ctx.attachments ?? (typeof ctx.get === 'function' ? ctx.get('attachments') : undefined);
+    try {
+      if (ctx.attachments) return ctx.attachments;
+    } catch {
+      // 被 inject 门禁挡住：落到下面的 ctx.get()
+    }
+    return typeof ctx.get === 'function' ? ctx.get('attachments') : undefined;
   }
 
   /**
@@ -196,7 +208,9 @@ export class BotRuntime {
     const refs = await store.saveImages(
       images.map((image) => ({
         data: Buffer.from(image.data, 'base64'),
-        mediaType: image.mimeType ?? 'image/jpeg',
+        // 字段名与宿主 saveInput 对齐（dsh-attachment/lib/index.js:82 读 mediaType）。
+        // 兼容 mimeType 只是防御历史调用方，新代码一律写 mediaType。
+        mediaType: image.mediaType ?? image.mimeType ?? 'image/jpeg',
       })),
     );
     let next = 0;

@@ -67,11 +67,25 @@ await new Promise((r) => tg.listen(TG_PORT, '127.0.0.1', r));
 
 const delivered = [];
 const storeCalls = [];
+const rejected = [];
 const sessionListeners = [];
 const agent = { id: 'agent-e2e', followup: () => {}, on() {} };
 const attachments = {
+  // 照官方 dsh-attachment/lib/index.js:82 saveInput 的**真实校验**打桩：
+  //   只读 image.mediaType，拿到 undefined 就拒绝整批
+  //   （真机原话：Image type undefined is not accepted by this deployment.
+  //     —— 2026-09-29 日志 20:09:16）。
+  // ⚠️ 早先这层打桩不看类型，于是"字段名写错"从一开始就测不出来。
   async admitPromptContent(content) {
     storeCalls.push(content);
+    const images = content.filter((p) => p.type === 'image');
+    for (const img of images) {
+      const t = img.mediaType;
+      if (typeof t !== 'string' || !t.startsWith('image/')) {
+        rejected.push(t);
+        throw new Error(`Image type ${t} is not accepted by this deployment.`);
+      }
+    }
     let n = 0;
     return content.map((p) =>
       p.type === 'image' ? { type: 'image', attachment: `durable-ref-${n++}` } : p,
@@ -138,6 +152,16 @@ ok(
   `图片块活着到 agent 且已换引用：${JSON.stringify(blocks).slice(0, 200)}`,
 );
 ok(storeCalls.length === 1, `attachments.admitPromptContent 恰好调用一次（${storeCalls.length}）`);
+ok(
+  rejected.length === 0,
+  `交给宿主的图片块带着合法 mediaType（真机症状是 undefined；实际拒绝值：${JSON.stringify(rejected)}）`,
+);
+ok(
+  (storeCalls[0] ?? []).every((p) => p.type !== 'image' || p.mediaType === 'image/jpeg'),
+  `mediaType 原样传到宿主（photo 无 mime_type → 合理地回落到 image/jpeg；实际：${JSON.stringify(
+    (storeCalls[0] ?? []).filter((p) => p.type === 'image').map((p) => p.mediaType),
+  )}）`,
+);
 ok(
   !blocks.some((b) => b?.type === 'image' && 'data' in b),
   '没有裸露的 base64 图片块漏到 agent（这正是模型"看不见内容"的原因）',

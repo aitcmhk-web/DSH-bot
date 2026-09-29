@@ -56,13 +56,34 @@ function host({ attachments = 'real' } = {}) {
 
 const ROUTE = { provider: 'deepseek-official', model: 'deepseek-flash', key: 'k' };
 
+// ── ⓪ 真机暴露的两个契约，先用静态断言钉死 ────────────────────────
+//
+// 这两条都是 2026-09-29 真机日志抓出来的，打桩测试当时**完全没覆盖**：
+//   19:56:18 `cannot get property "attachments" without inject`
+//            → Cordis 属性访问受 inject 门禁，没声明就直接抛。
+//   20:09:16 `Image type undefined is not accepted by this deployment.`
+//            → 宿主 saveInput 只读 `mediaType`，写 `mimeType` 等于传 undefined。
+{
+  const { readFile } = await import('node:fs/promises');
+  const idx = await readFile(new URL('./src/index.js', import.meta.url), 'utf8');
+  const m = idx.match(/export const inject\s*=\s*\[([^\]]*)\]/);
+  const inject = m ? m[1] : '';
+  ok(/\battachments\b/.test(inject), `index.js 声明了 attachments 依赖（inject = [${inject.trim()}]）`);
+
+  // 图片块构造处必须写 mediaType（不能是 mimeType）。
+  const push = idx.match(/blocks\.push\(\{\s*type:\s*'image'[\s\S]{0,200}?\}\)/);
+  const body = push ? push[0] : '';
+  ok(/\bmediaType:/.test(body), '图片块用 mediaType 传类型（宿主只认这个字段名）');
+  ok(!/\bmimeType:/.test(body), `图片块没有 mimeType 字段（实际片段：${body.replace(/\s+/g, ' ').slice(0, 80)}）`);
+}
+
 // ── ① 有图：必须换成 attachment，且投出去的消息里没有裸露的 base64 ──
 {
   const h = host();
   const rt = new BotRuntime({ ctx: h.ctx, route: ROUTE });
   const res = await rt.prompt('tg:1', [
     { type: 'text', text: '看这张图' },
-    { type: 'image', data: PNG, mimeType: 'image/png' },
+    { type: 'image', data: PNG, mediaType: 'image/png' },
   ]);
 
   ok(res.ok === true, `prompt 成功（${res.ok ? 'ok' : res.error}）`);
@@ -88,7 +109,7 @@ const ROUTE = { provider: 'deepseek-official', model: 'deepseek-flash', key: 'k'
 {
   const h = host({ attachments: null });
   const rt = new BotRuntime({ ctx: h.ctx, route: ROUTE });
-  const res = await rt.prompt('tg:3', [{ type: 'image', data: PNG, mimeType: 'image/png' }]);
+  const res = await rt.prompt('tg:3', [{ type: 'image', data: PNG, mediaType: 'image/png' }]);
   ok(res.ok === false, '拿不到 attachments 时 prompt 明确失败（而不是假装成功）');
   ok(
     String(res.error ?? '').includes('attachments'),
@@ -97,7 +118,29 @@ const ROUTE = { provider: 'deepseek-official', model: 'deepseek-flash', key: 'k'
   ok(h.delivered.length === 0, '失败时消息没有投给 agent（不留半条坏消息）');
 }
 
-// ── ④ 真 store 存在性：官方两个入口都在（我们优先走 admitPromptContent）──
+// ── ④ 属性被 inject 门禁挡住时，必须还能从 ctx.get() 兜底拿到服务 ──
+//    模拟真机 19:56:18：`ctx.attachments` 抛错而不是返回 undefined。
+{
+  const h = host();
+  const store = h.ctx.attachments;
+  const gated = {
+    get agents() {
+      return h.ctx.agents;
+    },
+    get attachments() {
+      throw new Error('cannot get property "attachments" without inject');
+    },
+    get: (name) => (name === 'attachments' ? store : undefined),
+    on() {},
+  };
+  const rt = new BotRuntime({ ctx: gated, route: ROUTE });
+  const res = await rt.prompt('tg:4', [{ type: 'image', data: PNG, mediaType: 'image/png' }]);
+  ok(res.ok === true, `属性被 inject 挡住时仍能成功（${res.ok ? 'ok' : res.error}）`);
+  const gb = h.delivered[0]?.content ?? [];
+  ok(gb[0]?.type === 'image' && typeof gb[0].attachment === 'string', '兜底拿到的服务确实完成了转换');
+}
+
+// ── ⑤ 真 store 存在性：官方两个入口都在（我们优先走 admitPromptContent）──
 {
   const { readFile } = await import('node:fs/promises');
   const p =

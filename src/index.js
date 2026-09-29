@@ -43,8 +43,14 @@ export const name = 'botplugin';
  *
  * ⚠️ `agents` 是**硬依赖**：没有它这个插件没有任何意义（收进来的消息没法交给模型）。
  *    Cordis 会等它出现才调 `apply()`。
+ *
+ * ⚠️ `attachments` 也必须写进 inject —— 它不是"可选优化"，是图片能不能看的**前提**：
+ *    Cordis 里 `ctx.attachments` 属性访问**受 inject 门禁**，没声明就抛
+ *    `cannot get property "attachments" without inject`（2026-09-29 真机日志 19:56:18）。
+ *    少了它，runtime.js 的 `#attachments()` 永远拿不到服务 → 发图必失败。
+ *    声明后宿主没装 attachment 插件也不影响纯文字（拿不到时只在真有图片块才报错）。
  */
-export const inject = ['agents'];
+export const inject = ['agents', 'attachments'];
 
 /** 插件配置。 */
 export const Config = Schema.object({
@@ -906,8 +912,14 @@ export function apply(ctx, config) {
 
     // ---- 图片 ----
     // SDK 约定（@deepseek-ai/dsh-sdk-jsonrpc-server 的 encodedImage 判据）：
-    //   { type: 'image', data: <canonical base64>, mimeType: 'image/png' }
+    //   { type: 'image', data: <canonical base64>, mediaType: 'image/png' }
     // 图片块必须真的压进 blocks：只声明 inputModalities 是没用的。
+    //
+    // ⚠️ 字段名是 `mediaType`，**不是** `mimeType` —— 宿主 admitPromptContent
+    //    → admitEncodedImages → saveInput 只读 `image.mediaType`
+    //    （dsh-attachment/lib/index.js:82）。写成 mimeType 等于传 undefined，
+    //    宿主报 `Image type undefined is not accepted by this deployment.`
+    //    （2026-09-29 真机日志 20:09:16）。
     const photo = message.photo?.[message.photo.length - 1];
     const imageDocument =
       message.document && String(message.document.mime_type ?? '').startsWith('image/')
@@ -920,7 +932,7 @@ export function apply(ctx, config) {
         blocks.push({
           type: 'image',
           data: bytes.toString('base64'),
-          mimeType: imageDocument?.mime_type ?? 'image/jpeg',
+          mediaType: imageDocument?.mime_type ?? 'image/jpeg',
         });
       } catch (err) {
         error(`图片下载失败: ${err.message}`);
