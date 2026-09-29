@@ -292,6 +292,12 @@ export function apply(ctx, config) {
     (config.defaultRouteKey && routeByKey(routes, config.defaultRouteKey)?.key) ?? defaultRouteKey;
   let activeRoute = configuredDefault ? routeByKey(routes, configuredDefault) : null;
   const useHostRoutes = routeList.length === 0;
+  // ⚠️ 跟随 web 端时「当前档位」与「web 端默认档」是**两件事**（2026-09-29 用户报障）：
+  //    默认档只管「新会话从哪条路起步」，用户在菜单里切过之后，当前档位就该是切的那条。
+  //    原先 refreshHostRoute() 每次刷写都把 activeRoute 覆盖成默认档，于是菜单的 ✅
+  //    和 /status 永远指着默认模型（实际切换是成功的，只是显示被打回原形）。
+  //    这里用一个显式记忆位承载「切过的档位」，刷新只在**没有记忆**时才回落到默认档。
+  let hostPickedKey = null;
 
   // ── 宿主模型表：跟随 web 端「设置 → 模型」（settings.yaml），加减模型即时生效 ──
   //    key 规则：单模型 provider 用别名，多模型 `<别名>:<模型id>`。
@@ -384,7 +390,11 @@ export function apply(ctx, config) {
   const refreshHostRoute = async () => {
     if (!useHostRoutes) return activeRoute;
     const table = await hostModelTable();
-    activeRoute = table.list.find((r) => r.key === table.defaultKey) ?? null;
+    // 记忆位优先：切过的档位必须活过刷新，否则菜单/状态又会显示成 web 默认档。
+    const remembered = hostPickedKey ? table.list.find((r) => r.key === hostPickedKey) : undefined;
+    activeRoute = remembered ?? table.list.find((r) => r.key === table.defaultKey) ?? null;
+    // 档位在 web 端被删掉 → 记忆失效，落回默认档（否则 activeRoute 会一直指着不存在的模型）。
+    if (!remembered) hostPickedKey = null;
     runtime?.setDefaultRoute(activeRoute);
     return activeRoute;
   };
@@ -1194,7 +1204,10 @@ export function apply(ctx, config) {
         }
         const switched = await runtime.switchRoute(chatKey, wanted);
         if (switched.ok) {
-          if (!useHostRoutes) activeRoute = wanted;
+          // 两档来源都要记住：手写 routes 直接换 activeRoute；跟随宿主时写记忆位，
+          // 下一次 refreshHostRoute() 才不会把显示覆盖回 web 默认档。
+          activeRoute = wanted;
+          if (useHostRoutes) hostPickedKey = wanted.key;
           await reply(
             `✅ 已切换到「${wanted.label}」\n${wanted.provider} / ${wanted.model}\n\n当前会话历史已带过去，直接接着聊即可。`,
           );
