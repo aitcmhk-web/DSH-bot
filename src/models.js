@@ -39,6 +39,9 @@ export function isLocalRoute(provider, routes = BUILTIN_ROUTES) {
  *
  * 口径：`'none'` / 空 / 没写 → 不发；`'off'` / `low` / `high` … → 原样发；
  * 兜底值 `fallback` **只**给显式配置的档位兜底，没有兜底可言的档一律不发。
+ * ⚠️ 2026-09-29 起 runtime 发送边界（normalizeEffort）会把 `'off'` 也一并拦下：
+ *    实爆证明 pi-ai 与 deepseek-official 都拒收 off —— 这里的「原样发」只描述
+ *    本函数的返回值，最终发不发以 runtime 边界为准。
  *
  * @param {{key?:string, reasoningEffort?: string|null}|null|undefined} route
  * @param {string|undefined} fallback

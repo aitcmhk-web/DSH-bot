@@ -22,6 +22,20 @@ import { createUserMessage, textContent } from './message.js';
 const SESSION_PREFIX = 'botplugin';
 
 /**
+ * 归一化思考强度：'none' / 'off' / 空 → 返回 undefined = **整个参数一个字节都不发**；
+ * 其余（low / medium / high / max …）原样发。
+ *
+ * ✅ 2026-09-29 远端实爆修正（mybot 盒子）：'off' 在 pi-ai 和 deepseek-official
+ *    两边都被拒（UNSUPPORTED_REASONING_EFFORT）。models.js 里「'off' 原样发」的
+ *    旧口径与 2026-09-28 的实测结论（"参数出现了，哪怕值是 off = 拒"）自相矛盾，
+ *    以实测为准 —— 发送边界一律拦下。原为 patches/0007 手工补丁，0.0.10 起入库。
+ */
+export function normalizeEffort(effort) {
+  const v = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+  return v && v !== 'none' && v !== 'off' ? v : undefined;
+}
+
+/**
  * 会话事件名。
  *
  * ✅ 已核对官方源码，不再是猜测：
@@ -362,6 +376,13 @@ export class BotRuntime {
       try {
         let handle;
         let created;
+        // 思考强度归一化（normalizeEffort）：'none'/'off'/空 不发，防止 UNSUPPORTED_REASONING_EFFORT。
+        const effort = normalizeEffort(route.reasoningEffort);
+        const agentOptions = {
+          provider: route.provider,
+          model: route.model,
+          ...(effort === undefined ? {} : { reasoningEffort: effort }),
+        };
         try {
           handle = await agents.create({
             // ⚠️ 官方写法是 `brandString(\`...\`)`，但 brandString 的官方实现就是
@@ -369,11 +390,7 @@ export class BotRuntime {
             //    这里直接传字符串，语义完全相同，且省掉一个解析不到的依赖。
             sessionId: `${SESSION_PREFIX}:${chatKey}`,
             meta: { cwd: this.#cwd },
-            agentOptions: {
-              provider: route.provider,
-              model: route.model,
-              ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-            },
+            agentOptions,
           });
           created = true;
         } catch (err) {
@@ -385,11 +402,7 @@ export class BotRuntime {
           if (!String(err?.message ?? err).includes('already exists')) throw err;
           handle = await agents.resume({
             resumeSessionId: `${SESSION_PREFIX}:${chatKey}`,
-            agentOptions: {
-              provider: route.provider,
-              model: route.model,
-              ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-            },
+            agentOptions,
           });
           created = false;
         }
