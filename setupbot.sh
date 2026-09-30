@@ -1073,23 +1073,23 @@ write_launchers() {
 
 # ============ 6. 复核 + 工作区文件 ============
 
-# 本机有没有本地语音引擎：whisper，或 阿里 FunASR SenseVoice（python3.11 + funasr）。
+# 本机有没有我们用的本地语音引擎：阿里 FunASR SenseVoice（python3.11 + funasr）。
 # ⛔ 只检测、只提示 —— 装什么、占多少磁盘是用户的事，绝不自动安装。
+# ⛔ 不看 whisper：中文识别太差，我们不用它（真要用得显式配 asrBackend=whisper）。
 VOICE_PY="/opt/homebrew/bin/python3.11"
 
 voice_engine_ready() {
-  if [ -x /opt/homebrew/bin/whisper ]; then return 0; fi
   if [ -x "$VOICE_PY" ] && "$VOICE_PY" -c 'import funasr' >/dev/null 2>&1; then return 0; fi
   return 1
 }
 
 voice_engine_hint() {
   if voice_engine_ready; then
-    say "✅ 语音：本机已经有本地语音引擎，发语音能转成文字。"
+    say "✅ 语音：本机已经有本地语音引擎（阿里 FunASR），发语音能转成文字。"
     return 0
   fi
   say ""
-  say "🎙 语音：本机还没装语音转文字引擎 —— 不装也能用，只是发语音听不懂。"
+  say "🎙 语音：本机还没装语音转文字引擎（阿里 FunASR）—— 不装也能用，只是发语音转不了文字。"
   say "   复制这一条装（需要 Homebrew）："
   say ""
   say "   brew install python@3.11 ffmpeg && /opt/homebrew/bin/python3.11 -m pip install -U funasr modelscope torch torchaudio soundfile"

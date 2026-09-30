@@ -102,7 +102,7 @@ dsh plugin --profile mybot add file:$HOME/DSH/BOT/botplugin
 | `memoryDir` / `memoryScript` | handoff 记忆接续：**默认开启**（`<工作目录>/memory` + 插件自带的记账程序），不用配；要关闭把 memoryDir 设成空串 |
 | `restartCommand` | 重启用的启动器 .command 路径；不填默认找工作目录里的 `start.command`（兼容老的 `启动-<工作区名>.command` / `启动-mybot.command`） |
 | `turnTimeoutMs` | 单轮超时，默认 30 分钟 |
-| `asrBackend` / `asrWhisperBin` / `asrPythonBin` | 语音转文字。不填就自动用本机的 `/opt/homebrew/bin/whisper` 或 `/opt/homebrew/bin/python3.11`（FunASR SenseVoice）；本机两个都没装时，发语音会回一条安装命令（⛔ 不自动装） |
+| `asrBackend` / `asrWhisperBin` / `asrPythonBin` | 语音转文字。默认 **sensevoice**（阿里 FunASR，中文准），不填路径就自动找 `/opt/homebrew/bin/python3.11`；本机没装时，安装收尾和发语音都会回一条可粘贴的安装命令（⛔ 不自动装）。`whisper` 中文差，只有显式填 `asrBackend: whisper` 才用 |
 
 ## 远程审批（手机点按钮，不用守着电脑）
 

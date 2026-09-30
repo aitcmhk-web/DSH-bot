@@ -87,11 +87,12 @@ export const Config = Schema.object({
   logLabel: Schema.string().default('botplugin').description('日志前缀'),
 
   // ---- 语音转文字 ----
-  // 这三个路径没有默认值：留空时收到语音会给「请设置 xxx」的可操作报错，而不是 ENOENT。
-  asrBackend: Schema.string().default('whisper')
-    .description('语音转文字后端：whisper 或 sensevoice（中文更准）'),
-  asrWhisperBin: Schema.string().description('whisper 可执行文件路径，如 /opt/homebrew/bin/whisper'),
-  asrPythonBin: Schema.string().description('python 解释器路径（sensevoice 后端用）'),
+  // 默认走阿里 FunASR SenseVoice（本机语音引擎），路径留空会自动找 /opt/homebrew/bin 下的。
+  // 没配也没有 → 收到语音时回「一条能直接粘的安装命令」，而不是 ENOENT。
+  asrBackend: Schema.string().default('sensevoice')
+    .description('语音转文字后端：sensevoice（默认，阿里 FunASR，中文准）或 whisper（中文差，要用得显式填）'),
+  asrWhisperBin: Schema.string().description('whisper 可执行文件路径（只有 asrBackend=whisper 时才用到）'),
+  asrPythonBin: Schema.string().description('python 解释器路径（sensevoice 用，默认 /opt/homebrew/bin/python3.11）'),
   asrKeepalive: Schema.boolean().default(false)
     .description('是否启用常驻转写服务（省掉每次约 7 秒的模型加载，代价是常驻约 1.5GB 内存）'),
   asrKeepalivePort: Schema.number().default(18081).description('常驻服务端口'),
@@ -1154,7 +1155,7 @@ export function apply(ctx, config) {
         await unlink(wav).catch(() => {});
       } catch (err) {
         error(`语音转写失败: ${err.message}`);
-        // 本机没装本地语音引擎（whisper / FunASR）→ 把安装命令回给用户，不是让人去改配置。
+        // 本机没装本地语音引擎（阿里 FunASR）→ 把安装命令原样回给用户，不是让人去改配置。
         await telegram.sendMessage(
           chatId,
           err?.code === 'VOICE_ENGINE_MISSING' ? err.message : `❌ 语音转文字失败：${err.message}`,

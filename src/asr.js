@@ -5,8 +5,8 @@
  * 本机压根没装引擎时回「一条能直接粘的安装命令」，而不是 ENOENT。
  *
  * 两个后端：
- *   · whisper     —— openai-whisper CLI（默认）
- *   · sensevoice  —— 阿里 FunASR SenseVoice-Small，中文更准、自带标点
+ *   · sensevoice  —— 阿里 FunASR SenseVoice-Small（**默认**，中文准、自带标点）
+ *   · whisper     —— openai-whisper CLI（中文识别差，只在显式配置时用）
  *
  * 常驻服务（可选加速）：走 TCP 本机回环问一个常驻 python 进程，
  *   省掉每次 ~7s 的模型加载。没起时静默回退冷启动，功能不受影响。
@@ -18,8 +18,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 
-/** 后端名 → 实现。未配置时 whisper。 */
-export const BACKENDS = ['whisper', 'sensevoice'];
+/** 后端名 → 实现。未配置时 sensevoice（阿里 FunASR —— 我们实际用的就是这个）。 */
+export const BACKENDS = ['sensevoice', 'whisper'];
 
 const log = (...args) => console.log('[botplugin:asr]', ...args);
 const logErr = (...args) => console.error('[botplugin:asr]', ...args);
@@ -56,7 +56,7 @@ export function asrConfig() {
 
 /** 当前后端名。 */
 export function currentBackend() {
-  return opts.backend === 'sensevoice' ? 'sensevoice' : 'whisper';
+  return opts.backend === 'whisper' ? 'whisper' : 'sensevoice';
 }
 
 // ---------------------------------------------------------------------------
@@ -111,24 +111,23 @@ function pythonHasFunasr(bin) {
 
 /**
  * 定这次用哪个引擎、哪个可执行文件。
- * 用户配了的优先 → 本机默认位置 → 都没有返回 null（= 该提示装）。
- * 配的后端不可用时会自己换用另一个（装了哪个就用哪个）。
+ * 配了的路径优先 → 本机 Homebrew 默认位置；都没有返回 null（= 该提示装）。
+ * ⛔ 不做跨后端自动顶替：默认就是 SenseVoice，本机没装它 → 提示装，
+ *    不悄悄退回中文识别很差的 whisper（要用 whisper 得显式配 asrBackend）。
  */
 function resolveEngine() {
-  const whisperBin = opts.whisperBin && exists(opts.whisperBin)
-    ? opts.whisperBin
-    : (exists(DEFAULT_WHISPER_BIN) ? DEFAULT_WHISPER_BIN : null);
   const pythonBin = opts.pythonBin && exists(opts.pythonBin)
     ? opts.pythonBin
     : (exists(DEFAULT_PYTHON_BIN) ? DEFAULT_PYTHON_BIN : null);
 
-  const senseVoice = () =>
-    (pythonBin && pythonHasFunasr(pythonBin) ? { backend: 'sensevoice', bin: pythonBin } : null);
-
-  if (currentBackend() === 'sensevoice') {
-    return senseVoice() || (whisperBin ? { backend: 'whisper', bin: whisperBin } : null);
+  if (currentBackend() === 'whisper') {
+    const whisperBin = opts.whisperBin && exists(opts.whisperBin)
+      ? opts.whisperBin
+      : (exists(DEFAULT_WHISPER_BIN) ? DEFAULT_WHISPER_BIN : null);
+    return whisperBin ? { backend: 'whisper', bin: whisperBin } : null;
   }
-  return whisperBin ? { backend: 'whisper', bin: whisperBin } : senseVoice();
+
+  return pythonBin && pythonHasFunasr(pythonBin) ? { backend: 'sensevoice', bin: pythonBin } : null;
 }
 
 /**
@@ -285,7 +284,7 @@ function voiceEngineMissingError() {
   return err;
 }
 
-/** openai-whisper CLI（--model base / txt / /tmp）。 */
+/** openai-whisper CLI（--model base / txt / /tmp）。备用后端，只在显式配了 whisper 时走。 */
 function transcribeWithWhisper(wavPath, bin) {
   return execFileSync(
     bin,
