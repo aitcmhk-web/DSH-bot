@@ -5,7 +5,7 @@
 整个安装就干两件事：
   ① 装「本体」 —— Git、Node、DSH（以后升级本体也是跑这一条）
   ② 装「机器人」—— 建工作区、绑 Telegram、绑微信，并在工作区里放好
-     启动 / 停止 / 重启 / 安装自启 / 卸载自启 五个双击文件
+     start / stop / restart / install-autostart / uninstall-autostart 五个文件
 下面的安装包把这两件事一次做完；会用终端的人也可以走在线命令（两种装出来一样）。
 
 ─────────────────────────────────
@@ -16,7 +16,7 @@
     curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh | zsh
   跑完这两条，终端里就多了 setupdsh 和 setupbot 两个词：
     setupdsh ＝ 升级本体（Git / Node / DSH）
-    setupbot ＝ 重新绑 TG / 微信、升级插件、重建那五个双击文件
+    setupbot ＝ 重新绑 TG / 微信、升级插件、重建那五个文件
 
 ─────────────────────────────────
 【第 1 步 · 拿 token】
@@ -33,24 +33,27 @@
   全程不用你编辑任何文件。窗口最后会停住 —— 看到 ✅ 再按回车关掉。
 
 【第 3 步 · 启动】
-  双击：~/DSH/mybot/启动.command
+  双击：~/DSH/mybot/start.command
   （工作区名字不是 mybot 的话，路径里的 mybot 换成你起的名字）
+  机器没有桌面（云主机 / 只有终端）时：cd ~/DSH/mybot 然后敲 ./start.command
   看到「Telegram 已登录：@你的机器人名」就成功了。
   去 Telegram 找你的新机器人，随便发一句话——
   它会先回「🔐 你已成为主人」，然后正常回答你。
 
 【工作区里那五个文件（都在 ~/DSH/你的名字/ 里）】
-  启动.command      —— 开始干活（在后台跑，窗口关掉也照样活着）
-  停止.command      —— 让它停下来（要退出就先双击这个，别直接关窗口）
-  重启.command      —— 升级 / 改完设置后用这个
-  安装自启.command  —— 开机自动启动（装好后再重启电脑，它自己就起来了）
-  卸载自启.command  —— 取消开机自动启动（想手动开就双击启动）
+  名字都是英文（云主机没有桌面，只能进文件夹敲，中文得切输入法）；
+  有桌面就双击，没桌面就在那个文件夹里敲 ./文件名。
+  start.command               —— 开始干活（在后台跑，窗口关掉也照样活着）
+  stop.command                —— 让它停下来（要退出就先停，别直接关窗口）
+  restart.command             —— 升级 / 改完设置后用这个
+  install-autostart.command   —— 开机自动启动（装好后再重启电脑，它自己就起来了）
+  uninstall-autostart.command —— 取消开机自动启动（想手动开就再跑 start）
 
 【加微信（可选）】
   ① 把 安装-mybot.command 再双击一次（或在终端敲 setupbot）
   ② 到微信那一步选「1. 重新扫码，绑一个」
   ③ 用手机微信「扫一扫」屏幕上的二维码（约 2 分钟过期，会自动刷新）
-  ④ 双击 重启.command，用扫码的那个微信发消息即可 —— 只有它能用。
+  ④ 跑一次 restart.command（双击，或终端里 ./restart.command），用扫码的那个微信发消息即可 —— 只有它能用。
 
 【换 token / 重新绑 TG】
   还是老办法：再双击一次 安装-mybot.command（或敲 setupbot），
@@ -60,13 +63,13 @@
   在终端敲 setupdsh；没装过这个命令，就把上面【在线装】第一条再跑一次。
 
 【停止 / 再次使用】
-  停止：双击 停止.command。
-  再次使用：双击 启动.command。
+  停止：跑一次 stop.command。
+  再次使用：跑一次 start.command。
 
 ─────────────────────────────────
 常见问题
 · 报 409 Conflict：这个 token 有别的程序在用（换一个新 bot 或停掉那个程序）。
-· 发消息没反应：双击 停止.command 再双击 启动.command，然后看 ~/DSH/你的名字/bot.log 最后几行。
+· 发消息没反应：跑一次 stop.command 再跑一次 start.command，然后看 ~/DSH/你的名字/bot.log 最后几行。
 · 想换模型：在 web 端「设置 → 模型」里增减 —— 下一条消息就生效；/model 可看列表。
 · 聊天记录存哪：~/DSH/你的名字/memory/ 里（流水账按月一个文件；/new、切模型时自动留 handoff 接续档）。
 · 微信扫码没反应：直接扫屏幕，别复制链接到电脑浏览器（会显示已过期）。

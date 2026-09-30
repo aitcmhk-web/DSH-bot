@@ -7,7 +7,7 @@
 # ⚠️ 现在这事分成两个（各管一头，互不越界）：
 #   setupdsh —— 机器上的家伙：Git、Node、DSH 本体（装 + 升级）
 #               在线入口：curl -fsSL .../setupdsh.sh | zsh
-#   setupbot —— 建/选工作区、装插件、绑 TG / 微信、生成工作区里那 5 个双击文件
+#   setupbot —— 建/选工作区、装插件、绑 TG / 微信、生成工作区里那 5 个文件（英文名）
 #               在线入口：curl -fsSL .../setupbot.sh | zsh（就是这个文件转发的那个）
 # 机器上还没有 dsh 的时候，setupbot 会自己把 setupdsh 跑一遍，顺序不用你操心；
 # 以后升级本体敲 setupdsh，重新绑 TG / 微信敲 setupbot。

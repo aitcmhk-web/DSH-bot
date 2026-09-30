@@ -14,7 +14,8 @@
 #   3) 把插件装进这个工作区 / 升级到最新
 #   4) TG：列出这台机器上已用过的 token 让你选，或粘一个新的
 #   5) 微信：用已有的凭据、重新扫码、或先不绑
-#   6) 在工作区里生成 5 个双击文件（启动/停止/重启/安装自启/卸载自启）+ 复核配置
+#   6) 在工作区里生成 5 个文件（start / stop / restart / install-autostart / uninstall-autostart，
+#      文件名一律英文，双击或纯终端里敲都行）+ 复核配置
 #
 # 测试钩子（不写进用户文档）：
 #   BOT_TOKEN=...                预置 token，跳过询问
@@ -818,8 +819,10 @@ write_bot_config() {
   return "$rc"
 }
 
-# ============ 5.9 工作区里的 5 个双击文件 ============
-# 生成：启动 / 停止 / 重启 / 安装自启 / 卸载自启，外加一个隐藏的共用助手 .botctl.sh。
+# ============ 5.9 工作区里的 5 个文件 ============
+# 生成：start / stop / restart / install-autostart / uninstall-autostart 五个 .command，
+# 外加一个隐藏的共用助手 .botctl.sh。
+# ⚠️ 文件名一律英文：云主机没有桌面，只能进文件夹手敲，中文名要切输入法。
 # ⚠️ 起停逻辑只有这一份（都在 .botctl.sh 里），5 个 .command 只是外壳 —— 别在别处再写一遍。
 write_launchers() {
   WS="$LAUNCH_DIR/$PROFILE"
@@ -828,11 +831,13 @@ write_launchers() {
 
   put() { printf '%s\n' "$2" >> "$1"; }
   pause_fn() {
-    put "$1" 'pause() { echo; printf "按回车键关闭窗口…"; read -r _ 2>/dev/null || true; }'
+    # 交互终端才停下等回车；从脚本里跑 / 无桌面的云主机上非交互跑，不会卡住
+    put "$1" 'pause() { [ -t 0 ] || return 0; echo; printf "按回车键关闭窗口…"; read -r _ 2>/dev/null || true; }'
   }
-  head_fn() { # $1=文件 $2=窗口标题 $3=第一行说明
+  head_fn() { # $1=文件 $2=窗口标题 $3=第一行说明 $4=终端里要敲的命令（可省）
     put "$1" '#!/bin/zsh'
     put "$1" "# ${3}。此文件由 setupbot 生成，可以重复生成。"
+    [ -n "${4:-}" ] && put "$1" "# 没有桌面（云主机 / 纯终端）：进到本文件夹，敲  $4"
     put "$1" 'cd "$(dirname "$0")" || exit 1'
     put "$1" "printf '\\033]0;$PROFILE — $2\\007'"
     put "$1" 'clear'
@@ -886,7 +891,7 @@ write_launchers() {
   put "$CTL" ''
   put "$CTL" 'do_stop() {'
   put "$CTL" '  if plist_loaded; then'
-  put "$CTL" '    echo "这份装着开机自启，先从 launchd 卸下（自启文件还留着，双击「安装自启」可再装）…"'
+  put "$CTL" '    echo "这份装着开机自启，先从 launchd 卸下（自启文件还留着，跑 ./install-autostart.command 可再装）…"'
   put "$CTL" '    launchctl unload "$PLIST" 2>/dev/null || true'
   put "$CTL" '  fi'
   put "$CTL" '  p="$(running_pid)" || { echo "现在没在跑。"; rm -f "$PIDFILE" 2>/dev/null; return 0; }'
@@ -913,7 +918,7 @@ write_launchers() {
   make_cmd() { # $1=文件名 $2=窗口标题 $3=动作 $4=.botctl 参数
     f="$WS/$1"
     : > "$f" 2>/dev/null || return 1
-    head_fn "$f" "$2" "双击 = ${3}「${PROFILE}」"
+    head_fn "$f" "$2" "${3}「${PROFILE}」" "./$1"
     put "$f" "echo \"${3}「${PROFILE}」\""
     put "$f" 'echo "──────────────"'
     put "$f" "\"\$(pwd)/.botctl.sh\" $4"
@@ -922,14 +927,15 @@ write_launchers() {
     put "$f" 'exit $RC'
     chmod +x "$f" 2>/dev/null
   }
-  make_cmd '启动.command' '启动' '启动' 'start'
-  make_cmd '停止.command' '停止' '停止' 'stop'
-  make_cmd '重启.command' '重启' '重启' 'restart'
+  # 文件名一律英文小写（云主机 / 纯终端里要手敲，中文得切输入法）；窗口标题和提示仍是中文
+  make_cmd 'start.command' '启动' '启动' 'start'
+  make_cmd 'stop.command' '停止' '停止' 'stop'
+  make_cmd 'restart.command' '重启' '重启' 'restart'
 
   # ---- 安装自启（launchd） ----
-  f="$WS/安装自启.command"
+  f="$WS/install-autostart.command"
   : > "$f" 2>/dev/null || return 1
-  head_fn "$f" '安装自启' "双击 = 让「${PROFILE}」开机自动跑"
+  head_fn "$f" '安装自启' "让「${PROFILE}」开机自动跑" './install-autostart.command'
   put "$f" "DSH=\"$DSHBIN\""
   put "$f" "PROFILE=\"$PROFILE\""
   put "$f" "export DSH_HOME=\"$DSH_HOME_DIR\""
@@ -984,7 +990,7 @@ write_launchers() {
   put "$f" 'sleep 3'
   put "$f" 'if launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
   put "$f" '  echo "✅ 装好了：以后开机（登录）它自己就起来，日志还是工作区的 bot.log。"'
-  put "$f" '  echo "   想取消：双击 卸载自启.command"'
+  put "$f" '  echo "   想取消：跑 ./uninstall-autostart.command"'
   put "$f" 'else'
   put "$f" '  echo "⛔ 装了但 launchctl 里看不到，把上面几行发我。"'
   put "$f" 'fi'
@@ -992,9 +998,9 @@ write_launchers() {
   chmod +x "$f" 2>/dev/null
 
   # ---- 卸载自启 ----
-  f="$WS/卸载自启.command"
+  f="$WS/uninstall-autostart.command"
   : > "$f" 2>/dev/null || return 1
-  head_fn "$f" '卸载自启' "双击 = 取消「${PROFILE}」的开机自启"
+  head_fn "$f" '卸载自启' "取消「${PROFILE}」的开机自启" './uninstall-autostart.command'
   put "$f" "LABEL=\"com.local.dshbot.$PROFILE\""
   put "$f" 'PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"'
   put "$f" ''
@@ -1011,16 +1017,18 @@ write_launchers() {
   put "$f" '  echo "⛔ 没卸干净，把上面几行发我。"'
   put "$f" 'else'
   put "$f" '  echo "✅ 已取消开机自启（自启文件已删）。"'
-  put "$f" '  if [ "$ran" = "1" ]; then echo "   （刚才那份进程也被 launchd 一起停了；要手动跑就双击 启动.command）"; fi'
+  put "$f" '  if [ "$ran" = "1" ]; then echo "   （刚才那份进程也被 launchd 一起停了；要手动跑就 ./start.command）"; fi'
   put "$f" 'fi'
   put "$f" 'pause'
   chmod +x "$f" 2>/dev/null
 
-  # 老版本只生成一个「启动-<名字>.command」，现在拆成 5 个 —— 那份是我们的旧产物，收掉
-  OLD="$WS/启动-${PROFILE}.command"
-  if [ -f "$OLD" ] && grep -q '此文件由 setupbot 生成' "$OLD" 2>/dev/null; then
-    rm -f "$OLD" 2>/dev/null && say "（旧的 启动-${PROFILE}.command 已被新的 启动.command 取代，删掉了）"
-  fi
+  # 旧产物收掉：① 老版本只生成的「启动-<名字>.command」；② 中文件名的 5 个旧文件（现在一律英文名）。
+  # 只删带「此文件由 setupbot 生成」标记的（确凿是我们生成的）；用户手写的同名文件不动。
+  for OLD in "$WS/启动-${PROFILE}.command" "$WS/启动.command" "$WS/停止.command" "$WS/重启.command" "$WS/安装自启.command" "$WS/卸载自启.command"; do
+    if [ -f "$OLD" ] && grep -q '此文件由 setupbot 生成' "$OLD" 2>/dev/null; then
+      rm -f "$OLD" 2>/dev/null && say "（旧的 $(basename "$OLD") 已换成英文名，收掉了）"
+    fi
+  done
 
   LAUNCH_OK=1
   return 0
@@ -1078,7 +1086,7 @@ finish() {
 
   if write_launchers; then
     say "✅ 工作区文件已生成：${LAUNCH_DIR}/${PROFILE}/"
-    say "   启动 / 停止 / 重启 / 安装自启 / 卸载自启 —— 双击就能用"
+    say "   start / stop / restart / install-autostart / uninstall-autostart —— 双击能用，终端里 ./start.command 也能用"
   else
     say "⚠️ 工作区文件没生成（${LAUNCH_DIR}/${PROFILE} 不可写？）—— 还能敲 dsh --profile ${PROFILE} 启动。"
   fi
@@ -1087,8 +1095,9 @@ finish() {
   say "============ 全部搞定 ============"
   say "工作区：${PROFILE}（${LAUNCH_DIR}/${PROFILE}）"
   if [ -n "$LAUNCH_OK" ]; then
-    say "启动：双击 ${LAUNCH_DIR}/${PROFILE}/启动.command（后台跑，窗口关了也活着）"
-    say "停止 / 重启 / 开机自启：就在同一个文件夹里"
+    say "启动：双击 ${LAUNCH_DIR}/${PROFILE}/start.command"
+    say "      （没有桌面就进这个文件夹敲 ./start.command；后台跑，窗口关了也活着）"
+    say "停止 / 重启 / 开机自启：同一个文件夹里的 stop.command、restart.command、install-autostart.command"
   else
     say "启动：敲 dsh --profile ${PROFILE}"
   fi
