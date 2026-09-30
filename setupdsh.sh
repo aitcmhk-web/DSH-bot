@@ -116,11 +116,17 @@ ensure_git() {
   if [ -n "$SKIP_UPGRADE" ]; then return 0; fi
   # 只升「Homebrew 管的」那一份；macOS 自带的那份归系统更新，brew 碰不到
   if [ -n "$BREW" ] && HOMEBREW_NO_AUTO_UPDATE=1 "$BREW" list --versions git >/dev/null 2>&1; then
-    say "把 git 升到最新（Homebrew）…"
+    OLDG="$("$GITBIN" --version 2>/dev/null || echo '?')"
+    say "把 git 升到最新（Homebrew）… 现在是：$OLDG"
     if HOMEBREW_NO_AUTO_UPDATE=1 "$BREW" upgrade git >/dev/null 2>&1; then
-      say "✅ git 已是最新：$("$GITBIN" --version 2>/dev/null || echo "$GITBIN")"
+      NEWG="$("$GITBIN" --version 2>/dev/null || echo '?')"
+      if [ "$NEWG" != "$OLDG" ]; then
+        say "✅ git 升好了：$OLDG → $NEWG"
+      else
+        say "✅ git 已是最新：$NEWG"
+      fi
     else
-      say "⚠️ git 没升成（可能本来就最新 / 没网），用现在这版继续。"
+      say "⚠️ git 没升成（可能本来就最新 / 没网），用现在这版继续：$OLDG"
     fi
   fi
 }
@@ -142,25 +148,39 @@ ensure_node() {
 
 # ============ 3. DSH 本体 ============
 DSHBIN=""
+# ⚠️ 取不到版本就返回空，调用处显示 `?`，绝不拿路径冒充版本号。
+#    2026-10-01 用户反馈：升级那段一直静默，既不报原版本也不报新版本，看不出到底升没升。
+dsh_version() {
+  [ -n "${1:-}" ] || return 0
+  "$1" --version 2>/dev/null | head -1 | tr -d '\r'
+}
 ensure_dsh() {
   DSHBIN="$(command -v dsh 2>/dev/null || true)"
   if [ -z "$DSHBIN" ]; then
     say "这台机器还没装 dsh，现在装（一两分钟）…"
     npm i -g @deepseek-ai/dsh || die "装 dsh 失败了，看上面的报错。"
   elif [ -n "$SKIP_UPGRADE" ]; then
-    say "✅ dsh 已有（跳过升级）：$DSHBIN"
+    say "✅ dsh 已有（跳过升级）：$(dsh_version "$DSHBIN")"
     return 0
   else
+    OLDV="$(dsh_version "$DSHBIN")"
+    say "当前 dsh：${OLDV:-?}（${DSHBIN}）"
     say "把 dsh 升到最新…"
     if npm i -g @deepseek-ai/dsh >/dev/null 2>&1; then
-      say "✅ dsh 已是最新。"
+      DSHBIN="$(command -v dsh 2>/dev/null || printf '%s' "$DSHBIN")"
+      NEWV="$(dsh_version "$DSHBIN")"
+      if [ -n "$NEWV" ] && [ "$NEWV" != "$OLDV" ]; then
+        say "✅ dsh 升好了：${OLDV:-?} → $NEWV"
+      else
+        say "✅ dsh 已是最新：${NEWV:-${OLDV:-?}}"
+      fi
     else
-      say "⚠️ dsh 没升成（大概是没网），用现在这版继续。"
+      say "⚠️ dsh 没升成（大概是没网），现在还是：${OLDV:-?}"
     fi
   fi
   DSHBIN="$(command -v dsh 2>/dev/null || true)"
   [ -n "$DSHBIN" ] || die "装完还是找不到 dsh 命令（可能要重开一个终端，或 npm 的全局 bin 目录不在 PATH 里）。"
-  say "✅ dsh：$DSHBIN"
+  say "✅ dsh：$(dsh_version "$DSHBIN")  （${DSHBIN}）"
 }
 
 # ============ 主流程 ============
@@ -180,7 +200,7 @@ say ""
 say "============ 全部搞定 ============"
 say "git ：$("$GITBIN" --version 2>/dev/null || echo '?')"
 say "node：$(node -v 2>/dev/null || echo '?')"
-say "dsh ：$DSHBIN"
+say "dsh ：$(dsh_version "$DSHBIN")"
 say ""
 say "下一步：建工作区 + 绑 TG / 微信 —— 跑 setupbot"
 if [ -n "${SELF_BIN_DIR:-}" ]; then
