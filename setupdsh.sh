@@ -26,7 +26,7 @@ SRC_PATH="$0"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    2026-10-01 用户反馈「github 没有提示版本」——跑起来必须先报自己是谁，才看得出手上这份是新是旧。
-SELF_VERSION="2026-10-01.2"
+SELF_VERSION="2026-10-01.3"
 
 SETUPDSH_URL="${SETUPDSH_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh}"
 SELF_DIR="$HOME/.dsh/setupdsh"
@@ -211,7 +211,7 @@ ensure_node
 ensure_dsh
 
 say ""
-say "============ 机器这边搞定 ============"
+say "============ 机器环境安装完成 ============"
 say "git ：$("$GITBIN" --version 2>/dev/null || echo '?')"
 say "node：$(node -v 2>/dev/null || echo '?')"
 say "dsh ：$(dsh_version "$DSHBIN")"

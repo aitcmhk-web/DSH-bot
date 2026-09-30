@@ -32,6 +32,10 @@ SRC_PATH="$0"
 # 也支持老用法：zsh setupbot.sh 工作区名（不指定就问你）
 ARG_PROFILE="${1:-}"
 
+# ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
+#    2026-10-01 用户反馈「更新看不到提示」——跑起来先报自己是谁，才看得出手上这份是新是旧。
+SELF_VERSION="2026-10-01.1"
+
 SETUPBOT_URL="${SETUPBOT_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh}"
 SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot}"
 DSH_HOME_DIR="${DSH_HOME:-$HOME/.dsh}"
@@ -127,12 +131,20 @@ fi
 # ============ 0. 把自己装成 setupbot 命令 ============
 install_self() {
   mkdir -p "$SELF_DIR" 2>/dev/null || return 0
-  # 有实体脚本文件（在线下载的 / 安装包里的）就复制自己；curl|zsh 没有实体才去下载
+  # 有实体脚本文件（安装包里的 / 已落盘的）就复制自己；curl|zsh 手上没有实体文件，从网上留一份备用。
+  # ⚠️ curl|zsh 这条**每次都要刷本地副本**：否则启动器一旦联不上网就退回旧脚本，
+  #    用户看到的还是老行为（2026-10-01 实测：GitHub 上已是新版，本机跑出来还是旧的）。
   if [ -f "$SRC_PATH" ] && grep -q 'setupbot-self-marker' "$SRC_PATH" 2>/dev/null; then
     cp "$SRC_PATH" "$SELF_PATH" 2>/dev/null || true
+  else
+    if curl -fsSL --max-time 25 "$SETUPBOT_URL" -o "$SELF_PATH.new" 2>/dev/null && [ -s "$SELF_PATH.new" ]; then
+      mv "$SELF_PATH.new" "$SELF_PATH" 2>/dev/null || rm -f "$SELF_PATH.new" 2>/dev/null
+    else
+      rm -f "$SELF_PATH.new" 2>/dev/null
+    fi
   fi
   if [ ! -s "$SELF_PATH" ]; then
-    curl -fsSL "$SETUPBOT_URL" -o "$SELF_PATH.new" 2>/dev/null \
+    curl -fsSL --max-time 25 "$SETUPBOT_URL" -o "$SELF_PATH.new" 2>/dev/null \
       && mv "$SELF_PATH.new" "$SELF_PATH" || rm -f "$SELF_PATH.new" 2>/dev/null
   fi
   [ -s "$SELF_PATH" ] || return 0
@@ -298,16 +310,30 @@ pick_workspace() {
 }
 
 # ============ 3. 插件（装 / 升级） ============
+# ⚠️ 从装好的插件里读版本号（package.json 是唯一版本源）。读不到返回空，绝不拿日期或路径冒充版本号。
+plugin_version() {
+  [ -n "${1:-}" ] || return 0
+  [ -f "$1/package.json" ] || return 0
+  sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1/package.json" | head -1
+}
 install_plugin() {
   PLUGDIR="$PROFILES/$PROFILE/node_modules/dsh-botplugin"
+  OLD_VER="$(plugin_version "$PLUGDIR")"
   say ""
   if [ -d "$PLUGDIR" ]; then
-    say "工作区 ${PROFILE} 里已经装了插件，升级到最新…"
+    say "工作区 ${PROFILE} 里已经装了插件（当前版本 ${OLD_VER:-未知}），升级到最新…"
   else
     say "给工作区 ${PROFILE} 装插件…（一两分钟）"
   fi
   ( cd "$HOME" && "$DSHBIN" plugin --profile "$PROFILE" add "$SPEC" ) || die "插件没装上，看上面的报错。"
-  say "✅ 插件好了。"
+  NEW_VER="$(plugin_version "$PLUGDIR")"
+  if [ -n "$OLD_VER" ] && [ -n "$NEW_VER" ] && [ "$OLD_VER" != "$NEW_VER" ]; then
+    say "✅ 插件：${OLD_VER} → ${NEW_VER}"
+  elif [ -n "$NEW_VER" ]; then
+    say "✅ 插件：${NEW_VER}（已是最新）"
+  else
+    say "✅ 插件装好了（版本号没读到）。"
+  fi
 }
 
 # ============ 4. TG token ============
@@ -785,7 +811,7 @@ write_bot_config() {
   mkdir -p "$PROFILES/$PROFILE" 2>/dev/null || true
   if ! has_botplugin_block "$cfg"; then
     if [ -z "$TOKEN" ] && [ -z "$WXFILE" ] && [ -z "$BOTCWD" ]; then
-      # ⚠️ 这里以前是静默 return 0：什么都没写还当成功，用户看到「全部搞定」以为绑好了（2026-09-30 撞过）
+      # ⚠️ 这里以前是静默 return 0：什么都没写还当成功，用户看到收尾的完成提示以为绑好了（2026-09-30 撞过）
       say "⚠️ 这次没有任何绑定要写，${cfg} 没动。"
       return 0
     fi
@@ -1157,7 +1183,7 @@ finish() {
   fi
 
   say ""
-  say "============ 全部搞定 ============"
+  say "============ 机器人安装配置完成 ============"
   say "工作区：${PROFILE}（${LAUNCH_DIR}/${PROFILE}）"
   if [ -n "$LAUNCH_OK" ]; then
     say "启动：双击 ${LAUNCH_DIR}/${PROFILE}/start.command"
@@ -1178,8 +1204,9 @@ finish() {
 # ============ 主流程 ============
 say ""
 say "=================================="
-say "  DSH 机器人 · 一条命令全搞定"
+say "  DSH 机器人 · 一条命令安装配置"
 say "=================================="
+say "setupbot 版本：${SELF_VERSION}"
 
 if [ "${SETUPBOT_NO_SELF_INSTALL:-}" != "1" ]; then
   install_self
