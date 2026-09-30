@@ -2,11 +2,11 @@
   mybot 安装说明 · 安装包方式（双击安装，不用敲命令）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-提示：如果你会用终端，也可以不走安装包，直接一条命令在线安装（机器上得先有 dsh 命令，
-没装就跑一次：npm i -g @deepseek-ai/dsh）：
-  dsh plugin --profile mybot add github:aitcmhk-web/DSH-bot
-两种方式装出来的东西一样，选一种就行。下面的步骤是给「下载了安装包的人」的。
-（走安装包的话不用管 dsh 装没装 —— 安装器会自己去找。）
+提示：如果你会用终端，也可以不走安装包，一条命令在线安装（机器上连 dsh 都没有也行，
+这条命令会自己装）：
+  curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setup-bot.sh | zsh
+它跑完会问你要 token，粘上回车，然后打出一行启动命令。两种方式装出来的东西一样，选一种就行。
+下面的步骤是给「下载了安装包的人」的。
 
 【第 1 步 · 拿 token】
   打开 Telegram，搜索 @BotFather，发送 /newbot，
@@ -14,8 +14,7 @@
 
 【第 2 步 · 填 token】
   安装器结束时会让你把 token 贴进终端：粘贴 + 回车，它自己写进配置，不用你编辑文件。
-  当时没填也没事，启动前在终端敲这一行补上：
-    open -e ~/DSH/mybot/profiles/mybot/cordis.patch.yml
+  当时没填也没事，启动前把安装包里的 安装-mybot.command 再双击一次，它会重新问你 token。
 
 【第 3 步 · 启动】
   双击：~/DSH/mybot/启动-mybot.command
