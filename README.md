@@ -16,15 +16,21 @@
 1. 把下面这条整段贴进终端，回车：
 
    ```
-   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setup-bot.sh | zsh
+   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh | zsh
    ```
 
-   它自己装 DSH（没装的话）、自己挑 profile、自己把插件装好，然后**只问你一样东西：token**
-   —— 在 Telegram 里找 @BotFather 复制那串，粘上、回车，它自己写进配置。
+   它自己装 DSH（没装的话）、自己列出/新建工作区、自己把插件装好，然后**只问你三件事**：
+   工作区叫什么（直接回车就叫 `mybot`）、Telegram token（@BotFather 那串）、微信怎么绑（可选）。
+   每样都是「输个编号」或「粘一下回车」，不用你编辑任何文件。
 
-2. 启动：照着它最后打出来的那行敲（形如 `dsh --profile mybot`）。
+2. 跑完它会把这条命令装进 PATH —— **以后不管重新绑 TG、重新绑微信、还是升级插件和 DSH，
+   都只要敲一个词**：
 
-以后升级也是同一条命令（重新跑会拉最新版）。
+   ```
+   setupbot
+   ```
+
+3. 启动：照着它最后打出来的那行，或者双击 `~/DSH/<工作区名>/启动-<工作区名>.command`。
 
 ## 开发者：本地安装（用你手上这份源码）
 
@@ -52,11 +58,14 @@ dsh plugin --profile mybot add file:$HOME/DSH/BOT/botplugin
 ## 安装方式二：下载安装包（不想敲命令的）
 
 1. 下载安装包：[dsh-mybot-安装包.zip](dsh-mybot-安装包.zip)（在本页文件列表里，点它再点 Download / Download raw）。
-2. 解压，双击里面的 `安装-mybot.command` —— 它会自动装到 `~/DSH/mybot` 并弹出图文说明。
-3. 结束时它会把 token 要过去 —— 粘贴 + 回车，它自己写进配置（没填也能装完，之后按弹出的说明补）。
-4. 以后每次使用：双击 `~/DSH/mybot/启动-mybot.command`。想加微信：双击 `登录微信.command` 扫码。
+2. 解压，双击里面的 `安装-mybot.command`。
+3. 接下来和在线方式**完全一样**：问你工作区名字（直接回车就叫 `mybot`）→ 粘 token → 微信要不要绑。
+   窗口最后会停住等你按回车，结果不会一闪而过。
+4. 以后每次使用：双击 `~/DSH/<工作区名>/启动-<工作区名>.command`。
+   想重新绑 TG / 微信：把 `安装-mybot.command` 再双击一次（或在终端敲 `setupbot`）。
 
-> 三种方式装出来的是同一个插件，选一种就行。安装包方式自带图文说明和启动器，适合第一次接触命令行的人；git 方式升级最省事（重跑一条命令）；本地方式改了源码立刻生效，适合调试。
+> 两种方式装出来的是同一个插件，跑的是同一个 `setupbot.sh`，选一种就行。
+> 安装包方式适合完全不想碰命令行的人；在线方式第一次要粘一条命令，之后也只剩 `setupbot` 一个词。
 
 ## 怎么确认装对了
 
@@ -74,7 +83,7 @@ dsh plugin --profile mybot add file:$HOME/DSH/BOT/botplugin
 | `routes` + `defaultRouteKey` | 手工指定模型档位；留空 = 自动跟随 web 端「设置 → 模型」 |
 | `cwd` | 模型的工作目录 |
 | `memoryDir` / `memoryScript` | handoff 记忆接续：**默认开启**（`<工作目录>/memory` + 插件自带的记账程序），不用配；要关闭把 memoryDir 设成空串 |
-| `restartCommand` | 重启用的启动器 .command 路径；不填默认找 `<工作目录>/启动-mybot.command` |
+| `restartCommand` | 重启用的启动器 .command 路径；不填默认找 `<工作目录>/启动-<工作区名>.command` |
 | `turnTimeoutMs` | 单轮超时，默认 30 分钟 |
 | `asrBackend` / `asrWhisperBin` / `asrPythonBin` | 语音转文字（不填则语音报"没配"） |
 
@@ -108,7 +117,7 @@ DSH 的审批服务用 waterfall 广播 `approval/request`，插件把它桥接�
 
 `/whoami` `/status` `/model` `/new`（新会话） `/restart`（重启进程，先留档） `/help`
 
-> `/restart` 与老 bot 同路：先把进展写进 handoff，再由**进程外的接力脚本**延迟几秒杀掉宿主并重新拉起（有 `启动-mybot.command` 就重开终端窗口；没有就按原始命令行后台拉起）。两者都没有时退化为只重开会话。重启完成后发条消息，新会话自动带上刚才的记忆。
+> `/restart` 与老 bot 同路：先把进展写进 handoff，再由**进程外的接力脚本**延迟几秒杀掉宿主并重新拉起（有 `启动-<工作区名>.command` 就重开终端窗口；没有就按原始命令行后台拉起）。两者都没有时退化为只重开会话。重启完成后发条消息，新会话自动带上刚才的记忆。
 
 ## 记忆（流水账 + handoff）
 

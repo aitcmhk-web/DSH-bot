@@ -19,7 +19,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { existsSync, openSync, appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, openSync, appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { readFile, writeFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -77,7 +77,7 @@ export const Config = Schema.object({
   cwd: Schema.string().description('会话工作目录。留空 = 用 DSH 当前目录'),
   memoryDir: Schema.string().description('记忆目录（每项目独占）。不填 = 默认 <工作目录>/memory；显式填空串 = 关闭记忆'),
   memoryScript: Schema.string().description('共享的 cache-manager.mjs 路径。不填 = 用插件自带的 vendor/conversation-cache/cache-manager.mjs'),
-  restartCommand: Schema.string().description('重启用的启动器 .command 路径。不填 = 默认找 <工作目录>/启动-mybot.command；找不到且拿不到原始命令行时，/restart 退化为只重开会话'),
+  restartCommand: Schema.string().description('重启用的启动器 .command 路径。不填 = 自动找工作目录里的「启动-<工作区名>.command」（兼容老的启动-mybot.command）；找不到且拿不到原始命令行时，/restart 退化为只重开会话'),
 
   // ---- 行为 ----
   backlogMaxAgeSeconds: Schema.number().default(2 * 60 * 60)
@@ -1221,14 +1221,34 @@ export function apply(ctx, config) {
    * 组装重启接力脚本的环境变量；无法安全拉起时返回 null（/restart 退化为只重开会话）。
    *
    * 两条拉起路径：
-   *   ① 启动器（macOS 安装包用户）：配置 restartCommand 或 <工作目录>/启动-mybot.command，
+   *   ① 启动器（macOS 安装包用户）：配置 restartCommand，或工作目录里的
+   *      `启动-<工作区名>.command`（setupbot 生成的就是这个名字；
+   *      兼容老的 `启动-mybot.command` / `启动.command`），
    *      helper 用 `open` 重开一个新的终端窗口；
    *   ② 原始命令行：把本进程的 node + 脚本 + 参数原样交给 helper nohup 拉起（尽力而为，
    *      宿主原先是终端窗口的话，那个窗口会结束、bot 转后台）。
    */
+  // 找启动器：安装器给每个工作区生成的是「启动-<工作区名>.command」，
+  // 名字随工作区变，所以按前缀扫一遍目录；老的固定名仍然优先认。
+  function findLauncher(cwd) {
+    const legacy = ['启动-mybot.command', '启动.command']
+      .map((n) => join(cwd, n))
+      .find((p) => existsSync(p));
+    if (legacy) return legacy;
+    try {
+      const hit = readdirSync(cwd)
+        .filter((n) => n.startsWith('启动-') && n.endsWith('.command'))
+        .sort()[0];
+      if (hit) return join(cwd, hit);
+    } catch {
+      // 目录读不了（不存在 / 没权限）就当没有启动器
+    }
+    return join(cwd, '启动-mybot.command');
+  }
+
   function restartPlanEnv() {
     const cwd = config.cwd || process.cwd();
-    const launcher = config.restartCommand || join(cwd, '启动-mybot.command');
+    const launcher = config.restartCommand || findLauncher(cwd);
     const hasLauncher = Boolean(launcher) && existsSync(launcher);
     const [, scriptPath, ...extraArgs] = process.argv;
     // 托管者检测：systemd 给每个 unit 进程注入 INVOCATION_ID；launchd 注入 XPC_SERVICE_NAME。
