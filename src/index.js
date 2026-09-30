@@ -428,6 +428,51 @@ export function apply(ctx, config) {
     return activeRoute;
   };
 
+  /**
+   * 自动回退链：剩下的档位按顺序试，但**本地档永远排最后**兜底。
+   *
+   * 口径照抄 bot.js `fallbackChainAfter()`（README.md:164）：web 端生成的档位表
+   * 把本地档排在最前，直接按列表顺序回退会「一欠费就先撞本地」
+   * （2026-09-28 实际发生过：zhipu 余额不足 → 直接切到 LOCAL-VQ）。
+   * ⚠️ 只影响回退顺序，`/model` 菜单的展示顺序不变。
+   */
+  const fallbackChainAfter = (brokenKey, list) => {
+    const rest = list.filter((r) => r.key !== brokenKey);
+    return [...rest.filter((r) => r.key !== 'local'), ...rest.filter((r) => r.key === 'local')];
+  };
+
+  /**
+   * 当前档位被模型拒绝后，换一个能用的档位。
+   *
+   * ⚠️ **刻意不落盘**（口径同 bot.js `failOverRoute`）：自动切换是应急，不是用户的选择。
+   *    原档位以后充值/恢复了，重启后还能重新用上；要是落了盘，一次临时欠费就会
+   *    把用户手选的档永久改掉 —— 那正是 2026-09-30 「重启后模型回默认」报障的同类错误。
+   *
+   * @returns {Promise<{route:object,key:string}|null>} 换成功的档位，全试完仍失败则 null
+   */
+  const failOverRoute = async (chatKey, brokenKey, detail) => {
+    // ⚠️ 按本文件既有口径取档位列表（1220/1403 行同款）：非跟随宿主时**不能**调
+    //    hostModelTable() —— 那条路要问宿主要 web 端档位表，非宿主模式下没有。
+    const list = useHostRoutes ? (await hostModelTable()).list : routeList;
+    for (const route of fallbackChainAfter(brokenKey, list)) {
+      try {
+        // ⚠️ 必须传真实 chatKey：runtime 的会话是按 chat 存的，
+        //    传 null 找不到记录，等于没切（会话还挂在旧档位句柄上）。
+        const r = await runtime.switchRoute(chatKey, route);
+        if (r && r.ok === false) {
+          error(`[model] 自动回退到 ${route.key} 失败: ${r.error}`);
+          continue;
+        }
+        activeRoute = route;
+        log(`[model] ${brokenKey} 调用失败,自动切到 ${route.key}: ${String(detail).slice(0, 160)}`);
+        return { route, key: route.key };
+      } catch (err) {
+        error(`[model] 自动回退到 ${route.key} 也失败: ${err.message}`);
+      }
+    }
+    return null;
+  };
+
   // -------------------------------------------------------------------------
   // 记忆（handoff）
   // -------------------------------------------------------------------------
@@ -802,6 +847,46 @@ export function apply(ctx, config) {
     const answer = await waiting;
     offEvents?.();
     if (!answer.ok) {
+      // ⚠️ 余额不足/限额这类失败**不是这一轮的问题，是这个档位不能用了**
+      //    （2026-09-30 用户报障：「模型欠费返回错误时，它不能自动跳到下一个模型」）。
+      //    判定用 models.js 的 isRouteFailure（正则里已含 欠费/余额/额度/402/quota…），
+      //    它此前只被 import 从没被调用 —— 这就是"判得出来却不切"的根因。
+      //    网络抖动等临时故障（TRANSIENT_FAILURE）不切，免得白白丢掉上下文。
+      if (isRouteFailure(answer.failure ?? answer.error)) {
+        // ⚠️ 先记下**坏掉的档**再切 —— failOverRoute 会把 activeRoute 改成新档，
+        //    切完再取就变成「从新档切到新档」的错话术（bot.js 同样先存 from）。
+        const broken = activeRoute;
+        const switched = await failOverRoute(chatKey, broken?.key, answer.error);
+        if (switched) {
+          await ep
+            .send({
+              text:
+                `🔁 模型「${describeRoute(broken)}」不可用，` +
+                `已自动切换到「${switched.route.label ?? switched.key}」并重试。\n原因：${answer.error}`,
+            })
+            .catch(() => {});
+          // 在新档位上重发这一轮，然后照常等回答。
+          const retry = await runtime.prompt(chatKey, promptPayload);
+          if (retry.ok) {
+            const retryWaiting = runtime.waitForTurn(chatKey, config.turnTimeoutMs);
+            const retryAnswer = await retryWaiting;
+            if (retryAnswer.ok) {
+              const retryBody = retryAnswer.text || '(本轮没有文字输出)';
+              memory?.ledgerRecord('assistant', retryBody, chatKey);
+              const retryTail = status ? await status.finish(retryBody) : null;
+              if (!(status && msg.source === 'tg')) {
+                const outText = retryTail ? `${retryBody}\n\n${retryTail}` : retryBody;
+                await ep.send({ text: outText }).catch((err) => error(`发送失败（${chatKey}）: ${err?.message}`));
+              }
+              return { ok: true };
+            }
+            await status?.fail(retryAnswer.error);
+            await ep.send({ text: `❌ 换档后仍失败：${retryAnswer.error}` }).catch(() => {});
+            return { ok: false, error: retryAnswer.error };
+          }
+          error(`换档后重发失败（${chatKey}）: ${retry.error}`);
+        }
+      }
       await status?.fail(answer.error);
       error(`等回答失败（${chatKey}）: ${answer.error}`);
       await ep.send({ text: `❌ ${answer.error}` }).catch(() => {});

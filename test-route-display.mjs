@@ -100,10 +100,24 @@ await new Promise((r) => tg.listen(TG_PORT, '127.0.0.1', r));
 // ── 假宿主 agent / ctx ────────────────────────────────────────────────────
 const sessionListeners = [];
 let createdCount = 0;
+let billingFailNext = false;
 const agent = { id: 'botplugin:tg:4242' };
 agent.followup = () => {
   setTimeout(() => {
     for (const fn of sessionListeners) {
+      // 欠费闸门：打开时这一轮以「余额不足」失败，用来验自动换档。
+      if (billingFailNext) {
+        fn(
+          { id: agent.id },
+          {
+            type: 'turn/end',
+            data: {
+              reason: { kind: 'error', error: { errorCode: 402, message: 'Insufficient Balance' } },
+            },
+          },
+        );
+        return;
+      }
       fn({ id: agent.id }, { type: 'turn/end', data: { reason: 'completed' } });
     }
   }, 5);
@@ -285,6 +299,38 @@ const sessionLines = logs.filter((l) => l.includes('session created for'));
 ok(
   sessionLines.some((l) => l.includes('zhipu/glm-4.7-flash')),
   `⭐ 切换真的把会话建到了 glm-4.7-flash 上（实际日志：${JSON.stringify(sessionLines)}）`,
+);
+
+// ── 场景 6b【2026-09-30 报障】：欠费必须自动跳到下一个档 ──────────────────
+//    报障原文：「当模型欠费返回错误时，它不能自动跳到下一个模型」。
+//    根因：isRouteFailure() 写好了但**从没被调用** —— 失败分支只回一句
+//    「❌ 处理失败」就 return，判得出来却不切。
+//    ⚠️ 判据取「用户实际收到的消息」+「runtime 真的把会话建到新档上」，
+//       不是"代码里有没有那段逻辑"。
+const beforeFailover = sent.length;
+const beforeSessionCount = logs.filter((l) => l.includes('session created for')).length;
+billingFailNext = true;
+updateQueue.push(userMsg(102, '这笔多少钱？'));
+await wait(1200);
+billingFailNext = false;
+
+const failoverMsgs = sent.slice(beforeFailover).map((m) => m.text);
+ok(
+  failoverMsgs.some((t) => t.includes('自动切换到')),
+  `⭐⭐ 欠费时告诉用户已自动换档（实际：${JSON.stringify(failoverMsgs)}）`,
+);
+ok(
+  !failoverMsgs.some((t) => t.startsWith('❌ 处理失败') || t.startsWith('❌ Insufficient')),
+  `⭐⭐ 不再是干巴巴一句报错（实际：${JSON.stringify(failoverMsgs)}）`,
+);
+const afterSessionCount = logs.filter((l) => l.includes('session created for')).length;
+ok(
+  afterSessionCount > beforeSessionCount,
+  `⭐⭐ 换档真的重建了会话（重试前 ${beforeSessionCount} 次 → 重试后 ${afterSessionCount} 次）`,
+);
+ok(
+  logs.some((l) => l.includes('自动切到')),
+  `⭐ 日志里有换档记录（实际：${JSON.stringify(logs.filter((l) => l.includes('自动切到')))})`,
 );
 
 // ── 场景 7【核心·2026-09-30 报障】：记忆必须活过**重启** ──────────────────

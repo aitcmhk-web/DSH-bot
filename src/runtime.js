@@ -405,7 +405,16 @@ export class BotRuntime {
           const reason = event.data?.reason ?? null;
           if (reason?.kind === 'error') {
             const failure = reason.error ?? {};
-            finish({ ok: false, error: failure.message ?? failure.error?.message ?? '模型调用失败' });
+            // ⚠️ 只带 message 会把判定依据丢掉（2026-09-30 用户报障：「模型欠费返回
+            //    错误时不能自动跳到下一个模型」）：欠费/限流信息常在 errorCode/code/
+            //    status 这些字段里，光看 message 可能判不出该不该切档。
+            //    这里把**整个 failure 结构**带出去（error 仍是人看的字符串），
+            //    由调用方用 isRouteFailure(failure) 判。
+            finish({
+              ok: false,
+              error: failure.message ?? failure.error?.message ?? '模型调用失败',
+              failure,
+            });
             return;
           }
           finish({ ok: true, text: text.trim() });
