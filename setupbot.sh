@@ -1,6 +1,6 @@
 #!/bin/sh
-# setupbot — 一条命令干完：建/选工作区、装/升级插件、绑 TG、绑微信、生成工作区的启动/停止/重启/自启文件。
-#       （装/升级 Git 和 DSH 本体不在这儿 —— 那是 setupdsh 的活；没装 dsh 时它会自动替你跑一次 setupdsh）
+# setupbot — 一条命令干完：建/选工作区、首次装插件、绑 TG、绑微信、生成工作区的启动/停止/重启/自启文件。
+#       （装/升级 Git、DSH 本体、以及插件升级不在这儿 —— 那是 setupdsh 的活；没装 dsh 时它会自动替你跑一次 setupdsh）
 # setupbot-self-marker（别删这行：脚本靠它认出「我自己」，避免把别的文件当自己复制）
 #
 # 给用户的命令（第一次跑一次，之后只要敲 setupbot）：
@@ -11,7 +11,7 @@
 #   1) 机器上没有 dsh → 自动跑一次 setupdsh 把它装上（有 dsh 就不动它，升级请自己敲 setupdsh）
 #   2) 列出已有工作区让你选编号，或直接回车新建（问你名字，直接回车就叫 mybot）
 #      （想直接指定：zsh setupbot.sh 你的工作区名）
-#   3) 把插件装进这个工作区 / 升级到最新
+#   3) 把插件装进这个工作区（已经装过就顺手升到最新；平时的插件升级走 setupdsh）
 #   4) TG：列出这台机器上已用过的 token 让你选，或粘一个新的
 #   5) 微信：用已有的凭据、重新扫码、或先不绑
 #   6) 在工作区里生成 5 个文件（start / stop / restart / install-autostart / uninstall-autostart，
@@ -1193,10 +1193,10 @@ finish() {
     say "启动：敲 dsh --profile ${PROFILE}"
   fi
   if [ -n "${SELF_BIN_DIR:-}" ]; then
-    say "以后重绑 TG / 微信、装/升级插件：敲 setupbot"
-    say "以后装/升级 git 和 DSH 本体：敲 setupdsh"
+    say "以后重绑 TG / 微信：敲 setupbot"
+    say "以后升级（git / DSH 本体 / 插件）：敲 setupdsh"
   else
-    say "以后重绑 TG / 微信、装/升级插件：把开头那条命令再跑一遍"
+    say "以后重绑 TG / 微信：把开头那条命令再跑一遍"
   fi
   say "=================================="
 }

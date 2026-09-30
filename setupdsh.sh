@@ -1,5 +1,6 @@
 #!/bin/sh
-# setupdsh — 一条命令干完：装/升级 Git、Node、DSH 本体。（不碰任何工作区、不绑 TG/微信）
+# setupdsh — 一条命令干完：装/升级 Git、Node、DSH 本体，外加已装机器人的工作区里的插件。
+#           （不建工作区、不绑 TG/微信 —— 那是 setupbot 的活）
 # setupdsh-self-marker（别删这行：脚本靠它认出「我自己」，避免把别的文件当自己复制）
 #
 # 给用户的命令（第一次跑一次，之后只要敲 setupdsh）：
@@ -10,14 +11,16 @@
 #   1) Git：没有就装；装了 Homebrew 且是 brew 管的那份，顺手升到最新
 #   2) Node/npm：没有就装（有 brew 用 brew），装不上就告诉你怎么办
 #   3) DSH 本体：没有就装，有就升到最新
+#   4) 插件：凡是已装机器人的工作区，把插件一起升到最新，报「原版本 → 新版本」
 #
-# ⚠️ 这个脚本从今往后只管「机器上的家伙」（git/node/dsh）。
-#    建工作区、装插件、绑 TG / 微信 —— 全在 setupbot 里，别搬到这儿来。
+# ⚠️ 分工（2026-10-01 用户定的）：升级是天天干的事，绑 TG / 微信一辈子跑一次。
+#    → 升级（git / node / dsh / 插件）全归这儿：敲一次 setupdsh 就升完，不用再走绑定问答。
+#    → 建工作区、首次装插件、重绑 TG / 微信 —— 那些归 setupbot。
 #
 # 测试钩子（不写进用户文档）：
 #   SETUPDSH_URL=...             脚本自身的下载地址
 #   SETUPDSH_NO_SELF_INSTALL=1   不安装 setupdsh 命令
-#   SETUPDSH_SKIP_UPGRADE=1      只装不升（离线 / 测试用）
+#   SETUPDSH_SKIP_UPGRADE=1      只装不升（离线 / 测试用；插件也一起跳过）
 
 set -u
 
@@ -26,7 +29,7 @@ SRC_PATH="$0"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    2026-10-01 用户反馈「github 没有提示版本」——跑起来必须先报自己是谁，才看得出手上这份是新是旧。
-SELF_VERSION="2026-10-01.3"
+SELF_VERSION="2026-10-01.4"
 
 SETUPDSH_URL="${SETUPDSH_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh}"
 SELF_DIR="$HOME/.dsh/setupdsh"
@@ -196,6 +199,62 @@ ensure_dsh() {
   say "✅ dsh：$(dsh_version "$DSHBIN")  （${DSHBIN}）"
 }
 
+# ============ 4. 插件（已装机器人的工作区，一起升） ============
+# ⚠️ 分工（2026-10-01 用户指出）：升级是频繁动作，绑 TG / 微信用的少。
+#    所以插件升级放在这儿 —— 敲一次 setupdsh 就连插件一起升，不必再走绑定那套问答。
+#    建工作区 / 首次装插件 / 重绑，仍然在 setupbot 里。
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot}"
+# ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
+#    ⛔ 绝不拿日期或路径冒充版本号（2026-10-01 用户骂过）。
+plugin_version() {
+  [ -n "${1:-}" ] || return 0
+  [ -f "$1/package.json" ] || return 0
+  sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1/package.json" | head -1
+}
+upgrade_plugins() {
+  [ -n "${DSHBIN:-}" ] || return 0
+  if [ -n "${SKIP_UPGRADE:-}" ]; then
+    say ""
+    say "（跳过了插件升级：SETUPDSH_SKIP_UPGRADE=1）"
+    return 0
+  fi
+  # ⚠️ 不能用 `for X in $(find …)`：zsh（curl|zsh 那条路）不做单词切分，
+  #    多行结果会被当成一个路径，多个工作区时静默出错。改成 while read 逐行读，sh / zsh 都稳。
+  PLUGLIST="$(find "${DSH_HOME:-$HOME/.dsh}/profiles" -maxdepth 4 \( -type d -o -type l \) -name dsh-botplugin 2>/dev/null || true)"
+  if [ -z "$PLUGLIST" ]; then
+    say ""
+    say "这台机器还没装过机器人插件（第一次要在工作区里装，跑 setupbot），这一步跳过。"
+    return 0
+  fi
+  say ""
+  say "把已经装了机器人的工作区里的插件，一起升到最新…"
+  # ⚠️ 用临时文件 + `while read`，不用管道：管道会把循环扔进子 shell，
+  #    里面记的 PLUG_CHANGED 传不出来，收尾就会在「一个插件都没升」时也提示重启。
+  PLUG_CHANGED=0
+  PLUGLIST_FILE="${TMPDIR:-/tmp}/setupdsh-pluglist.$$"
+  if ! printf '%s\n' "$PLUGLIST" > "$PLUGLIST_FILE" 2>/dev/null; then
+    say "⚠️ 临时文件写不进去（${PLUGLIST_FILE}），插件升级这一步跳过。"
+    return 0
+  fi
+  while IFS= read -r PD; do
+    [ -n "$PD" ] || continue
+    PROF="$(basename "$(dirname "$(dirname "$PD")")")"
+    OLDV="$(plugin_version "$PD")"
+    if ( cd "$HOME" && "$DSHBIN" plugin --profile "$PROF" add "$SPEC" ); then
+      NEWV="$(plugin_version "$PD")"
+      if [ -n "$NEWV" ] && [ "$NEWV" != "$OLDV" ]; then
+        say "✅ 工作区 ${PROF} 的插件：${OLDV:-?} → ${NEWV}"
+        PLUG_CHANGED=1
+      else
+        say "✅ 工作区 ${PROF} 的插件：${NEWV:-${OLDV:-?}}（没有变化）"
+      fi
+    else
+      say "⚠️ 工作区 ${PROF} 的插件没升成（大概是没网），现在还是：${OLDV:-?}"
+    fi
+  done < "$PLUGLIST_FILE"
+  rm -f "$PLUGLIST_FILE" 2>/dev/null || true
+}
+
 # ============ 主流程 ============
 say ""
 say "=================================="
@@ -209,6 +268,7 @@ fi
 ensure_git
 ensure_node
 ensure_dsh
+upgrade_plugins
 
 say ""
 say "============ 机器环境安装完成 ============"
@@ -216,7 +276,10 @@ say "git ：$("$GITBIN" --version 2>/dev/null || echo '?')"
 say "node：$(node -v 2>/dev/null || echo '?')"
 say "dsh ：$(dsh_version "$DSHBIN")"
 say ""
-say "下一步：建工作区 + 绑 TG / 微信 —— 跑 setupbot"
+if [ "${PLUG_CHANGED:-0}" = "1" ]; then
+  say "插件升完了：要重启一次机器人才生效 —— 双击工作区里的 restart.command"
+fi
+say "建工作区 / 换 TG / 换微信 —— 跑 setupbot"
 if [ -n "${SELF_BIN_DIR:-}" ]; then
   say "（以后升级这些，直接敲：setupdsh）"
 else

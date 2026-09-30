@@ -12,8 +12,8 @@
 - 一个 Telegram bot token（在 Telegram 里找 @BotFather 发送 `/newbot` 新建，不要和其他 bot 共用）
 
 > 安装分成两件事，一个脚本管一头，互不越界：
-> `setupdsh` = 机器上的家伙（Git、Node、DSH 本体：装 + 升级）；
-> `setupbot` = 建/选工作区、装插件、绑 TG / 微信、生成工作区里那 5 个文件（英文名，双击或终端里跑都行）。
+> `setupdsh` = 升级（Git、Node、DSH 本体，外加已经装过机器人的工作区里的插件：装 + 升级）；
+> `setupbot` = 建/选工作区、首次装插件、绑 TG / 微信、生成工作区里那 5 个文件（英文名，双击或终端里跑都行）。
 > 机器上没有 `dsh` 时 `setupbot` 会自己把 `setupdsh` 跑一遍，所以顺序不用记。
 
 ## 安装方式一：在线安装（两条命令，推荐）
@@ -34,8 +34,8 @@
    工作区叫什么（直接回车就叫 `mybot`）、Telegram token（@BotFather 那串）、微信怎么绑（可选）。
    每样都是「输个编号」或「粘一下回车」，不用你编辑任何文件。
 
-2. 跑完它会把两个词装进 PATH —— **以后升级本体敲 `setupdsh`；
-   重新绑 TG、重新绑微信、升级插件敲 `setupbot`**：
+2. 跑完它会把两个词装进 PATH —— **以后升级（本体 + 插件）敲 `setupdsh`；
+   重新绑 TG、重新绑微信敲 `setupbot`**：
 
    ```
    setupdsh
@@ -79,7 +79,7 @@ dsh plugin --profile mybot add file:$HOME/DSH/BOT/botplugin
    窗口最后会停住等你按回车，结果不会一闪而过。
 4. 以后每次使用：跑 `~/DSH/<工作区名>/start.command`（`stop.command` / `restart.command` / `install-autostart.command` / `uninstall-autostart.command` 是同一个目录里的另外四个文件）。
    想重新绑 TG / 微信：把 `安装-mybot.command` 再双击一次（或在终端敲 `setupbot`）。
-   想升级本体（Git / Node / DSH）：在终端敲 `setupdsh`（安装包里也带了这个脚本）。
+   想升级（Git / Node / DSH 本体 / 已经装过机器人的工作区里的插件）：在终端敲 `setupdsh`（安装包里也带了这个脚本）。
 
 > 两种方式装出来的是同一个插件，跑的是同一个 `setupbot.sh`，选一种就行。
 > 安装包方式适合完全不想碰命令行的人；在线方式第一次要粘两条命令，之后也只剩 `setupdsh` / `setupbot` 两个词。

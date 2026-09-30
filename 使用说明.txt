@@ -15,8 +15,8 @@
   第二条（建工作区 + 绑 TG / 微信）：
     curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh | zsh
   跑完这两条，终端里就多了 setupdsh 和 setupbot 两个词：
-    setupdsh ＝ 升级本体（Git / Node / DSH）
-    setupbot ＝ 重新绑 TG / 微信、升级插件、重建那五个文件
+    setupdsh ＝ 升级（Git / Node / DSH 本体 + 已经装过机器人的工作区里的插件）
+    setupbot ＝ 建工作区、首次装插件、重新绑 TG / 微信、重建那五个文件
 
 ─────────────────────────────────
 【第 1 步 · 拿 token】
@@ -59,8 +59,10 @@
   还是老办法：再双击一次 安装-mybot.command（或敲 setupbot），
   TG 那一步直接粘新的 token；想沿用原来的，按回车再输编号就行。
 
-【升级本体（Git / Node / DSH）】
+【升级（Git / Node / DSH / 插件）】
   在终端敲 setupdsh；没装过这个命令，就把上面【在线装】第一条再跑一次。
+  已经装过机器人的工作区，插件会一起升到最新，并告诉你「原版本 → 新版本」。
+  升完跑一次 restart.command 才生效。
 
 【停止 / 再次使用】
   停止：跑一次 stop.command。
