@@ -141,7 +141,7 @@ const ROUTE = { provider: 'deepseek-official', model: 'deepseek-flash', key: 'k'
 }
 
 // ── ⑤ 真 store 存在性：官方两个入口都在（我们优先走 admitPromptContent）──
-//   ⚠️ 路径**不能写死某台机器的绝对路径**（原文是 /Users/tcm/...，发出去的包
+//   ⚠️ 路径**不能写死某台机器的绝对路径**（原文写的是开发机的家目录，发出去的包
 //      在别人机器上必然读不到 → 这三项断言全挂）。按 DSH 的实际布局逐级找，
 //      找不到就跳过本组（不是失败：本机没装 DSH 全家桶时这几项本就无法验证）。
 {
