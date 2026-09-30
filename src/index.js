@@ -70,7 +70,7 @@ export const Config = Schema.object({
 
   // ---- 模型路由 ----
   routes: Schema.array(Schema.any()).default([])
-    .description('模型路由表。留空 = 跟随 web 端模型页（settings.yaml）增减的模型与默认档'),
+    .description('模型路由表。留空 = 跟随 web 端模型页（web profile 的 cordis.patch.yml）增减的模型与默认档'),
   defaultRouteKey: Schema.string().description('默认走哪条路由（仅手写 routes 时有效）'),
 
   // ---- 工作区与记忆 ----
@@ -102,7 +102,7 @@ export const Config = Schema.object({
 
   // ---- 识图自动探测 ----
   visionAutoDetect: Schema.boolean().default(true)
-    .description('启动时后台自动探测各模型是否支持识图：通的继承识图，不通的自动标记纯文字（写 ~/.dsh/settings.yaml，自动备份；不阻塞启动）'),
+    .description('启动时后台自动探测各模型是否支持识图：通的继承识图，不通的自动标记纯文字（写 web 端模型配置，自动备份；不阻塞启动）'),
 });
 
 /** 日志小工具。 */
@@ -282,7 +282,7 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------------------
   // ⚠️ 路由有两档来源：
   //    ① 配置里写了 routes → 用配置（手工表，优先）。
-  //    ② routes 留空 → **跟随宿主模型表**（web 端 settings.yaml 增减模型即时生效）：
+  //    ② routes 留空 → **跟随宿主模型表**（web 端模型页增减模型即时生效）：
   //       默认档 = 宿主 agentDefaultModel.currentSelection()（web 改默认模型，新会话就跟着变）；
   //       /model 列表 = 宿主 llm 目录 ∩ llm-pi-ai providers 的 models。
   //       宿主 API 依据：settings.get(ns)（dsh-settings/lib/index.js:388）、
@@ -300,7 +300,7 @@ export function apply(ctx, config) {
   //    这里用一个显式记忆位承载「切过的档位」，刷新只在**没有记忆**时才回落到默认档。
   let hostPickedKey = null;
 
-  // ── 宿主模型表：跟随 web 端「设置 → 模型」（settings.yaml），加减模型即时生效 ──
+  // ── 宿主模型表：跟随 web 端「设置 → 模型」，加减模型即时生效 ──
   //    key 规则：单模型 provider 用别名，多模型 `<别名>:<模型id>`。
   const KEY_ALIAS = { alibailian: 'ali', 'deepseek-official': 'ds', qwen36vq: 'local', qwen36iq4xs: 'iq4' };
   const menuKey = (pid) => KEY_ALIAS[pid] ?? pid;
@@ -383,7 +383,7 @@ export function apply(ctx, config) {
           model: id,
           displayName: m?.name ?? id,
           // 同上：deepseek 目录里 reasoningEffort 没配就是 'none' = 不发，交给模型默认。
-          // 配了才发（bot 的 web 端 settings.yaml 里 llm-deepseek.reasoningEffort: off 是显式配置）。
+          // 配了才发（bot 的 web 端 llm-deepseek.reasoningEffort: off 是显式配置）。
           reasoningEffort: dsSection.reasoningEffort ?? 'none',
           isDefault: def?.provider === 'deepseek-official' && def?.model === id,
         });
@@ -1103,7 +1103,7 @@ export function apply(ctx, config) {
           ageMinutes !== null ? `已存在: ${ageMinutes} 分钟` : '已存在: (未知)',
           `工作目录: ${config.cwd || process.cwd()}`,
           `模型: ${current ? `${current.key} — ${current.provider} / ${current.model}` : '(未配置)'}${current ? effortText : ''}`,
-          '权限模式: 由 ~/.dsh/settings.yaml 的 permission.defaultPreset 决定（bot 不覆盖）',
+          '权限模式: 由 profile 的 cordis.patch.yml 里 permission.defaultPreset 决定（bot 不覆盖）',
           `DSH 进程: ${runtime.ready ? '运行中 ✅' : '未运行 ⚠️'}`,
         ];
         await reply(lines.join('\n'));

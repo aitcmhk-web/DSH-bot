@@ -54,11 +54,13 @@
 dsh plugin --profile mybot add file:/绝对路径/dsh-botplugin
 ```
 
-例如源码在 `/Users/tcm/DSH/BOT/botplugin`：
+例如源码在 `~/DSH/BOT/botplugin`：
 
 ```
-dsh plugin --profile mybot add file:/Users/tcm/DSH/BOT/botplugin
+dsh plugin --profile mybot add file:$HOME/DSH/BOT/botplugin
 ```
+
+> ⚠️ `file:` 后面**不能写 `~`** —— 它不会展开波浪号，会当成字面路径找不到。用 `$HOME/` 或完整绝对路径。
 
 > 用 `file:` 装出来的是**软链** —— 改完源码不用重装，重启 profile 就生效。
 > 调试的时候用这个；平时用上面的 git 方式。**两种选一种，别都装**

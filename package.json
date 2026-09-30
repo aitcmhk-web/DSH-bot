@@ -1,6 +1,6 @@
 {
   "name": "dsh-botplugin",
-  "version": "0.0.16",
+  "version": "0.0.17",
   "description": "Telegram and WeChat bridges plus handoff continuity for DeepSeek Harness (DSH)",
   "type": "module",
   "main": "src/index.js",
@@ -13,6 +13,8 @@
     "src",
     "vendor",
     "cordis.patch.yml",
+    "安装-mybot.command",
+    "dsh-mybot-安装包.zip",
     "weixin-login.mjs",
     "qr-terminal.mjs",
     "restart-helper.sh",
@@ -24,9 +26,6 @@
   ],
   "engines": {
     "node": ">=18"
-  },
-  "dependencies": {
-    "yaml": "^2.9.1"
   },
   "dsh": {
     "bundle": {

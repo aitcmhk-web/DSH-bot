@@ -22,7 +22,6 @@
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createRequire } from 'node:module';
 
 const HOME = homedir();
 /**
@@ -51,23 +50,111 @@ const QUIET = process.argv.includes('--quiet');
 
 const say = (msg) => { if (!QUIET) console.log(msg); };
 
-/** YAML 解析器，main() 里赋值；两处解析都失败时保持 null（调用方明确跳过，绝不崩）。 */
-let YAML = null;
-
 /**
- * 拿 YAML 解析器，两步：
- *   ① 正路 —— 作为包依赖解析（插件正确装好依赖时，或脚本目录向上能走到 node_modules/yaml）；
- *   ② 兼容本机 DSH 安装 —— ~/.dsh/profiles/node_modules 里常备 yaml（DSH 全家桶）。
- * 都拿不到返回 null —— 只跳过，绝不崩（2026-09-29：老写法硬编码 ②，别的机器上启动即崩）。
+ * 极简 YAML 解析器 —— **自带，不依赖任何包**。
+ *
+ * ⭐ 为什么要自己写（2026-09-30）：原来这里走 `await import('yaml')`，失败再翻
+ *    `~/.dsh/profiles/node_modules`。两处都不成立时**静默跳过探测** ——
+ *    而插件的 `dependencies` 里那个 `yaml` 在别的机器上根本装不出来
+ *    （profile 的 node_modules 常是空的），等于发布出去就不工作。
+ *    解析器照抄 `sync-from-web.mjs`（同机同结构，已被长期实测），行为一致。
+ *
+ * 支持本文件用到的子集：顶层 map 或 array、嵌套 map、`- ` 列表、
+ * 引号标量、true/false/null/数字。**不支持**锚点、多行标量、流式 `{}`/`[]` —— 
+ * 而 web 端模型配置里不会出现这些。
  */
-async function loadYaml() {
-  try {
-    return await import('yaml');
-  } catch {}
-  try {
-    return createRequire(join(HOME, '.dsh/profiles/node_modules/'))('yaml');
-  } catch {}
-  return null;
+function parseYaml(text) {
+  const lines = text.split(/\r?\n/);
+  // ⚠️ 顶层可能是 map（老版 settings.yaml）也可能是 **array**（cordis.patch.yml）。
+  //    先探测：第一行有效行以 `- ` 开头 → 数组。不定这层，patch 文件会被解析成
+  //    一个只含最后一个条目字段的 map，`['llm-pi-ai']` 取不到 → provider 全丢。
+  const firstLine = lines.find((l) => l.trim() && !l.trim().startsWith('#'));
+  const isArrayDoc = /^\s*-\s+/.test(firstLine ?? '');
+  const root = isArrayDoc ? [] : {};
+  const stack = [{ indent: -1, node: root }];
+
+  const stripComment = (s) => {
+    let out = '';
+    let q = null;
+    for (const ch of s) {
+      if (q) {
+        out += ch;
+        if (ch === q) q = null;
+      } else if (ch === '"' || ch === "'") {
+        q = ch;
+        out += ch;
+      } else if (ch === '#') break;
+      else out += ch;
+    }
+    return out.trimEnd();
+  };
+
+  const parseScalar = (raw) => {
+    const v = raw.trim();
+    if (v === '') return '';
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+      return v.slice(1, -1);
+    }
+    if (v === 'true') return true;
+    if (v === 'false') return false;
+    if (v === 'null' || v === '~') return null;
+    if (/^-?\d+$/.test(v)) return Number(v);
+    if (/^-?\d*\.\d+$/.test(v)) return Number(v);
+    return v;
+  };
+
+  for (const raw of lines) {
+    if (!raw.trim()) continue;
+    const noComment = stripComment(raw);
+    if (!noComment.trim()) continue;
+    const indent = noComment.match(/^\s*/)[0].length;
+    const body = noComment.trim();
+
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
+    const parent = stack[stack.length - 1].node;
+
+    if (body.startsWith('- ')) {
+      const item = body.slice(2).trim();
+      // ⚠️ 数组的父容器：上面遇到 `models:`（空值）时建的是 map，
+      //    这里必须就地换成 array，否则 push 全丢（实测踩过：解析结果为空）。
+      // ⚠️⚠️ 换完必须**重新取 parent** —— parent 是在换之前取的，仍指向被丢弃的旧 map。
+      if (stack.length > 1) {
+        const top = stack[stack.length - 1];
+        if (top.node && !Array.isArray(top.node) && top.parent && top.key !== undefined) {
+          const arr = [];
+          top.parent[top.key] = arr;
+          top.node = arr;
+        }
+      }
+      const listParent = stack[stack.length - 1].node;
+      if (!Array.isArray(listParent)) continue;
+      const m = item.match(/^(["']?[\w.$-]+["']?):\s*(.*)$/);
+      if (m) {
+        const obj = {};
+        const k = m[1].replace(/^["']|["']$/g, '');
+        if (m[2] !== '') obj[k] = parseScalar(m[2]);
+        listParent.push(obj);
+        stack.push({ indent, node: obj });
+      } else {
+        listParent.push(parseScalar(item));
+      }
+      continue;
+    }
+
+    const m = body.match(/^(["']?[\w.$-]+["']?):\s*(.*)$/);
+    if (!m) continue;
+    const key = m[1].replace(/^["']|["']$/g, '');
+    const rest = m[2];
+    if (rest === '') {
+      const container = {};
+      parent[key] = container;
+      stack.push({ indent, node: container, key, parent });
+    } else {
+      parent[key] = parseScalar(rest);
+    }
+  }
+
+  return root;
 }
 
 /** 1x1 红色 PNG。 */
@@ -76,7 +163,7 @@ const TIMEOUT_MS = 15000;
 
 function loadKeys() {
   try {
-    const doc = YAML.parse(readFileSync(`${HOME}/.dsh/.credentials.yaml`, 'utf8'));
+    const doc = parseYaml(readFileSync(`${HOME}/.dsh/.credentials.yaml`, 'utf8'));
     return doc?.refs ?? {};
   } catch {
     return {};
@@ -150,12 +237,6 @@ function removeMark(lines, r) {
 }
 
 async function main() {
-  YAML = await loadYaml();
-  if (!YAML) {
-    // ⚠️ 用 console.log 而非 say()：跳过原因即使在 --quiet 下也要留痕。
-    console.log('⏭ 没有 YAML 解析器（插件依赖未安装，本机也没有 DSH 自带的）—— 跳过识图探测。');
-    return;
-  }
   let src;
   try {
     src = readFileSync(target, 'utf8');
@@ -163,7 +244,7 @@ async function main() {
     console.log(`⏭ 未找到 ${target}（web 端未配模型）—— 跳过识图探测。`);
     return;
   }
-  const doc = YAML.parse(src);
+  const doc = parseYaml(src);
   // ── 取 providers：两种顶层结构都要认 ──────────────────────────────
   //   settings.yaml   → 顶层 map，`llm-pi-ai` 是顶层键；
   //   cordis.patch.yml→ 顶层 **数组**，llm-pi-ai 是其中一条 `- id: llm-pi-ai`
@@ -232,7 +313,7 @@ async function main() {
     } else if (v === 'no') {
       if (hasMark) {
         // ⛔ 2026-09-29 远端实爆修复：--force 复测「仍不支持」时条目里已有 input:，
-        //    老代码不查重再插一次 = 重复键 = 整份 settings.yaml 变非法 YAML。
+        //    老代码不查重再插一次 = 重复键 = 整份模型配置变非法 YAML。
         say(`⏭ ${j.name}/${j.id}: 仍不支持，维持原标记（不重复插入）`);
         continue;
       }
@@ -253,9 +334,9 @@ async function main() {
   if (CHECK) { say('（--check 未写文件）'); return; }
   if (!changed) { say('无改动。'); return; }
   // ⛔ 最后一道闸：写回前必须能整体重新解析成合法 YAML，解析不过一字不写。
-  //   （settings.yaml 坏一份 = providers/permission 全丢，2026-09-29 远端实爆过一回。）
+  //   （web 端模型配置坏一份 = providers/permission 全丢，2026-09-29 远端实爆过一回。）
   try {
-    YAML.parse(work.join('\n'));
+    parseYaml(work.join('\n'));
   } catch (err) {
     console.error(`⛔ 生成的 YAML 解析失败（${err.message}）—— 已放弃写回，原文件未动。`);
     process.exit(1);

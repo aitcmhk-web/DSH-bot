@@ -141,14 +141,30 @@ const ROUTE = { provider: 'deepseek-official', model: 'deepseek-flash', key: 'k'
 }
 
 // ── ⑤ 真 store 存在性：官方两个入口都在（我们优先走 admitPromptContent）──
+//   ⚠️ 路径**不能写死某台机器的绝对路径**（原文是 /Users/tcm/...，发出去的包
+//      在别人机器上必然读不到 → 这三项断言全挂）。按 DSH 的实际布局逐级找，
+//      找不到就跳过本组（不是失败：本机没装 DSH 全家桶时这几项本就无法验证）。
 {
   const { readFile } = await import('node:fs/promises');
-  const p =
-    '/Users/tcm/.dsh/profiles/node_modules/@deepseek-ai/dsh-attachment/lib/index.js';
-  const src = await readFile(p, 'utf8').catch(() => '');
-  ok(src.length > 0, '官方 dsh-attachment 包在本机可读');
-  ok(src.includes('async admitPromptContent'), '官方 store 确实提供 admitPromptContent（我们优先走的那条）');
-  ok(src.includes('async function admitEncodedImages'), '官方另有 admitEncodedImages（我们兜底用的那条）');
+  const { existsSync } = await import('node:fs');
+  const { homedir } = await import('node:os');
+  const { join } = await import('node:path');
+  const rel = 'node_modules/@deepseek-ai/dsh-attachment/lib/index.js';
+  const candidates = [
+    join(homedir(), '.dsh', 'profiles', rel),          // 本机常见：共享依赖
+    join(homedir(), '.dsh', 'profiles', 'web', rel),
+    join(homedir(), '.dsh', 'profiles', 'bot', rel),
+    join(process.cwd(), 'node_modules/@deepseek-ai/dsh-attachment/lib/index.js'),
+  ];
+  const found = candidates.find((p) => existsSync(p));
+  if (!found) {
+    console.log('⏭ 跳过：本机找不到 dsh-attachment 包（这几项无法验证，不算失败）');
+  } else {
+    const src = await readFile(found, 'utf8').catch(() => '');
+    ok(src.length > 0, '官方 dsh-attachment 包在本机可读');
+    ok(src.includes('async admitPromptContent'), '官方 store 确实提供 admitPromptContent（我们优先走的那条）');
+    ok(src.includes('async function admitEncodedImages'), '官方另有 admitEncodedImages（我们兜底用的那条）');
+  }
 }
 
 console.log(failed === 0 ? '\n全部通过' : `\n${failed} 项失败`);
