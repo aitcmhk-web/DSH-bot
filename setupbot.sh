@@ -431,14 +431,19 @@ write_bot_config() {
       printf '    telegramAllowedUsers: []\n'
       [ -n "$WXFILE" ] && printf '    weixinAccountFile: "%s"\n' "$WXFILE"
       [ -n "$BOTCWD" ] && printf '    cwd: "%s"\n' "$BOTCWD"
+      # ⚠️ 收尾这句不能删：上面几条 `&&` 遇到空值会返回 1，整组就被误判成「写失败」，
+      #    刚写好、内容完全正确的临时文件会被下面那句删掉（2026-09-30 在已有工作区上撞过）。
+      :
     } > "$tmp" || { rm -f "$tmp"; return 1; }
     mv "$tmp" "$cfg" || return 1
     return 0
   fi
-  [ -n "$TOKEN" ]  && set_cfg_key telegramToken     "$TOKEN"  "$cfg"
-  [ -n "$WXFILE" ] && set_cfg_key weixinAccountFile "$WXFILE" "$cfg"
-  [ -n "$BOTCWD" ] && set_cfg_key cwd               "$BOTCWD" "$cfg"
-  return 0
+  # 逐键改也必须认失败：原来用 `&&` 串联，改失败了也当没事（配置静默没落地）
+  rc=0
+  if [ -n "$TOKEN" ];  then set_cfg_key telegramToken     "$TOKEN"  "$cfg" || rc=1; fi
+  if [ -n "$WXFILE" ]; then set_cfg_key weixinAccountFile "$WXFILE" "$cfg" || rc=1; fi
+  if [ -n "$BOTCWD" ]; then set_cfg_key cwd               "$BOTCWD" "$cfg" || rc=1; fi
+  return "$rc"
 }
 
 # ============ 6. 复核 + 启动器 ============
@@ -499,6 +504,6 @@ pick_workspace
 install_plugin
 pick_token
 pick_wechat
-write_bot_config || die "配置文件没写成功。"
+write_bot_config || die "配置文件没写成功（${PROFILES}/${PROFILE}/cordis.patch.yml）。把 setupbot 再跑一遍；还不行就把上面几行发我。"
 finish
 exit 0
