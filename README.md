@@ -8,7 +8,13 @@
 ## 环境要求
 
 - Node ≥ 18
-- 机器上装好 DSH（有 `dsh` 命令）
+- 机器上装好 DSH（有 `dsh` 命令）。**没有就先装：**
+  ```
+  npm i -g @deepseek-ai/dsh
+  ```
+  > 不想装全局也行 —— 下面所有 `dsh ...` 命令都换成 `npx -y @deepseek-ai/dsh ...`，
+  > 效果一样，只是每次会先检查一下版本。
+  > 判断装没装：跑 `dsh --version`，报 `command not found` 就是没装。
 - 一个 Telegram bot token（在 Telegram 里找 @BotFather 发送 `/newbot` 新建，不要和其他 bot 共用）
 
 ## 安装方式一：在线安装（从 git 装，会敲命令的，推荐）
@@ -18,7 +24,7 @@
 > `dsh plugin` 会自动切到 profile 目录再装，所以**在哪个目录打开终端都行**；
 > 裸 `pnpm add` 会装到你当前所在目录，DSH 看不见，插件静默失效。
 
-1. 装进目标 profile（下面以 `mybot` 为例，没有就先建一个）：
+1. 装进目标 profile（下面以 `mybot` 为例；**profile 不存在也不用先建，`dsh plugin` 会自动建**）：
 
    ```
    dsh plugin --profile mybot add github:aitcmhk-web/DSH-bot

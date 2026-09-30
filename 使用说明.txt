@@ -4,7 +4,10 @@
 
 提示：如果你会用终端，也可以不走安装包，直接一条命令在线安装：
   dsh plugin --profile mybot add github:aitcmhk-web/DSH-bot
+⚠️ 前提是这台机器已经有 dsh 命令。没装就先跑一次：npm i -g @deepseek-ai/dsh
+   （不想装全局，就把上面命令开头的 dsh 换成 npx -y @deepseek-ai/dsh，效果一样）
 两种方式装出来的东西一样，选一种就行。下面的步骤是给「下载了安装包的人」的。
+（走安装包的话不用管 dsh 装没装 —— 安装器会自己去找。）
 
 【第 1 步 · 拿 token】
   打开 Telegram，搜索 @BotFather，发送 /newbot，
