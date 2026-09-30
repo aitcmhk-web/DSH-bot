@@ -60,11 +60,24 @@ cd "$TARGET"
 cp "$PKGDIR/使用说明.txt" "$TARGET/使用说明.txt" 2>/dev/null || true
 open -e "$TARGET/使用说明.txt"
 
+CFG="$TARGET/profiles/mybot/cordis.patch.yml"
 echo ""
-echo "✅ 安装完成。"
-echo "下一步：① 在 ~/DSH/mybot/profiles/mybot/cordis.patch.yml 里填入你的 token"
-echo "        ② 双击 ~/DSH/mybot/启动-mybot.command"
-echo "现在帮你打开配置文件吗？(y=打开，其他=退出)"
-read -r ans
-[ "$ans" = "y" ] && open -e "$TARGET/profiles/mybot/cordis.patch.yml"
+if grep -q "把这一整串换成你的token" "$CFG" 2>/dev/null; then
+  echo "把你的 Telegram token 贴进来，然后按回车（在 @BotFather 那里复制的那串）："
+  read -r TGTOKEN || true
+  case "$TGTOKEN" in
+    [0-9]*:[A-Za-z0-9_-]*)
+      sed -i '' "s|把这一整串换成你的token|$TGTOKEN|" "$CFG"
+      echo "✅ token 已写进配置。"
+      ;;
+    *)
+      echo "⚠️ 没填（或者看着不像 token，一般长这样 123456:AA...）。"
+      echo "   之后自己打开这个文件填：open -e ~/DSH/mybot/profiles/mybot/cordis.patch.yml"
+      ;;
+  esac
+else
+  echo "✅ 配置里已经有 token 了，这次没动它。"
+fi
+echo ""
+echo "✅ 安装完成。下一步：双击 ~/DSH/mybot/启动-mybot.command"
 exit 0

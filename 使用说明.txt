@@ -13,9 +13,9 @@
   按提示起两个名字，它会给你一串 "数字:字母" —— 复制它。
 
 【第 2 步 · 填 token】
-  打开：~/DSH/mybot/profiles/mybot/cordis.patch.yml
-  把 telegramToken 引号里的 "把这一整串换成你的token" 换成刚复制的串，保存。
-  （安装器结束时问你的那句，答 y 也会帮你打开这个文件。）
+  安装器结束时会让你把 token 贴进终端：粘贴 + 回车，它自己写进配置，不用你编辑文件。
+  当时没填也没事，启动前在终端敲这一行补上：
+    open -e ~/DSH/mybot/profiles/mybot/cordis.patch.yml
 
 【第 3 步 · 启动】
   双击：~/DSH/mybot/启动-mybot.command

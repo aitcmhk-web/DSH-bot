@@ -25,13 +25,18 @@
    > ⚠️ `mybot` 是示例名，换成你自己的 profile 名（`ls ~/.dsh/profiles/` 看有哪些）。
    > 名字写错不报错：DSH 会新建一个空 profile，插件装进去，你原来的会话没变化。
 
-2. 编辑该 profile 的 `cordis.patch.yml`，加上配置（**token 必填**）：
+2. 填 token（把下面引号里那串先换成 @BotFather 发你的，再整段贴进终端）：
 
-   ```yaml
+   ```
+   cat > ~/.dsh/profiles/mybot/cordis.patch.yml <<'EOF'
    - id: botplugin
      config:
        telegramToken: "123456:ABC你的token"
+   EOF
    ```
+
+   > ⚠️ 这条命令会覆盖那个文件 —— 用新 profile 名（如 `mybot`）没事，里面本来只有一个 `[]`；
+   > 用已经配过东西的 profile，就手动把那三行加进去。
 
 3. 启动：
 
@@ -68,7 +73,7 @@ dsh plugin --profile mybot add file:$HOME/DSH/BOT/botplugin
 
 1. 下载安装包：[dsh-mybot-安装包.zip](dsh-mybot-安装包.zip)（在本页文件列表里，点它再点 Download / Download raw）。
 2. 解压，双击里面的 `安装-mybot.command` —— 它会自动装到 `~/DSH/mybot` 并弹出图文说明。
-3. 按弹出的说明填 token（打开 `~/DSH/mybot/profiles/mybot/cordis.patch.yml`，把 telegramToken 换成你的）。
+3. 结束时它会把 token 要过去 —— 粘贴 + 回车，它自己写进配置（没填也能装完，之后按弹出的说明补）。
 4. 以后每次使用：双击 `~/DSH/mybot/启动-mybot.command`。想加微信：双击 `登录微信.command` 扫码。
 
 > 三种方式装出来的是同一个插件，选一种就行。安装包方式自带图文说明和启动器，适合第一次接触命令行的人；git 方式升级最省事（重跑一条命令）；本地方式改了源码立刻生效，适合调试。
