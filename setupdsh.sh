@@ -24,6 +24,10 @@ set -u
 # ⚠️ zsh 在函数体里会把 $0 换成函数名，必须在这一层先记住脚本自己的路径
 SRC_PATH="$0"
 
+# ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
+#    2026-10-01 用户反馈「github 没有提示版本」——跑起来必须先报自己是谁，才看得出手上这份是新是旧。
+SELF_VERSION="2026-10-01.2"
+
 SETUPDSH_URL="${SETUPDSH_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh}"
 SELF_DIR="$HOME/.dsh/setupdsh"
 SELF_PATH="$SELF_DIR/setupdsh.sh"
@@ -35,12 +39,20 @@ die() { printf '\n⛔ %s\n' "$*" >&2; exit 1; }
 # ============ 0. 把自己装成 setupdsh 命令 ============
 install_self() {
   mkdir -p "$SELF_DIR" 2>/dev/null || return 0
-  # 有实体脚本文件（在线下载的 / 安装包里的）就复制自己；curl|zsh 没有实体才去下载
+  # 有实体脚本文件（安装包里的）就复制自己；curl|zsh 手上没有实体文件，从网上留一份备用。
+  # ⚠️ curl|zsh 这条**每次都要刷本地副本**：否则启动器一旦联不上网就退回旧脚本，
+  #    用户看到的还是老行为（2026-10-01 实测：GitHub 上已是新版，本机跑出来还是旧的）。
   if [ -f "$SRC_PATH" ] && grep -q 'setupdsh-self-marker' "$SRC_PATH" 2>/dev/null; then
     cp "$SRC_PATH" "$SELF_PATH" 2>/dev/null || true
+  else
+    if curl -fsSL --max-time 25 "$SETUPDSH_URL" -o "$SELF_PATH.new" 2>/dev/null && [ -s "$SELF_PATH.new" ]; then
+      mv "$SELF_PATH.new" "$SELF_PATH" 2>/dev/null || rm -f "$SELF_PATH.new" 2>/dev/null
+    else
+      rm -f "$SELF_PATH.new" 2>/dev/null
+    fi
   fi
   if [ ! -s "$SELF_PATH" ]; then
-    curl -fsSL "$SETUPDSH_URL" -o "$SELF_PATH.new" 2>/dev/null \
+    curl -fsSL --max-time 25 "$SETUPDSH_URL" -o "$SELF_PATH.new" 2>/dev/null \
       && mv "$SELF_PATH.new" "$SELF_PATH" || rm -f "$SELF_PATH.new" 2>/dev/null
   fi
   [ -s "$SELF_PATH" ] || return 0
@@ -71,6 +83,7 @@ install_self() {
     printf '%s\n' '  mv "$SELF.new" "$SELF"'
     printf '%s\n' 'else'
     printf '%s\n' '  rm -f "$SELF.new" 2>/dev/null'
+    printf '%s\n' '  echo "（这次没联上更新服务器，用本机存的那份 setupdsh 跑）"'
     printf '%s\n' 'fi'
     printf '%s\n' '[ -s "$SELF" ] || { echo "⛔ setupdsh 本体不在（可能没网）。请重跑一次安装命令。"; exit 1; }'
     printf '%s\n' 'exec /bin/zsh "$SELF" "$@"'
@@ -188,6 +201,7 @@ say ""
 say "=================================="
 say "  DSH 本体 · 安装 / 升级"
 say "=================================="
+say "setupdsh 版本：${SELF_VERSION}"
 
 if [ "${SETUPDSH_NO_SELF_INSTALL:-}" != "1" ]; then
   install_self
@@ -197,7 +211,7 @@ ensure_node
 ensure_dsh
 
 say ""
-say "============ 全部搞定 ============"
+say "============ 机器这边搞定 ============"
 say "git ：$("$GITBIN" --version 2>/dev/null || echo '?')"
 say "node：$(node -v 2>/dev/null || echo '?')"
 say "dsh ：$(dsh_version "$DSHBIN")"
