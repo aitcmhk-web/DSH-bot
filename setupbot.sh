@@ -819,6 +819,43 @@ write_bot_config() {
   return "$rc"
 }
 
+# ============ 5.85 把 web 端的模型表复制进这个工作区 ============
+# 为什么必须复制：`llm-pi-ai` 的 patch config 是**整体替换**、而且**按 profile 隔离** ——
+# 插件「跟随 web 端模型页」只解决了**菜单**，真能不能答话取决于**本 profile**里有没有
+# 注册这些 provider。不复制就是这个现象：菜单点得到、一问就
+# `no adapter registered for provider "qwen36vq"`（2026-10-01 用户实测，见 dshbot 工作区日志）。
+# 注：BOT/sync-from-web.mjs 在我这台机器上干的就是这件事，但它**不在安装包里** —— 别人机器上没有。
+# ⚠️ 只加不减：本 profile 已经写过 `llm-pi-ai` 就一个字都不动（用户可能自己改过它）。
+# ⚠️ 原子替换（临时文件 + mv）—— bot 跑着的时候 HMR 会热重载这份文件，原地写会让插件树崩掉。
+ensure_provider_block() {
+  cfg="$PROFILES/$PROFILE/cordis.patch.yml"
+  web="$PROFILES/web/cordis.patch.yml"
+  if [ -f "$cfg" ]; then
+    if grep -qE '^[[:space:]]*-[[:space:]]*id:[[:space:]]*llm-pi-ai[[:space:]]*$' "$cfg" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  [ -f "$web" ] || return 0
+  block="$(awk '/^[[:space:]]*-[[:space:]]*id:[[:space:]]*llm-pi-ai[[:space:]]*$/{f=1} f&&/^-[[:space:]]/{if (index($0,"id: llm-pi-ai")==0) exit} f{print}' "$web")"
+  if [ -z "$block" ]; then
+    return 0
+  fi
+  tmp="$cfg.$$.tmp"
+  {
+    if [ -s "$cfg" ]; then
+      body="$(grep -vE '^[[:space:]]*(#|$)' "$cfg" | tr -d '[:space:]')"
+    else
+      body=""
+    fi
+    if [ -n "$body" ] && [ "$body" != "[]" ]; then cat "$cfg"; fi
+    printf '%s\n' "$block"
+    :
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$cfg" || { rm -f "$tmp"; return 1; }
+  say "✅ 模型表已同步：web 端「设置 → 模型」里的档位已复制进工作区 ${PROFILE}（不复制＝收得到消息、答不上话）。"
+  return 0
+}
+
 # ============ 5.9 工作区里的 5 个文件 ============
 # 生成：start / stop / restart / install-autostart / uninstall-autostart 五个 .command，
 # 外加一个隐藏的共用助手 .botctl.sh。
@@ -1126,5 +1163,6 @@ pick_token
 pick_wechat
 ensure_model
 write_bot_config || die "配置文件没写成功（${PROFILES}/${PROFILE}/cordis.patch.yml）。把 setupbot 再跑一遍；还不行就把上面几行发我。"
+ensure_provider_block || say "⚠️ web 端的模型表没能复制进工作区 ${PROFILE} —— 先去 web 端「设置 → 模型」配好模型，再把 setupbot 跑一遍。"
 finish
 exit 0
