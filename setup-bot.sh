@@ -3,8 +3,14 @@
 #   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setup-bot.sh | zsh
 #
 # 它自己什么都不干了，只把活交给新的 setupbot.sh（同一个仓库根目录，主入口）。
-# 完整流程（装 dsh、选工作区、装插件、绑 TG、绑微信）都在 setupbot.sh 里，
-# 以后甚至只要敲 setupbot 一个词（第一次跑完它就装进 PATH 了）。
+#
+# ⚠️ 现在这事分成两个（各管一头，互不越界）：
+#   setupdsh —— 机器上的家伙：Git、Node、DSH 本体（装 + 升级）
+#               在线入口：curl -fsSL .../setupdsh.sh | zsh
+#   setupbot —— 建/选工作区、装插件、绑 TG / 微信、生成工作区里那 5 个双击文件
+#               在线入口：curl -fsSL .../setupbot.sh | zsh（就是这个文件转发的那个）
+# 机器上还没有 dsh 的时候，setupbot 会自己把 setupdsh 跑一遍，顺序不用你操心；
+# 以后升级本体敲 setupdsh，重新绑 TG / 微信敲 setupbot。
 
 set -u
 

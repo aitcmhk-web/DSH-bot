@@ -1,5 +1,6 @@
 #!/bin/sh
-# setupbot — 一条命令干完：装/升级 DSH、装/升级插件、挑工作区、绑 TG、绑微信。
+# setupbot — 一条命令干完：建/选工作区、装/升级插件、绑 TG、绑微信、生成工作区的启动/停止/重启/自启文件。
+#       （装/升级 Git 和 DSH 本体不在这儿 —— 那是 setupdsh 的活；没装 dsh 时它会自动替你跑一次 setupdsh）
 # setupbot-self-marker（别删这行：脚本靠它认出「我自己」，避免把别的文件当自己复制）
 #
 # 给用户的命令（第一次跑一次，之后只要敲 setupbot）：
@@ -7,13 +8,13 @@
 #
 # 它自己会办完：
 #   0) 把 setupbot 命令装进 PATH（以后直接敲 setupbot，可重复跑）
-#   1) dsh 没有就装，有就升到最新
+#   1) 机器上没有 dsh → 自动跑一次 setupdsh 把它装上（有 dsh 就不动它，升级请自己敲 setupdsh）
 #   2) 列出已有工作区让你选编号，或直接回车新建（问你名字，直接回车就叫 mybot）
 #      （想直接指定：zsh setupbot.sh 你的工作区名）
 #   3) 把插件装进这个工作区 / 升级到最新
 #   4) TG：列出这台机器上已用过的 token 让你选，或粘一个新的
 #   5) 微信：用已有的凭据、重新扫码、或先不绑
-#   6) 生成双击启动器 + 复核配置
+#   6) 在工作区里生成 5 个双击文件（启动/停止/重启/安装自启/卸载自启）+ 复核配置
 #
 # 测试钩子（不写进用户文档）：
 #   BOT_TOKEN=...                预置 token，跳过询问
@@ -21,7 +22,7 @@
 #   SETUPBOT_IN=文件             从文件逐行读答案（非交互测试）
 #   SETUPBOT_URL=...             脚本自身的下载地址
 #   SETUPBOT_NO_SELF_INSTALL=1   不安装 setupbot 命令
-#   SETUPBOT_SKIP_DSH_UPGRADE=1  不升级 dsh
+#   SETUPBOT_SKIP_DSH_UPGRADE=1  兼容老用法：有 dsh 时本来就不会升级，留着不报错
 
 set -u
 
@@ -179,24 +180,45 @@ install_self() {
   esac
 }
 
-# ============ 1. dsh 本体 ============
+# ============ 1. dsh 本体（归 setupdsh；这里只保证「它在」） ============
+# ⚠️ 装/升级 git、node、dsh 的逻辑全在 setupdsh.sh 里，别搬回来 —— 那是它唯一的家。
 DSHBIN=""
+SETUPDSH_URL_DEFAULT="https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh"
+SETUPDSH_PATH="$HOME/.dsh/setupdsh/setupdsh.sh"
+
+run_setupdsh() {
+  # 优先用「自己身边那份」（安装包里 / 已装好的实体脚本），实在没有才去下载
+  HEAR_DSH="$(dirname "$SRC_PATH")/setupdsh.sh"
+  if [ -f "$HEAR_DSH" ] && grep -q 'setupdsh-self-marker' "$HEAR_DSH" 2>/dev/null; then
+    say "（用本机这份 setupdsh.sh）"
+    /bin/zsh "$HEAR_DSH"
+    return $?
+  fi
+  if [ -s "$SETUPDSH_PATH" ]; then
+    say "（用已装好的 setupdsh）"
+    /bin/zsh "$SETUPDSH_PATH"
+    return $?
+  fi
+  TMPD="$(mktemp -t setupdsh.XXXXXX 2>/dev/null || echo "/tmp/setupdsh.$$.sh")"
+  if curl -fsSL --max-time 60 "${SETUPDSH_URL:-$SETUPDSH_URL_DEFAULT}" -o "$TMPD" 2>/dev/null && [ -s "$TMPD" ]; then
+    /bin/zsh "$TMPD"
+    RC=$?
+    rm -f "$TMPD" 2>/dev/null
+    return $RC
+  fi
+  rm -f "$TMPD" 2>/dev/null
+  return 1
+}
+
 ensure_dsh() {
   DSHBIN="$(command -v dsh 2>/dev/null || true)"
-  if [ -z "$DSHBIN" ]; then
-    command -v npm >/dev/null 2>&1 || die "这台机器没有 npm。先装 Node.js（nodejs.org）再跑一次。"
-    say "这台机器还没装 dsh，先装它（一两分钟）…"
-    npm i -g @deepseek-ai/dsh || die "装 dsh 失败了，看上面的报错。"
-    DSHBIN="$(command -v dsh 2>/dev/null || true)"
-    [ -n "$DSHBIN" ] || die "装完还是找不到 dsh 命令（可能要重开一个终端）。"
-  elif [ "${SETUPBOT_SKIP_DSH_UPGRADE:-}" != "1" ]; then
-    say "把 dsh 升到最新…"
-    if npm i -g @deepseek-ai/dsh >/dev/null 2>&1; then
-      say "✅ dsh 已是最新。"
-    else
-      say "⚠️ dsh 没升成（大概是没网），用现在这版继续。"
-    fi
+  [ -n "$DSHBIN" ] && return 0
+  say "这台机器还没装 dsh —— 先让 setupdsh 把它装上。"
+  if ! run_setupdsh; then
+    die "没装成 dsh（大概是没网）。有网了先跑一次：curl -fsSL ${SETUPDSH_URL:-$SETUPDSH_URL_DEFAULT} | zsh"
   fi
+  DSHBIN="$(command -v dsh 2>/dev/null || true)"
+  [ -n "$DSHBIN" ] || die "setupdsh 跑完了还是找不到 dsh 命令（重开一个终端再跑 setupbot 试试）。"
 }
 
 # ============ 2. 选工作区 ============
@@ -796,7 +818,215 @@ write_bot_config() {
   return "$rc"
 }
 
-# ============ 6. 复核 + 启动器 ============
+# ============ 5.9 工作区里的 5 个双击文件 ============
+# 生成：启动 / 停止 / 重启 / 安装自启 / 卸载自启，外加一个隐藏的共用助手 .botctl.sh。
+# ⚠️ 起停逻辑只有这一份（都在 .botctl.sh 里），5 个 .command 只是外壳 —— 别在别处再写一遍。
+write_launchers() {
+  WS="$LAUNCH_DIR/$PROFILE"
+  LAUNCH_OK=""
+  mkdir -p "$WS" 2>/dev/null || return 1
+
+  put() { printf '%s\n' "$2" >> "$1"; }
+  pause_fn() {
+    put "$1" 'pause() { echo; printf "按回车键关闭窗口…"; read -r _ 2>/dev/null || true; }'
+  }
+  head_fn() { # $1=文件 $2=窗口标题 $3=第一行说明
+    put "$1" '#!/bin/zsh'
+    put "$1" "# ${3}。此文件由 setupbot 生成，可以重复生成。"
+    put "$1" 'cd "$(dirname "$0")" || exit 1'
+    put "$1" "printf '\\033]0;$PROFILE — $2\\007'"
+    put "$1" 'clear'
+    pause_fn "$1"
+  }
+
+  # ---- 共用助手：所有起停逻辑都在这儿 ----
+  CTL="$WS/.botctl.sh"
+  : > "$CTL" 2>/dev/null || return 1
+  put "$CTL" '#!/bin/zsh'
+  put "$CTL" '# .botctl — 「启动 / 停止 / 重启」共用的逻辑。此文件由 setupbot 生成，可以重复生成。'
+  put "$CTL" '# ⚠️ 别手改；要改文案或起停方式，重跑一次 setupbot（这个文件会被重新生成）。'
+  put "$CTL" '# 用法：.botctl.sh start|stop|restart|status'
+  put "$CTL" 'set -u'
+  put "$CTL" 'WS="$(cd "$(dirname "$0")" && pwd)"'
+  put "$CTL" "export DSH_HOME=\"$DSH_HOME_DIR\""
+  put "$CTL" "DSH=\"$DSHBIN\""
+  put "$CTL" "PROFILE=\"$PROFILE\""
+  put "$CTL" "LABEL=\"com.local.dshbot.$PROFILE\""
+  put "$CTL" 'PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"'
+  put "$CTL" 'PIDFILE="$WS/.bot.pid"'
+  put "$CTL" 'LOG="$WS/bot.log"'
+  put "$CTL" ''
+  put "$CTL" '# 找「真在跑」的 pid：pidfile 可能是残骸，必须核对进程确实是本工作区的 dsh。'
+  put "$CTL" '# （pgrep 在本机有假阴性，这里用 ps 全表过滤）'
+  put "$CTL" 'running_pid() {'
+  put "$CTL" '  p=""'
+  put "$CTL" '  [ -f "$PIDFILE" ] && p="$(cat "$PIDFILE" 2>/dev/null || echo)"'
+  put "$CTL" '  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null && ps -o command= -p "$p" 2>/dev/null | grep -Eq -- "--profile ${PROFILE}( |$)"; then'
+  put "$CTL" '    echo "$p"; return 0'
+  put "$CTL" '  fi'
+  put "$CTL" '  p="$(ps -axo pid=,command= 2>/dev/null | grep -E -- "--profile ${PROFILE}( |$)" | grep -v "grep -E" | awk "{print \$1}" | head -1)"'
+  put "$CTL" '  if [ -n "$p" ]; then echo "$p"; return 0; fi'
+  put "$CTL" '  return 1'
+  put "$CTL" '}'
+  put "$CTL" 'plist_loaded() { [ -f "$PLIST" ] && launchctl list 2>/dev/null | grep -qF "$LABEL"; }'
+  put "$CTL" ''
+  put "$CTL" 'do_start() {'
+  put "$CTL" '  p="$(running_pid)" && { echo "已经在跑（PID ${p}），没有重复启动。"; return 0; }'
+  put "$CTL" '  if plist_loaded; then'
+  put "$CTL" '    echo "这份装着开机自启，交给 launchd 拉起…"'
+  put "$CTL" '    launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || launchctl load "$PLIST" 2>/dev/null || true'
+  put "$CTL" '  else'
+  put "$CTL" '    echo "启动中…（日志：${LOG}）"'
+  put "$CTL" '    ( cd "$WS" && nohup "$DSH" --profile "$PROFILE" >>"$LOG" 2>&1 </dev/null & echo $! >"$PIDFILE" )'
+  put "$CTL" '  fi'
+  put "$CTL" '  sleep 3'
+  put "$CTL" '  p="$(running_pid)" || { echo "⛔ 没能起来。日志最后几行："; tail -n 8 "$LOG" 2>/dev/null; return 1; }'
+  put "$CTL" '  echo "✅ 已启动（PID ${p}）。日志：$LOG"'
+  put "$CTL" '}'
+  put "$CTL" ''
+  put "$CTL" 'do_stop() {'
+  put "$CTL" '  if plist_loaded; then'
+  put "$CTL" '    echo "这份装着开机自启，先从 launchd 卸下（自启文件还留着，双击「安装自启」可再装）…"'
+  put "$CTL" '    launchctl unload "$PLIST" 2>/dev/null || true'
+  put "$CTL" '  fi'
+  put "$CTL" '  p="$(running_pid)" || { echo "现在没在跑。"; rm -f "$PIDFILE" 2>/dev/null; return 0; }'
+  put "$CTL" '  echo "停止中（PID ${p}）…"'
+  put "$CTL" '  kill "$p" 2>/dev/null || true'
+  put "$CTL" '  i=0'
+  put "$CTL" '  while [ "$i" -lt 20 ]; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; i=$((i+1)); done'
+  put "$CTL" '  if kill -0 "$p" 2>/dev/null; then echo "它没理会，强杀…"; kill -9 "$p" 2>/dev/null || true; sleep 1; fi'
+  put "$CTL" '  rm -f "$PIDFILE" 2>/dev/null'
+  put "$CTL" '  if kill -0 "$p" 2>/dev/null; then echo "⛔ PID ${p} 还在，手动看一眼：ps -p ${p}"; return 1; fi'
+  put "$CTL" '  echo "✅ 已停止。"'
+  put "$CTL" '}'
+  put "$CTL" ''
+  put "$CTL" 'case "${1:-}" in'
+  put "$CTL" '  start)   do_start ;;'
+  put "$CTL" '  stop)    do_stop ;;'
+  put "$CTL" '  restart) do_stop; echo; do_start ;;'
+  put "$CTL" '  status)  if p="$(running_pid)"; then echo "在跑（PID ${p}）"; else echo "没在跑"; fi ;;'
+  put "$CTL" '  *) echo "用法：$0 start|stop|restart|status"; exit 2 ;;'
+  put "$CTL" 'esac'
+  chmod +x "$CTL" 2>/dev/null
+
+  # ---- 启动 / 停止 / 重启：三个一样的外壳 ----
+  make_cmd() { # $1=文件名 $2=窗口标题 $3=动作 $4=.botctl 参数
+    f="$WS/$1"
+    : > "$f" 2>/dev/null || return 1
+    head_fn "$f" "$2" "双击 = ${3}「${PROFILE}」"
+    put "$f" "echo \"${3}「${PROFILE}」\""
+    put "$f" 'echo "──────────────"'
+    put "$f" "\"\$(pwd)/.botctl.sh\" $4"
+    put "$f" 'RC=$?'
+    put "$f" 'pause'
+    put "$f" 'exit $RC'
+    chmod +x "$f" 2>/dev/null
+  }
+  make_cmd '启动.command' '启动' '启动' 'start'
+  make_cmd '停止.command' '停止' '停止' 'stop'
+  make_cmd '重启.command' '重启' '重启' 'restart'
+
+  # ---- 安装自启（launchd） ----
+  f="$WS/安装自启.command"
+  : > "$f" 2>/dev/null || return 1
+  head_fn "$f" '安装自启' "双击 = 让「${PROFILE}」开机自动跑"
+  put "$f" "DSH=\"$DSHBIN\""
+  put "$f" "PROFILE=\"$PROFILE\""
+  put "$f" "export DSH_HOME=\"$DSH_HOME_DIR\""
+  put "$f" 'WS="$(pwd)"'
+  put "$f" "LABEL=\"com.local.dshbot.$PROFILE\""
+  put "$f" 'PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"'
+  put "$f" ''
+  put "$f" "echo \"给「${PROFILE}」装开机自启\""
+  put "$f" 'echo "──────────────"'
+  put "$f" '# 先停掉手动起的这份，免得装完变成两个进程抢同一个 token'
+  put "$f" '"$WS/.botctl.sh" stop'
+  put "$f" 'echo'
+  put "$f" 'if ! mkdir -p "$HOME/Library/LaunchAgents" 2>/dev/null; then'
+  put "$f" '  echo "⛔ 建不了 ~/Library/LaunchAgents，装不了。"; pause; exit 1'
+  put "$f" 'fi'
+  put "$f" 'if [ -f "$PLIST" ]; then'
+  put "$f" '  cp -p "$PLIST" "$PLIST.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null && echo "（旧的自启文件已备份成 $PLIST.bak.…）"'
+  put "$f" 'fi'
+  put "$f" 'cat > "$PLIST" <<PLIST_EOF'
+  put "$f" '<?xml version="1.0" encoding="UTF-8"?>'
+  put "$f" '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+  put "$f" '<plist version="1.0">'
+  put "$f" '<dict>'
+  put "$f" '  <key>Label</key><string>${LABEL}</string>'
+  put "$f" '  <key>ProgramArguments</key>'
+  put "$f" '  <array>'
+  put "$f" '    <string>${DSH}</string>'
+  put "$f" '    <string>--profile</string>'
+  put "$f" '    <string>${PROFILE}</string>'
+  put "$f" '  </array>'
+  put "$f" '  <key>WorkingDirectory</key><string>${WS}</string>'
+  put "$f" '  <key>EnvironmentVariables</key>'
+  put "$f" '  <dict>'
+  put "$f" '    <key>DSH_HOME</key><string>${DSH_HOME}</string>'
+  put "$f" '    <key>PATH</key><string>${PATH}</string>'
+  put "$f" '  </dict>'
+  put "$f" '  <key>RunAtLoad</key><true/>'
+  put "$f" '  <key>StandardOutPath</key><string>${WS}/bot.log</string>'
+  put "$f" '  <key>StandardErrorPath</key><string>${WS}/bot.log</string>'
+  put "$f" '</dict>'
+  put "$f" '</plist>'
+  put "$f" 'PLIST_EOF'
+  put "$f" '# ⚠️ 故意不写 KeepAlive：崩了不自动重拉，免得好好的「停止」按下去它又自己回来。'
+  put "$f" ''
+  put "$f" 'if ! plutil -lint "$PLIST" >/dev/null 2>&1; then'
+  put "$f" '  echo "⛔ 生成的自启文件格式不对，没有安装。把上面几行发我。"; pause; exit 1'
+  put "$f" 'fi'
+  put "$f" 'launchctl unload "$PLIST" 2>/dev/null || true'
+  put "$f" 'if ! launchctl load "$PLIST" 2>/dev/null; then'
+  put "$f" '  echo "⛔ launchctl load 失败了，把上面几行发我。"; pause; exit 1'
+  put "$f" 'fi'
+  put "$f" 'sleep 3'
+  put "$f" 'if launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
+  put "$f" '  echo "✅ 装好了：以后开机（登录）它自己就起来，日志还是工作区的 bot.log。"'
+  put "$f" '  echo "   想取消：双击 卸载自启.command"'
+  put "$f" 'else'
+  put "$f" '  echo "⛔ 装了但 launchctl 里看不到，把上面几行发我。"'
+  put "$f" 'fi'
+  put "$f" 'pause'
+  chmod +x "$f" 2>/dev/null
+
+  # ---- 卸载自启 ----
+  f="$WS/卸载自启.command"
+  : > "$f" 2>/dev/null || return 1
+  head_fn "$f" '卸载自启' "双击 = 取消「${PROFILE}」的开机自启"
+  put "$f" "LABEL=\"com.local.dshbot.$PROFILE\""
+  put "$f" 'PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"'
+  put "$f" ''
+  put "$f" "echo \"取消「${PROFILE}」的开机自启\""
+  put "$f" 'echo "──────────────"'
+  put "$f" 'ran=0'
+  put "$f" 'if [ -f "$PLIST" ]; then'
+  put "$f" '  if launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
+  put "$f" '    launchctl unload "$PLIST" 2>/dev/null && ran=1 || true'
+  put "$f" '  fi'
+  put "$f" '  rm -f "$PLIST" 2>/dev/null'
+  put "$f" 'fi'
+  put "$f" 'if [ -f "$PLIST" ] || launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
+  put "$f" '  echo "⛔ 没卸干净，把上面几行发我。"'
+  put "$f" 'else'
+  put "$f" '  echo "✅ 已取消开机自启（自启文件已删）。"'
+  put "$f" '  if [ "$ran" = "1" ]; then echo "   （刚才那份进程也被 launchd 一起停了；要手动跑就双击 启动.command）"; fi'
+  put "$f" 'fi'
+  put "$f" 'pause'
+  chmod +x "$f" 2>/dev/null
+
+  # 老版本只生成一个「启动-<名字>.command」，现在拆成 5 个 —— 那份是我们的旧产物，收掉
+  OLD="$WS/启动-${PROFILE}.command"
+  if [ -f "$OLD" ] && grep -q '此文件由 setupbot 生成' "$OLD" 2>/dev/null; then
+    rm -f "$OLD" 2>/dev/null && say "（旧的 启动-${PROFILE}.command 已被新的 启动.command 取代，删掉了）"
+  fi
+
+  LAUNCH_OK=1
+  return 0
+}
+
+# ============ 6. 复核 + 工作区文件 ============
 finish() {
   cfg="$PROFILES/$PROFILE/cordis.patch.yml"
   say ""
@@ -846,26 +1076,27 @@ finish() {
     done < "$TOK_FILE"
   fi
 
-  L="$LAUNCH_DIR/$PROFILE/启动-${PROFILE}.command"
-  mkdir -p "$LAUNCH_DIR/$PROFILE" 2>/dev/null || true
-  {
-    printf '#!/bin/zsh\n'
-    printf '# 双击启动「%s」工作区。此文件由 setupbot 生成，可以重复生成。\n' "$PROFILE"
-    printf 'cd "$(dirname "$0")"\n'
-    printf 'export DSH_HOME="%s"\n' "$DSH_HOME_DIR"
-    printf 'exec "%s" --profile "%s"\n' "$DSHBIN" "$PROFILE"
-  } > "$L" 2>/dev/null || L=""
-  [ -n "$L" ] && chmod +x "$L" 2>/dev/null
+  if write_launchers; then
+    say "✅ 工作区文件已生成：${LAUNCH_DIR}/${PROFILE}/"
+    say "   启动 / 停止 / 重启 / 安装自启 / 卸载自启 —— 双击就能用"
+  else
+    say "⚠️ 工作区文件没生成（${LAUNCH_DIR}/${PROFILE} 不可写？）—— 还能敲 dsh --profile ${PROFILE} 启动。"
+  fi
 
   say ""
   say "============ 全部搞定 ============"
-  say "工作区：${PROFILE}"
-  if [ -n "$L" ]; then say "启动：双击 ${L}"; fi
-  say "      或者敲 dsh --profile ${PROFILE}"
-  if [ -n "${SELF_BIN_DIR:-}" ]; then
-    say "以后重绑 TG / 微信、升级，全都只要敲：setupbot"
+  say "工作区：${PROFILE}（${LAUNCH_DIR}/${PROFILE}）"
+  if [ -n "$LAUNCH_OK" ]; then
+    say "启动：双击 ${LAUNCH_DIR}/${PROFILE}/启动.command（后台跑，窗口关了也活着）"
+    say "停止 / 重启 / 开机自启：就在同一个文件夹里"
   else
-    say "以后重绑 TG / 微信、升级，把开头那条命令再跑一遍就行。"
+    say "启动：敲 dsh --profile ${PROFILE}"
+  fi
+  if [ -n "${SELF_BIN_DIR:-}" ]; then
+    say "以后重绑 TG / 微信、装/升级插件：敲 setupbot"
+    say "以后装/升级 git 和 DSH 本体：敲 setupdsh"
+  else
+    say "以后重绑 TG / 微信、装/升级插件：把开头那条命令再跑一遍"
   fi
   say "=================================="
 }
