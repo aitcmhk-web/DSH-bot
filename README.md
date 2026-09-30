@@ -8,30 +8,22 @@
 ## 环境要求
 
 - Node ≥ 18
-- 机器上装好 DSH（有 `dsh` 命令）。**没有就先装：**
-  ```
-  npm i -g @deepseek-ai/dsh
-  ```
+- 机器上装好 DSH（有 `dsh` 命令；没装的话照着下面第 1 步走）
 - 一个 Telegram bot token（在 Telegram 里找 @BotFather 发送 `/newbot` 新建，不要和其他 bot 共用）
 
 ## 安装方式一：在线安装（从 git 装，会敲命令的，推荐）
 
-> ⚠️ **必须用 `dsh plugin`，不要用裸 `pnpm add`。**
-> 插件只有装进 **profile 的 `node_modules`**（`~/.dsh/profiles/<profile>/node_modules/`）才会被 DSH 加载。
-> `dsh plugin` 会自动切到 profile 目录再装，所以**在哪个目录打开终端都行**；
-> 裸 `pnpm add` 会装到你当前所在目录，DSH 看不见，插件静默失效。
-
-1. 装进目标 profile（下面以 `mybot` 为例）：
+1. 两条命令，照着敲（`mybot` 换成你自己的 profile 名）：
 
    ```
+   npm i -g @deepseek-ai/dsh
    dsh plugin --profile mybot add github:aitcmhk-web/DSH-bot
    ```
 
-   > ⚠️ `mybot` 只是**示例名**，要换成**你自己的 profile 名**。
-   > profile 名 = `~/.dsh/profiles/` 下的目录名，用 `ls ~/.dsh/profiles/` 看有哪些
-   > （常见的是 `bot`、`web`、`tui`）。
-   > **填错名字不会报错** —— DSH 会新建一个空 profile，插件装进去，
-   > 但你原来的会话一点变化都没有。
+   > ⚠️ 必须用 `dsh plugin`，别用裸 `pnpm add` —— 插件只有装进 profile 的 `node_modules`
+   > 才会被 DSH 加载，裸 `pnpm add` 装到你当前目录，DSH 看不见，静默失效。
+   > ⚠️ `mybot` 是示例名，换成你自己的 profile 名（`ls ~/.dsh/profiles/` 看有哪些）。
+   > 名字写错不报错：DSH 会新建一个空 profile，插件装进去，你原来的会话没变化。
 
 2. 编辑该 profile 的 `cordis.patch.yml`，加上配置（**token 必填**）：
 
@@ -47,9 +39,9 @@
    dsh --profile mybot
    ```
 
-以后升级也是同一条命令（重新 add 会拉最新版本）。npm 发布后还可以用 `dsh plugin --profile mybot add dsh-botplugin`。
+以后升级也是同一条命令（重新 add 会拉最新版本）。
 
-## 安装方式一之二：本地安装（用你手上这份源码）
+## 开发者：本地安装（用你手上这份源码）
 
 已经有一份源码（比如你自己 clone 下来的、或者要改着调试的），就用 `file:` 指向**那个目录**：
 
