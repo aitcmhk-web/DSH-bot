@@ -302,16 +302,29 @@ export function apply(ctx, config) {
   //    又回默认的了」）—— 用户切过的档本该一直有效，直到他自己再切一次。所以落盘。
   //    存插件自己的文件，**刻意不碰 bot.js 的 .state.json**：那边 saveState() 是整体
   //    重写，两个进程各写各的会互相抹掉对方的状态。
+  //
+  //  ⚠️⚠️ 记忆位的存活判据**只能是「用户有没有再手选过」**（2026-09-30 用户定案：
+  //    「不管什么原因，不要自动切换回第一档，除非我手动切换」）。
+  //    原先这里拿「这个 key 在不在当前档位表里」当存活判据，出了一连串事故：
+  //      · hostModelTable() 的第 ② 段（内置 deepseek 目录）不由 web 端配置决定，
+  //        用户从 web 端删掉某个 ds 档，表里**照样有** → remembered 永远命中，
+  //        清理分支永远不执行 → 旧 key 永久留存（2026-09-30 用户报障）。
+  //      · 反过来，只要表有任何变动（web 端改默认、加减模型、升级、profile 重建），
+  //        记忆档一时匹配不上就被判死并**落盘清空** → 重启后回第一档。
+  //    ⇒ 现在记忆位是「粘」的：读到就信、就继续用，表里有没有都不影响它。
+  //      进程重启 / 重启电脑 / 升级后重启**都不许动它**；只有 /model 手点那次才改。
   const pickedKeyFile = join(config.cwd || process.cwd(), '.botplugin-state.json');
   let hostPickedKey = null;
   try {
     // 同步读：文件只有几十字节，且 apply() 不是 async（不能用 await）。
     const saved = JSON.parse(readFileSync(pickedKeyFile, 'utf8'));
-    // ⚠️ 只认字符串：档位在 web 端被删掉时，下面的 refreshHostRoute() 会把它清空，
-    //    不能因为文件里存过一个已失效的 key 就把它当成有效记忆。
-    if (saved && typeof saved.hostPickedKey === 'string') hostPickedKey = saved.hostPickedKey;
+    // ⚠️ 只认非空字符串。**不**在这里判"档位还有效吗" —— 见上面那段定案：
+    //    有效性不该由插件猜，猜错一次用户的档位就没了。
+    if (saved && typeof saved.hostPickedKey === 'string' && saved.hostPickedKey.trim()) {
+      hostPickedKey = saved.hostPickedKey;
+    }
   } catch { /* 文件不存在 / JSON 坏了 → 当没有记忆，照常回落默认档 */ }
-  /** 记住用户手选的档位（含落盘）。传 null = 清除记忆（档位已失效）。 */
+  /** 记住用户手选的档位（含落盘）。⚠️ 只该在用户**手点切换**时调用。 */
   const rememberPickedKey = (key) => {
     if (hostPickedKey === key) return;
     hostPickedKey = key;
@@ -327,6 +340,52 @@ export function apply(ctx, config) {
   const routeKeyFor = (pid, modelId, isOnlyModel) => {
     const alias = menuKey(pid);
     return isOnlyModel ? alias : `${alias}:${modelId}`;
+  };
+  /**
+   * 从记忆位的 key **重建**一个档位对象（web 端档位表里暂时找不到它时用）。
+   *
+   * 为什么需要：记忆位不再拿档位表校验（见 refreshHostRoute 的定案），于是
+   * 「表里没有」时不能再靠 table.list 兜底 —— 没有这步重建，activeRoute 会变成
+   * null，用户手选的档位在重启后等于消失（比"回第一档"更糟）。
+   *
+   * 规则与 routeKeyFor 同源（互为逆运算）：
+   *   · `zhipu:glm-4.7-flash` → provider=zhipu, model=glm-4.7-flash
+   *   · `ali`                 → 别名反查 provider=alibailian，model 未知 → 退回 last，
+   *                             拿不到就返回 null（**不猜模型名**）
+   *
+   * @param {string} key 记忆位里的 key
+   * @param {object|null} last 上一次解析出来的档位（用来补 model 等已知信息）
+   * @returns {object|null} 重建的档位；信息不够就 null，绝不编一个假的
+   */
+  const routeFromPickedKey = (key, last) => {
+    const colon = key.indexOf(':');
+    let provider;
+    let model;
+    if (colon > 0) {
+      const alias = key.slice(0, colon);
+      model = key.slice(colon + 1);
+      // 别名反查真实 provider id；反查不到就按原样当 provider id。
+      provider = Object.keys(KEY_ALIAS).find((pid) => KEY_ALIAS[pid] === alias) ?? alias;
+    } else {
+      // 没有 `:` = 单模型 provider，key 本身就是别名（也可能用户手写过真 provider id）。
+      provider = Object.keys(KEY_ALIAS).find((pid) => KEY_ALIAS[pid] === key) ?? key;
+      // 模型名无从得知：只有 last 恰好在同一个 provider 上时才能沿用，否则放弃。
+      if (last && last.provider === provider && last.model) model = last.model;
+    }
+    if (!provider || !model) return null;
+    return {
+      key,
+      provider,
+      model,
+      // 这几个只用于显示；拿不到真实值就给个不含糊的占位，别假装知道。
+      label: last?.provider === provider ? last.label : provider,
+      short: last?.provider === provider ? last.short : `${provider}:${model}`,
+      displayName: last?.provider === provider ? last.displayName : model,
+      reasoningEffort: last?.provider === provider ? last.reasoningEffort : 'none',
+      isDefault: false,
+      // ⚠️ 标记"这不是从表里来的"，别处若要按表判断可以据此区分。
+      __rebuiltFromPickedKey: true,
+    };
   };
 
   /** 实时重建宿主模型表（异步：deepseek 内置目录要查 llm 服务）。 */
@@ -418,12 +477,28 @@ export function apply(ctx, config) {
   const refreshHostRoute = async () => {
     if (!useHostRoutes) return activeRoute;
     const table = await hostModelTable();
-    // 记忆位优先：切过的档位必须活过刷新，否则菜单/状态又会显示成 web 默认档。
-    const remembered = hostPickedKey ? table.list.find((r) => r.key === hostPickedKey) : undefined;
-    activeRoute = remembered ?? table.list.find((r) => r.key === table.defaultKey) ?? null;
-    // 档位在 web 端被删掉 → 记忆失效，落回默认档（否则 activeRoute 会一直指着不存在的模型）。
-    // ⚠️ 这里也必须同步落盘清掉，否则文件里一直留着失效 key，下次重启又白读一次。
-    if (!remembered) rememberPickedKey(null);
+    // ⚠️⚠️ 记忆位最先判、且**无条件生效**（2026-09-30 用户定案：「不管什么原因，
+    //    不要自动切换回第一档，除非我手动切换」）。
+    //    这里**不再**拿 table.list 去校验 hostPickedKey —— 那正是历次「重启后回
+    //    第一档」的根因：表一时匹配不上（web 端改默认/加减模型/升级/profile 重建）
+    //    就被判死并落盘清空。用户手选过的档，只有用户自己能改。
+    if (hostPickedKey) {
+      // 表里有这条 → 直接用表里的完整定义（档位参数以 web 端为准，不拿旧快照）。
+      const inTable = table.list.find((r) => r.key === hostPickedKey);
+      // 表里没有，但本轮运行里它已经解析好了（上一次刷新就建好了）→ 沿用，别丢。
+      const alreadyResolved = activeRoute?.key === hostPickedKey ? activeRoute : null;
+      // ⚠️ 表里没有、且本轮还没解析过它 —— **必须自己把档位重建出来**，
+      //    否则 activeRoute = null，用户手选的档位在重启后等于凭空消失
+      //    （表现就是「重启又回第一档 / 显示(未配置)」）。
+      //    原先这里靠 table.list 兜底，所以永远不会为 null；现在不靠表了，
+      //    这步重建就必须显式做 —— 漏了它，本函数就从"回第一档"变成"没有档"，
+      //    是更糟的回归（2026-09-30 实测：场景 ①②③ 全挂，改成重建后全绿）。
+      activeRoute = inTable ?? alreadyResolved ?? routeFromPickedKey(hostPickedKey, activeRoute);
+      runtime?.setDefaultRoute(activeRoute);
+      return activeRoute;
+    }
+    // 没有记忆位（从没手选过 / 用户清过）才走默认档，这是"新会话从哪起步"的初始值。
+    activeRoute = table.list.find((r) => r.key === table.defaultKey) ?? null;
     runtime?.setDefaultRoute(activeRoute);
     return activeRoute;
   };
