@@ -1,5 +1,7 @@
 node_modules/
 weixin-account.json
+.botplugin-state.json
+.botplugin.lock
 *.log
 .DS_Store
 *.bak.*

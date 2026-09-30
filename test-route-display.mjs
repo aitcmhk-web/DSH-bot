@@ -287,7 +287,73 @@ ok(
   `⭐ 切换真的把会话建到了 glm-4.7-flash 上（实际日志：${JSON.stringify(sessionLines)}）`,
 );
 
+// ── 场景 7【核心·2026-09-30 报障】：记忆必须活过**重启** ──────────────────
+//    报障原文：「插件那边重启后模型又回默认的了，正常应该不切换才对，除非我主动切换」。
+//    原实现把记忆位放在内存里（let hostPickedKey = null），进程一换就归零 → 回落默认档。
+//    这里模拟真实重启：**同一个 cwd 再 apply() 一次**（新进程等价于新的一次 apply，
+//    模块状态本来就随进程消失，而落盘文件留在 cwd）。
+//    ⚠️ 判据必须是「重启后的菜单 ✅ / 当前行」，不是"文件里有没有那个 key" ——
+//       写了文件但启动时没读回来，正是这个 bug 的形态。
 tg.close();
+await wait(100);
+
+const sent2 = [];
+const tg2 = createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://x');
+  let body = '';
+  for await (const c of req) body += c;
+  const json = (o) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(o));
+  };
+  const params = JSON.parse(body || '{}');
+  if (url.pathname.includes('/getMe')) {
+    return json({ ok: true, result: { id: 999, is_bot: true, username: 'testbot' } });
+  }
+  if (url.pathname.includes('/getUpdates')) {
+    if (updateQueue2.length === 0) await new Promise((r) => setTimeout(r, 300));
+    return json({ ok: true, result: updateQueue2.splice(0, updateQueue2.length) });
+  }
+  if (url.pathname.includes('/sendMessage')) {
+    sent2.push({ chat_id: params.chat_id, text: params.text ?? '', reply_markup: params.reply_markup });
+    return json({ ok: true, result: { message_id: sent2.length, chat: { id: params.chat_id } } });
+  }
+  return json({ ok: true, result: true });
+});
+const updateQueue2 = [];
+const TG_PORT2 = 18954;
+await new Promise((r) => tg2.listen(TG_PORT2, '127.0.0.1', r));
+
+// 重启：同一个 WORKDIR（落盘文件就在那儿），重新 apply 一份全新进程状态。
+plugin.apply(ctx, {
+  telegramToken: 'TOKEN',
+  telegramApiRoot: `http://127.0.0.1:${TG_PORT2}`,
+  telegramAllowedUsers: [],
+  cwd: WORKDIR,
+  turnTimeoutMs: 4000,
+});
+await wait(400);
+updateQueue2.push(userMsg(101, '/model'));
+const deadline7 = Date.now() + 4000;
+let menu3;
+while (Date.now() < deadline7) {
+  menu3 = sent2.find((m) => m.reply_markup?.inline_keyboard?.length);
+  if (menu3) break;
+  await wait(50);
+}
+const btns3 = (menu3?.reply_markup?.inline_keyboard ?? []).map((row) => row[0]);
+ok(
+  btns3.find((b) => b.text.endsWith('✅'))?.text === 'zhipu:glm-4.7-flash ✅',
+  `⭐⭐ 重启后 ✅ 仍在用户手选的 glm-4.7-flash（报障症状 = 回落到 glm-5.3-flash；实际：${JSON.stringify(
+    btns3.map((b) => b.text),
+  )}）`,
+);
+ok(
+  currentLine(menu3).includes('glm-4.7-flash'),
+  `⭐⭐ 重启后「当前」行仍是 glm-4.7-flash（实际：${currentLine(menu3)}）`,
+);
+
+tg2.close();
 rmSync(WORKDIR, { recursive: true, force: true });
 console.log = realLog;
 process.stderr.write(failed === 0 ? '\n全部通过\n' : `\n${failed} 项失败\n`);

@@ -19,7 +19,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { existsSync, openSync, appendFileSync } from 'node:fs';
+import { existsSync, openSync, appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { readFile, writeFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -298,7 +298,27 @@ export function apply(ctx, config) {
   //    原先 refreshHostRoute() 每次刷写都把 activeRoute 覆盖成默认档，于是菜单的 ✅
   //    和 /status 永远指着默认模型（实际切换是成功的，只是显示被打回原形）。
   //    这里用一个显式记忆位承载「切过的档位」，刷新只在**没有记忆**时才回落到默认档。
+  //  ⚠️ 记忆位光放内存会在**重启后丢**（2026-09-30 用户报障：「插件那边重启后模型
+  //    又回默认的了」）—— 用户切过的档本该一直有效，直到他自己再切一次。所以落盘。
+  //    存插件自己的文件，**刻意不碰 bot.js 的 .state.json**：那边 saveState() 是整体
+  //    重写，两个进程各写各的会互相抹掉对方的状态。
+  const pickedKeyFile = join(config.cwd || process.cwd(), '.botplugin-state.json');
   let hostPickedKey = null;
+  try {
+    // 同步读：文件只有几十字节，且 apply() 不是 async（不能用 await）。
+    const saved = JSON.parse(readFileSync(pickedKeyFile, 'utf8'));
+    // ⚠️ 只认字符串：档位在 web 端被删掉时，下面的 refreshHostRoute() 会把它清空，
+    //    不能因为文件里存过一个已失效的 key 就把它当成有效记忆。
+    if (saved && typeof saved.hostPickedKey === 'string') hostPickedKey = saved.hostPickedKey;
+  } catch { /* 文件不存在 / JSON 坏了 → 当没有记忆，照常回落默认档 */ }
+  /** 记住用户手选的档位（含落盘）。传 null = 清除记忆（档位已失效）。 */
+  const rememberPickedKey = (key) => {
+    if (hostPickedKey === key) return;
+    hostPickedKey = key;
+    try {
+      writeFileSync(pickedKeyFile, JSON.stringify({ hostPickedKey: key }, null, 2));
+    } catch { /* 写不了不影响本次运行，只是重启后仍会回落 */ }
+  };
 
   // ── 宿主模型表：跟随 web 端「设置 → 模型」，加减模型即时生效 ──
   //    key 规则：单模型 provider 用别名，多模型 `<别名>:<模型id>`。
@@ -402,7 +422,8 @@ export function apply(ctx, config) {
     const remembered = hostPickedKey ? table.list.find((r) => r.key === hostPickedKey) : undefined;
     activeRoute = remembered ?? table.list.find((r) => r.key === table.defaultKey) ?? null;
     // 档位在 web 端被删掉 → 记忆失效，落回默认档（否则 activeRoute 会一直指着不存在的模型）。
-    if (!remembered) hostPickedKey = null;
+    // ⚠️ 这里也必须同步落盘清掉，否则文件里一直留着失效 key，下次重启又白读一次。
+    if (!remembered) rememberPickedKey(null);
     runtime?.setDefaultRoute(activeRoute);
     return activeRoute;
   };
@@ -1217,7 +1238,7 @@ export function apply(ctx, config) {
           // 两档来源都要记住：手写 routes 直接换 activeRoute；跟随宿主时写记忆位，
           // 下一次 refreshHostRoute() 才不会把显示覆盖回 web 默认档。
           activeRoute = wanted;
-          if (useHostRoutes) hostPickedKey = wanted.key;
+          if (useHostRoutes) rememberPickedKey(wanted.key);
           await reply(
             `✅ 已切换到「${wanted.label}」\n${wanted.provider} / ${wanted.model}\n\n当前会话历史已带过去，直接接着聊即可。`,
           );
