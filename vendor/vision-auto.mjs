@@ -19,13 +19,32 @@
  *   node vision-auto.mjs --quiet         # 静默（bot 启动钩子用），只报错误
  *   node vision-auto.mjs <file>          # 指定目标文件（副本试跑）
  */
-import { readFileSync, writeFileSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 
 const HOME = homedir();
-const target = process.argv.slice(2).find((a) => !a.startsWith('-')) || `${HOME}/.dsh/settings.yaml`;
+/**
+ * 目标文件（默认）：web 端「设置 → 模型」的真实落盘。
+ *
+ * ⚠️ 路径变迁（2026-09-30 实证）：
+ *   - 0.2.0 起 home 级 `~/.dsh/settings.yaml` 被升级流程**搬走**
+ *     （只剩 `settings.yaml.imported`），web 端配置改落
+ *     `profiles/web/cordis.patch.yml`；
+ *   - 老代码默认写死 settings.yaml → 每次都走「未找到 → 跳过探测」，
+ *     识图标记永远补不上（2026-09-30 远端实测报的就是这条）。
+ *   ⇒ 默认优先 patch，不存在再退回 settings.yaml（老版本 DSH 仍可用）。
+ *   显式传参（副本试跑）优先级最高，不受影响。
+ */
+const CANDIDATES = [
+  `${HOME}/.dsh/profiles/web/cordis.patch.yml`,
+  `${HOME}/.dsh/settings.yaml`,
+];
+const argTarget = process.argv.slice(2).find((a) => !a.startsWith('-'));
+const target = argTarget
+  || CANDIDATES.find((p) => { try { return existsSync(p); } catch { return false; } })
+  || CANDIDATES[0];
 const CHECK = process.argv.includes('--check');
 const FORCE = process.argv.includes('--force');
 const QUIET = process.argv.includes('--quiet');
@@ -97,24 +116,35 @@ async function probe(baseURL, apiKeyEnv, modelId, keys) {
 }
 
 /** 在文件文本中定位某模型条目的行区间，返回 {start, end}（含首含尾，0 基）。
- *  条目 = 精确匹配的 `        - id: <id>` 行 + 其后所有 ≥10 空格缩进的从属行。
- *  （0/4/6 空格的行——顶层键、provider 键、4 空格列表——一律不算条目成员。） */
+ *
+ *  ⚠️ 缩进**不能写死**（2026-09-30 实测踩过）：模型条目的缩进取决于它嵌在哪：
+ *    settings.yaml   顶层 map      → `        - id:`（8 空格）
+ *    cordis.patch.yml 顶层数组+config → `          - id:`（10 空格）
+ *  写死 8 空格的话，patch 文件里 indexOf 恒为 -1 —— 每个模型都「找不到条目」，
+ *  静默什么都不做。所以这里按 `- id: <id>` 的实际缩进匹配，并据此推算从属行缩进。 */
 function findEntry(lines, modelId) {
-  const idLine = `        - id: ${modelId}`;
-  const start = lines.indexOf(idLine);
+  const re = new RegExp(`^(\\s*)- id: ${modelId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`);
+  let start = -1;
+  let indent = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(re);
+    if (m) { start = i; indent = m[1].length; break; }
+  }
   if (start === -1) return null;
+  // 从属行 = 比条目行缩进更深的后续行
   let end = start;
-  for (let i = start + 1; i < lines.length && /^ {10,}/.test(lines[i]); i++) end = i;
-  return { start, end };
+  const deeper = new RegExp(`^ {${indent + 1},}`);
+  for (let i = start + 1; i < lines.length && deeper.test(lines[i]); i++) end = i;
+  return { start, end, indent };
 }
 
-const entryHasInput = (lines, r) => lines.slice(r.start, r.end + 1).some((l) => /^ {8,}input:/.test(l));
+const entryHasInput = (lines, r) => lines.slice(r.start, r.end + 1).some((l) => /^\s*input:/.test(l));
 
 /** 摘掉条目里的纯文字标记（input: 行 + 紧随的 - text 行）。从区间尾部往前删，行号不失效。 */
 function removeMark(lines, r) {
   for (let i = r.end; i >= r.start; i--) {
-    if (/^ {10,}input:/.test(lines[i])) {
-      lines.splice(i, /^ {12,}- /.test(lines[i + 1] ?? '') ? 2 : 1);
+    if (/^\s*input:/.test(lines[i])) {
+      lines.splice(i, /^\s*- /.test(lines[i + 1] ?? '') ? 2 : 1);
     }
   }
 }
@@ -134,19 +164,35 @@ async function main() {
     return;
   }
   const doc = YAML.parse(src);
-  const providers = doc?.['llm-pi-ai']?.providers ?? {};
+  // ── 取 providers：两种顶层结构都要认 ──────────────────────────────
+  //   settings.yaml   → 顶层 map，`llm-pi-ai` 是顶层键；
+  //   cordis.patch.yml→ 顶层 **数组**，llm-pi-ai 是其中一条 `- id: llm-pi-ai`
+  //                     条目，providers 在它的 `config:` 下面。
+  //   ⚠️ 只认 map 的话，patch 文件会静默拿到 {} —— provider 全丢、一个都不探测。
+  const piEntry = Array.isArray(doc)
+    ? doc.find((e) => e?.id === 'llm-pi-ai')
+    : doc?.['llm-pi-ai'];
+  const providers = piEntry?.config?.providers ?? piEntry?.providers ?? {};
   const keys = loadKeys();
   const lines = src.split('\n');
 
   // ── 第 1 步：确保每个服务商都有 defaultInput（「假设都有识图」层）──
-  const INJECT = '      defaultInput:\n        - text\n        - image\n';
+  //   ⚠️ 缩进按 baseURL 行**实测**推算（defaultInput 与 baseURL 同级，其列表项再深 2），
+  //      不写死 6 空格 —— patch 文件里是 8，写死就注错层、YAML 直接坏掉。
   let changed = false;
   for (const [name, p] of Object.entries(providers)) {
     if (p?.defaultInput?.includes('image')) continue;
-    const anchor = src.match(new RegExp(`^      baseURL: ${p.baseURL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n`, 'm'));
+    const esc = String(p.baseURL ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!esc) { say(`⚠️ ${name}: 无 baseURL，跳过 defaultInput`); continue; }
+    const anchorRe = new RegExp(`^(\\s*)baseURL: ["']?${esc}["']?\\s*$`, 'm');
+    const anchor = src.match(anchorRe);
     if (!anchor) { say(`⚠️ ${name}: 找不到 baseURL 锚点，跳过 defaultInput`); continue; }
     if (CHECK) { say(`（将给 ${name} 补 defaultInput）`); continue; }
-    lines.splice(lines.findIndex((l) => l === `      baseURL: ${p.baseURL}`) + 1, 0, ...INJECT.trimEnd().split('\n'));
+    const pad = anchor[1];
+    const INJECT = [`${pad}defaultInput:`, `${pad}  - text`, `${pad}  - image`];
+    const at = lines.findIndex((l) => new RegExp(`^${pad}baseURL: ["']?${esc}["']?\\s*$`).test(l));
+    if (at === -1) { say(`⚠️ ${name}: 行定位失败，跳过 defaultInput`); continue; }
+    lines.splice(at + 1, 0, ...INJECT);
     changed = true;
     say(`✅ ${name}: 已补 defaultInput [text, image]`);
   }
@@ -190,14 +236,16 @@ async function main() {
         say(`⏭ ${j.name}/${j.id}: 仍不支持，维持原标记（不重复插入）`);
         continue;
       }
-      ops.push({ pos: j.entry.end + 1, kind: 'insert' });
+      // input 与条目内其它键（id/name）同级：比 `- ` 再深 2，实测条目缩进推算。
+      const p2 = ' '.repeat((j.entry.indent ?? 8) + 2);
+      ops.push({ pos: j.entry.end + 1, kind: 'insert', pad: p2 });
       say(`⛔ ${j.name}/${j.id}: 不支持识图（${j.result.why}）→ 将标记纯文字`);
     } else say(`⚠️ ${j.name}/${j.id}: 未知（${j.result.why}）→ 不动`);
   }
   ops.sort((a, b) => b.pos - a.pos); // 从后往前，行号不失效
   for (const op of ops) {
     if (CHECK) continue;
-    if (op.kind === 'insert') work.splice(op.pos, 0, '          input:', '            - text');
+    if (op.kind === 'insert') work.splice(op.pos, 0, `${op.pad}input:`, `${op.pad}  - text`);
     else removeMark(work, op.entry);
     changed = true;
   }
