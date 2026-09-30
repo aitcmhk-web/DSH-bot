@@ -11,41 +11,20 @@
 - 机器上装好 DSH（有 `dsh` 命令；没装的话照着下面第 1 步走）
 - 一个 Telegram bot token（在 Telegram 里找 @BotFather 发送 `/newbot` 新建，不要和其他 bot 共用）
 
-## 安装方式一：在线安装（从 git 装，会敲命令的，推荐）
+## 安装方式一：在线安装（一条命令，推荐）
 
-1. 两条命令，照着敲（`mybot` 换成你自己的 profile 名）：
-
-   ```
-   npm i -g @deepseek-ai/dsh
-   dsh plugin --profile mybot add github:aitcmhk-web/DSH-bot
-   ```
-
-   > ⚠️ 必须用 `dsh plugin`，别用裸 `pnpm add` —— 插件只有装进 profile 的 `node_modules`
-   > 才会被 DSH 加载，裸 `pnpm add` 装到你当前目录，DSH 看不见，静默失效。
-   > ⚠️ `mybot` 是示例名，换成你自己的 profile 名（`ls ~/.dsh/profiles/` 看有哪些）。
-   > 名字写错不报错：DSH 会新建一个空 profile，插件装进去，你原来的会话没变化。
-
-2. 填 token（把下面引号里那串先换成 @BotFather 发你的，再整段贴进终端）：
+1. 把下面这条整段贴进终端，回车：
 
    ```
-   mkdir -p ~/.dsh/profiles/mybot
-   cat > ~/.dsh/profiles/mybot/cordis.patch.yml <<'EOF'
-   - id: botplugin
-     config:
-       telegramToken: "123456:ABC你的token"
-   EOF
+   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setup-bot.sh | zsh
    ```
 
-   > ⚠️ 这条命令会覆盖那个文件 —— 用新 profile 名（如 `mybot`）没事，里面本来只有一个 `[]`；
-   > 用已经配过东西的 profile，就手动把那三行加进去。
+   它自己装 DSH（没装的话）、自己挑 profile、自己把插件装好，然后**只问你一样东西：token**
+   —— 在 Telegram 里找 @BotFather 复制那串，粘上、回车，它自己写进配置。
 
-3. 启动：
+2. 启动：照着它最后打出来的那行敲（形如 `dsh --profile mybot`）。
 
-   ```
-   dsh --profile mybot
-   ```
-
-以后升级也是同一条命令（重新 add 会拉最新版本）。
+以后升级也是同一条命令（重新跑会拉最新版）。
 
 ## 开发者：本地安装（用你手上这份源码）
 
@@ -81,10 +60,9 @@ dsh plugin --profile mybot add file:$HOME/DSH/BOT/botplugin
 
 ## 怎么确认装对了
 
-插件**装对了**的话，`ls ~/.dsh/profiles/mybot/node_modules/` 里能看到 `dsh-botplugin`。
+脚本跑到最后会打「✅ 复核通过：配置已经生效」—— 看到这句就是装对了，它紧接着会给你启动命令。
 
-看不到 = 装到别处去了，插件不会生效（而且**不报错**，只会静默什么都没发生）。
-把装错的那份删掉，再用 `dsh plugin --profile mybot add ...` 重装一次。
+没看到这句、或者它报「插件没装上」= 没装成，插件不会生效（而且**不报错**，只会静默什么都没发生）。
 
 ## 配置项速查
 
