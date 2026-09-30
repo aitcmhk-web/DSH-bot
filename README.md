@@ -167,3 +167,7 @@ DSH 的审批服务用 waterfall 广播 `approval/request`，插件把它桥接�
 ## 已知限制
 
 - 微信扫码工具用 macOS 原生 CoreImage 渲染二维码（零依赖），Windows/Linux 机器上会退化为只打印链接。
+
+## 许可
+
+MIT License（全文见 [LICENSE](LICENSE)）：可以自由使用、修改、再发布，保留版权声明即可；软件不提供任何担保。
