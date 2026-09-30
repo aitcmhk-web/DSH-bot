@@ -31,6 +31,7 @@ import { Memory } from './memory.js';
 import { BotRuntime } from './runtime.js';
 import { Hub, makeMessage, markAsHubOutput } from './hub.js';
 import { buildRoutes, routeByKey, routeFor, describeRoute, isRouteFailure, reasoningEffortFor } from './models.js';
+import { readWebLlmPiAi, webPatchPath } from './web-patch.js';
 import { LiveStatus, describeTool } from './status.js';
 import { transcribe, configure as configureAsr, currentBackend } from './asr.js';
 import { installApprovalBridge } from './approval-bridge.js';
@@ -319,8 +320,15 @@ export function apply(ctx, config) {
     const def = readSection('agent-default-model');
     const list = [];
 
-    // ① 自定义 provider（llm-pi-ai.providers.*）—— 与 sync-from-web.mjs:232 同构
-    const providers = readSection('llm-pi-ai')?.providers ?? {};
+    // ① 自定义 provider（llm-pi-ai.providers.*）
+    //    ⚠️ 来源优先级（2026-09-30 定案）：**先读 web 端 patch 文件**，再退回 settings 服务。
+    //    原因：patch 按 profile 隔离（`dsh-app-boot/lib/index.js:946,1141`
+    //    `patchPath = join(dir, PROFILE_PATCH_FILENAME)`），插件跑在 bot profile 里，
+    //    `settings` 服务读不到 web profile 那份；而别人机器上没有 `sync-from-web.mjs`
+    //    去复制一份到 bot profile —— 只问 settings 的话，菜单会是**空的**。
+    //    本机之所以看不出来，正是因为 sync 脚本帮着复制了一份。
+    const fromWebPatch = readWebLlmPiAi();
+    const providers = fromWebPatch ?? readSection('llm-pi-ai')?.providers ?? {};
     for (const [pid, p] of Object.entries(providers)) {
       const models = (Array.isArray(p?.models) ? p.models : []).filter((m) => m?.id);
       if (models.length === 0) continue;
