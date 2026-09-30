@@ -28,6 +28,7 @@
 2. 填 token（把下面引号里那串先换成 @BotFather 发你的，再整段贴进终端）：
 
    ```
+   mkdir -p ~/.dsh/profiles/mybot
    cat > ~/.dsh/profiles/mybot/cordis.patch.yml <<'EOF'
    - id: botplugin
      config:
