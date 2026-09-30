@@ -1,8 +1,8 @@
 /**
  * asr.js —— 语音转文字后端分派层。
  *
- * 可执行文件路径全部走 options（构造时传入），不写死：
- * 没配时收到语音会给「请设置 xxx」的可操作报错，而不是 ENOENT。
+ * 可执行文件路径走 options（构造时传入）；没配就按 Homebrew 默认位置找。
+ * 本机压根没装引擎时回「一条能直接粘的安装命令」，而不是 ENOENT。
  *
  * 两个后端：
  *   · whisper     —— openai-whisper CLI（默认）
@@ -14,6 +14,7 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 
@@ -56,6 +57,78 @@ export function asrConfig() {
 /** 当前后端名。 */
 export function currentBackend() {
   return opts.backend === 'sensevoice' ? 'sensevoice' : 'whisper';
+}
+
+// ---------------------------------------------------------------------------
+// 本机有没有语音引擎（没装 → 回安装命令，⛔ 绝不自动装）
+// ---------------------------------------------------------------------------
+
+/** Homebrew 默认位置：用户没配路径时先按它找。 */
+const DEFAULT_WHISPER_BIN = '/opt/homebrew/bin/whisper';
+const DEFAULT_PYTHON_BIN = '/opt/homebrew/bin/python3.11';
+
+/** 本地语音引擎的安装指令（阿里 FunASR SenseVoice-Small，离线跑、中文准）。 */
+export const VOICE_INSTALL_COMMAND =
+  'brew install python@3.11 ffmpeg && /opt/homebrew/bin/python3.11 -m pip install -U funasr modelscope torch torchaudio soundfile';
+
+/**
+ * 本机没装引擎时回给用户的话。
+ * ⛔ 只给命令，不替用户装 —— 装什么、占多少磁盘是用户自己的事。
+ */
+export function voiceEngineMissingMessage() {
+  return [
+    '🎙 本机还没装语音转文字引擎（阿里 FunASR · SenseVoice，离线跑、中文准）。',
+    '装好就能听语音，复制这一条（需要 Homebrew）：',
+    '',
+    VOICE_INSTALL_COMMAND,
+    '',
+    '（≈900MB 模型首次转写时自动下载；装完直接发语音，不用改配置。）',
+  ].join('\n');
+}
+
+/** 路径存在吗（不存在返回 false，不抛）。 */
+function exists(p) {
+  if (!p) return false;
+  try {
+    return fs.existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
+let pythonEngineOk; // undefined = 还没探过
+/** python 里有没有 funasr（只探一次，结果缓存 —— import funasr 要几秒）。 */
+function pythonHasFunasr(bin) {
+  if (pythonEngineOk !== undefined) return pythonEngineOk;
+  try {
+    execFileSync(bin, ['-c', 'import funasr'], { timeout: 60_000, stdio: 'ignore' });
+    pythonEngineOk = true;
+  } catch {
+    pythonEngineOk = false;
+  }
+  return pythonEngineOk;
+}
+
+/**
+ * 定这次用哪个引擎、哪个可执行文件。
+ * 用户配了的优先 → 本机默认位置 → 都没有返回 null（= 该提示装）。
+ * 配的后端不可用时会自己换用另一个（装了哪个就用哪个）。
+ */
+function resolveEngine() {
+  const whisperBin = opts.whisperBin && exists(opts.whisperBin)
+    ? opts.whisperBin
+    : (exists(DEFAULT_WHISPER_BIN) ? DEFAULT_WHISPER_BIN : null);
+  const pythonBin = opts.pythonBin && exists(opts.pythonBin)
+    ? opts.pythonBin
+    : (exists(DEFAULT_PYTHON_BIN) ? DEFAULT_PYTHON_BIN : null);
+
+  const senseVoice = () =>
+    (pythonBin && pythonHasFunasr(pythonBin) ? { backend: 'sensevoice', bin: pythonBin } : null);
+
+  if (currentBackend() === 'sensevoice') {
+    return senseVoice() || (whisperBin ? { backend: 'whisper', bin: whisperBin } : null);
+  }
+  return whisperBin ? { backend: 'whisper', bin: whisperBin } : senseVoice();
 }
 
 /**
@@ -205,23 +278,17 @@ function transcribeViaKeepalive(wavPath) {
 // 两个后端
 // ---------------------------------------------------------------------------
 
-/** 缺可执行文件时的报错必须可操作 —— ENOENT 对用户等于没说。 */
-function requireBin(which) {
-  const bin = which === 'whisper' ? opts.whisperBin : opts.pythonBin;
-  if (!bin) {
-    throw new Error(
-      which === 'whisper'
-        ? '语音转文字没配：请设置 asrWhisperBin（whisper 可执行文件路径）'
-        : '语音转文字没配：请设置 asrPythonBin（python 解释器路径）',
-    );
-  }
-  return bin;
+/** 本机没引擎时的报错：带 code，上层据此把「安装命令」原样回给用户。 */
+function voiceEngineMissingError() {
+  const err = new Error(voiceEngineMissingMessage());
+  err.code = 'VOICE_ENGINE_MISSING';
+  return err;
 }
 
 /** openai-whisper CLI（--model base / txt / /tmp）。 */
-function transcribeWithWhisper(wavPath) {
+function transcribeWithWhisper(wavPath, bin) {
   return execFileSync(
-    requireBin('whisper'),
+    bin,
     [wavPath, '--model', 'base', '--output_format', 'txt', '--output_dir', '/tmp'],
     { timeout: opts.timeoutMs, maxBuffer: 10 * 1024 * 1024 },
   ).toString().trim();
@@ -233,7 +300,7 @@ function transcribeWithWhisper(wavPath) {
  * 走内联 python 脚本：避免多维护一个 .py 文件，也避免 shell 引号转义问题
  * （路径通过 argv 传入）。模型权重首次运行时由 modelscope 自动下载并缓存。
  */
-function transcribeWithSenseVoice(wavPath) {
+function transcribeWithSenseVoice(wavPath, bin) {
   const script = `
 import sys
 from funasr import AutoModel
@@ -259,7 +326,7 @@ print("${SENTINEL}")
 print(res[0].get("text", ""))
 `;
 
-  const out = execFileSync(requireBin('python'), ['-c', script, wavPath], {
+  const out = execFileSync(bin, ['-c', script, wavPath], {
     timeout: opts.sensevoiceTimeoutMs, // 首次需下载权重 + CPU 推理，放宽到 5 分钟
     maxBuffer: 10 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -303,6 +370,9 @@ export async function transcribe(wavPath) {
     }
   }
 
-  if (backend === 'sensevoice') return transcribeWithSenseVoice(wavPath);
-  return transcribeWithWhisper(wavPath);
+  // 本机没装引擎 → 抛出带 code 的错，上层把「安装命令」原样回给用户（⛔ 不自动装）。
+  const engine = resolveEngine();
+  if (!engine) throw voiceEngineMissingError();
+  if (engine.backend === 'sensevoice') return transcribeWithSenseVoice(wavPath, engine.bin);
+  return transcribeWithWhisper(wavPath, engine.bin);
 }

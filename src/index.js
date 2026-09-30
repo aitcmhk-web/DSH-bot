@@ -1154,7 +1154,11 @@ export function apply(ctx, config) {
         await unlink(wav).catch(() => {});
       } catch (err) {
         error(`语音转写失败: ${err.message}`);
-        await telegram.sendMessage(chatId, `❌ 语音转文字失败：${err.message}`);
+        // 本机没装本地语音引擎（whisper / FunASR）→ 把安装命令回给用户，不是让人去改配置。
+        await telegram.sendMessage(
+          chatId,
+          err?.code === 'VOICE_ENGINE_MISSING' ? err.message : `❌ 语音转文字失败：${err.message}`,
+        );
         return;
       }
       if (!text) {
