@@ -1282,22 +1282,35 @@ export function apply(ctx, config) {
    *   ② 原始命令行：把本进程的 node + 脚本 + 参数原样交给 helper nohup 拉起（尽力而为，
    *      宿主原先是终端窗口的话，那个窗口会结束、bot 转后台）。
    */
-  // 找启动器：setupbot 给每个工作区生成的是英文名「start.command」
-  // （2026-10-01 起；以前是「启动-<工作区名>.command」/「启动.command」，老工作区还留着，继续认）。
+  // 找启动器：跨平台兼容。
+  // macOS：setupbot 生成 start.command（双击弹终端窗口），也兼容老的 启动-* 前缀。
+  // Linux：setupbot 生成 start.sh（nohup 后台拉起），也兼容 -start.sh 后缀。
   function findLauncher(cwd) {
-    const legacy = ['start.command', '启动-mybot.command', '启动.command']
+    // macOS .command 文件
+    const macLegacy = ['start.command', '启动-mybot.command', '启动.command']
       .map((n) => join(cwd, n))
       .find((p) => existsSync(p));
-    if (legacy) return legacy;
+    if (macLegacy) return macLegacy;
     try {
-      const hit = readdirSync(cwd)
+      const macHit = readdirSync(cwd)
         .filter((n) => n.startsWith('启动-') && n.endsWith('.command'))
         .sort()[0];
-      if (hit) return join(cwd, hit);
-    } catch {
-      // 目录读不了（不存在 / 没权限）就当没有启动器
-    }
-    return join(cwd, 'start.command');
+      if (macHit) return join(cwd, macHit);
+    } catch { /* 目录读不了 */ }
+
+    // Linux .sh 文件
+    const linuxLauncher = ['start.sh'].map((n) => join(cwd, n)).find((p) => existsSync(p));
+    if (linuxLauncher) return linuxLauncher;
+    try {
+      const linuxHit = readdirSync(cwd)
+        .filter((n) => n === 'start.sh' || n.endsWith('-start.sh'))
+        .sort()[0];
+      if (linuxHit) return join(cwd, linuxHit);
+    } catch { /* 目录读不了 */ }
+
+    // fallback：优先返回 .command（macOS 用户），没有则返回 null（Linux 走 nohup 路径）
+    const fallback = join(cwd, 'start.command');
+    return existsSync(fallback) ? fallback : null;
   }
 
   function restartPlanEnv() {
@@ -1517,7 +1530,8 @@ export function apply(ctx, config) {
         const helper = join(dirname(fileURLToPath(import.meta.url)), '..', 'restart-helper.sh');
         const planEnv = restartPlanEnv();
         if (existsSync(helper) && planEnv) {
-          const child = spawn('/bin/bash', [helper], {
+          const bashPath = (() => { try { return execFileSync('which', ['bash'], { timeout: 3000 }).toString().trim(); } catch { return '/bin/sh'; } })();
+          const child = spawn(bashPath, [helper], {
             detached: true,
             stdio: 'ignore',
             env: { ...process.env, ...planEnv },

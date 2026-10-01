@@ -63,9 +63,44 @@ export function currentBackend() {
 // 本机有没有语音引擎（没装 → 回安装命令，⛔ 绝不自动装）
 // ---------------------------------------------------------------------------
 
-/** Homebrew 默认位置：用户没配路径时先按它找。 */
-const DEFAULT_WHISPER_BIN = '/opt/homebrew/bin/whisper';
-const DEFAULT_PYTHON_BIN = '/opt/homebrew/bin/python3.11';
+/** 环境变量覆盖：用户指定 whisper/python 路径时优先用。 */
+const ENV_WHISPER_BIN = process.env.ASR_WHISPER_PATH;
+const ENV_PYTHON_BIN = process.env.ASR_PYTHON_PATH;
+
+/** Homebrew 默认位置（macOS Apple Silicon）。 */
+const HOMEBREW_WHISPER = '/opt/homebrew/bin/whisper';
+const HOMEBREW_PYTHON = '/opt/homebrew/bin/python3.11';
+
+/** Linux 常见位置。 */
+const LINUX_PYTHON = ['/usr/bin/python3', '/usr/local/bin/python3'];
+
+/** CLI which 探测一个可执行文件。 */
+function whichBin(name) {
+  try {
+    const out = execFileSync('which', [name], { timeout: 3000 });
+    const p = out.toString().trim();
+    return p && existsSync(p) ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 找 python：配置 > 环境变量 > Homebrew > Linux 常见路径 > which。 */
+function findPython() {
+  if (opts.pythonBin && exists(opts.pythonBin)) return opts.pythonBin;
+  if (ENV_PYTHON_BIN && exists(ENV_PYTHON_BIN)) return ENV_PYTHON_BIN;
+  if (exists(HOMEBREW_PYTHON)) return HOMEBREW_PYTHON;
+  for (const p of LINUX_PYTHON) { if (exists(p)) return p; }
+  return whichBin('python3') || whichBin('python');
+}
+
+/** 找 whisper：配置 > 环境变量 > Homebrew > which。 */
+function findWhisper() {
+  if (opts.whisperBin && exists(opts.whisperBin)) return opts.whisperBin;
+  if (ENV_WHISPER_BIN && exists(ENV_WHISPER_BIN)) return ENV_WHISPER_BIN;
+  if (exists(HOMEBREW_WHISPER)) return HOMEBREW_WHISPER;
+  return whichBin('whisper');
+}
 
 /** 本地语音引擎的安装指令（阿里 FunASR SenseVoice-Small，离线跑、中文准）。 */
 export const VOICE_INSTALL_COMMAND =
@@ -111,19 +146,15 @@ function pythonHasFunasr(bin) {
 
 /**
  * 定这次用哪个引擎、哪个可执行文件。
- * 配了的路径优先 → 本机 Homebrew 默认位置；都没有返回 null（= 该提示装）。
+ * 优先级：配置 > 环境变量 > Homebrew (macOS) > Linux 常见路径 > CLI which。
  * ⛔ 不做跨后端自动顶替：默认就是 SenseVoice，本机没装它 → 提示装，
  *    不悄悄退回中文识别很差的 whisper（要用 whisper 得显式配 asrBackend）。
  */
 function resolveEngine() {
-  const pythonBin = opts.pythonBin && exists(opts.pythonBin)
-    ? opts.pythonBin
-    : (exists(DEFAULT_PYTHON_BIN) ? DEFAULT_PYTHON_BIN : null);
+  const pythonBin = findPython();
 
   if (currentBackend() === 'whisper') {
-    const whisperBin = opts.whisperBin && exists(opts.whisperBin)
-      ? opts.whisperBin
-      : (exists(DEFAULT_WHISPER_BIN) ? DEFAULT_WHISPER_BIN : null);
+    const whisperBin = findWhisper();
     return whisperBin ? { backend: 'whisper', bin: whisperBin } : null;
   }
 

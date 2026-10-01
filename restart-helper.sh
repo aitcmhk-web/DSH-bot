@@ -135,10 +135,15 @@ if [ -n "${RESTART_SUPERVISED:-}" ]; then
 fi
 
 # 拉起新宿主：优先启动器（macOS `open` 会开一个新的终端窗口，用户看得见）；
-# 没有启动器就按原始命令行 nohup 后台拉起（日志进 RESTART_LOG）。
+# Linux 没有 `open`，直接走 nohup 路径。
 if [ -n "$LAUNCHER" ] && [ -f "$LAUNCHER" ] && command -v open >/dev/null 2>&1; then
   log "通过启动器拉起：open $LAUNCHER"
   open "$LAUNCHER"
+elif [ -n "$LAUNCHER" ] && [ -f "$LAUNCHER" ]; then
+  # macOS 以外的平台：启动器存在但没有 open → 执行它
+  log "通过启动器拉起：$LAUNCHER"
+  cd "$(dirname "$LAUNCHER")" 2>/dev/null || { log "❌ cd $(dirname "$LAUNCHER") 失败"; exit 1; }
+  "$LAUNCHER" >> "$LOG" 2>&1 &
 else
   if [ -z "${RESTART_SCRIPT:-}" ]; then
     log "❌ 没有启动器也没有原始命令行，无法拉起 —— 宿主已停，请手动启动"
