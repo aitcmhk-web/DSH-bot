@@ -972,11 +972,16 @@ export function apply(ctx, config) {
     const body = answer.text || '(本轮没有文字输出)';
     // 流水账记**不带小尾巴**的回答原文（老 bot 同口径：速度尾巴是采样元数据，不是对话）。
     memory?.ledgerRecord('assistant', body, chatKey);
+
+    // 广播回答到所有端点（除了发起端）
+    await hub.outbound(body, { exclude: msg.source, label: 'DSH 输出' });
+
     // 收尾交付：TG 由 status.finish 把回答（含速度小尾巴）**编辑进占位消息**（返回 null）；
     // 微信由 status 取消「正在输入」并返回小尾巴，回答照常走端点发送、小尾巴拼在后面。
     const tail = status ? await status.finish(body) : null;
     if (!(status && msg.source === 'tg')) {
-      const outText = tail ? `${body}\n\n${tail}` : body;
+      const prefix = msg.source === 'tg' ? '[DSH][TG] ' : '[DSH][WX] ';
+      const outText = tail ? `${prefix}${body}\n\n${tail}` : `${prefix}${body}`;
       await ep.send({ text: outText }).catch((err) => error(`发送失败（${chatKey}）: ${err?.message}`));
     }
     return { ok: true };
