@@ -216,7 +216,7 @@ ensure_dsh() {
 # ⚠️ 分工（2026-10-01 用户指出）：升级是频繁动作，绑 TG / 微信用的少。
 #    所以插件升级放在这儿 —— 敲一次 setupdsh 就连插件一起升，不必再走绑定那套问答。
 #    建工作区 / 首次装插件 / 重绑，仍然在 setupbot 里。
-SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v0.0.41}"
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v0.0.41b}"
 # ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
 #    ⛔ 绝不拿日期或路径冒充版本号（2026-10-01 用户骂过）。
 plugin_version() {
