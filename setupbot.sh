@@ -325,7 +325,8 @@ install_plugin() {
   else
     say "给工作区 ${PROFILE} 装插件…（一两分钟）"
   fi
-  ( cd "$HOME" && "$DSHBIN" plugin --profile "$PROFILE" add "$SPEC" ) || die "插件没装上，看上面的报错。"
+  # ⚠️ Ubuntu 可能没有 GitHub SSH key：把 git+ssh:// 重定向到 https://
+  ( cd "$HOME" && git config --global url."https://github.com/".insteadOf git@github.com: && "$DSHBIN" plugin --profile "$PROFILE" add "$SPEC" ) || die "插件没装上，看上面的报错。"
   NEW_VER="$(plugin_version "$PLUGDIR")"
   if [ -n "$OLD_VER" ] && [ -n "$NEW_VER" ] && [ "$OLD_VER" != "$NEW_VER" ]; then
     say "✅ 插件：${OLD_VER} → ${NEW_VER}"
