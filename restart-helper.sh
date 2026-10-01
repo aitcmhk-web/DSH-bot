@@ -134,25 +134,20 @@ if [ -n "${RESTART_SUPERVISED:-}" ]; then
   exit 0
 fi
 
-# 拉起新宿主：优先启动器（macOS `open` 会开一个新的终端窗口，用户看得见）；
-# Linux 没有 `open`，直接走 nohup 路径。
-if [ -n "$LAUNCHER" ] && [ -f "$LAUNCHER" ] && command -v open >/dev/null 2>&1; then
-  log "通过启动器拉起：open $LAUNCHER"
-  open "$LAUNCHER"
-elif [ -n "$LAUNCHER" ] && [ -f "$LAUNCHER" ]; then
-  # macOS 以外的平台：启动器存在但没有 open → 执行它
-  log "通过启动器拉起：$LAUNCHER"
+# 拉起新宿主：macOS .command 文件用 open 会弹终端窗口，改为 nohup 后台拉起（不弹窗）；
+# Linux .sh 或原始命令行走 nohup 路径。
+if [ -n "$LAUNCHER" ] && [ -f "$LAUNCHER" ]; then
+  log "nohup 拉起启动器：$LAUNCHER"
   cd "$(dirname "$LAUNCHER")" 2>/dev/null || { log "❌ cd $(dirname "$LAUNCHER") 失败"; exit 1; }
-  "$LAUNCHER" >> "$LOG" 2>&1 &
-else
-  if [ -z "${RESTART_SCRIPT:-}" ]; then
-    log "❌ 没有启动器也没有原始命令行，无法拉起 —— 宿主已停，请手动启动"
-    exit 1
-  fi
+  nohup "$LAUNCHER" >> "$LOG" 2>&1 &
+elif [ -n "${RESTART_SCRIPT:-}" ]; then
   cd "${RESTART_CWD:-$PWD}" 2>/dev/null || { log "❌ cd ${RESTART_CWD:-?} 失败"; exit 1; }
   log "nohup 拉起：${RESTART_NODE:-node} ${RESTART_SCRIPT} ${RESTART_ARGS:-}"
   nohup "${RESTART_NODE:-node}" "$RESTART_SCRIPT" ${RESTART_ARGS:-} >> "$LOG" 2>&1 &
   log "已后台拉起（pid=$!）—— 若宿主原先是终端窗口里跑的，那个窗口已结束，bot 现在在后台"
+else
+  log "❌ 没有启动器也没有原始命令行，无法拉起 —— 宿主已停，请手动启动"
+  exit 1
 fi
 
 sleep 3
