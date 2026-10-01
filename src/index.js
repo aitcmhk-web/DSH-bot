@@ -979,11 +979,15 @@ export function apply(ctx, config) {
             if (retryAnswer.ok) {
               const retryBody = retryAnswer.text || '(本轮没有文字输出)';
               memory?.ledgerRecord('assistant', retryBody, chatKey);
-              const retryTail = status ? await status.finish(retryBody) : null;
+              // TG 端交付带 [DSH] 前缀
+              const retryDeliver = msg.source === 'tg' ? '[DSH] ' + retryBody : retryBody;
+              const retryTail = status ? await status.finish(retryDeliver) : null;
               if (!(status && msg.source === 'tg')) {
                 const outText = retryTail ? `${retryBody}\n\n${retryTail}` : retryBody;
                 await ep.send({ text: outText }).catch((err) => error(`发送失败（${chatKey}）: ${err?.message}`));
               }
+              // 广播到所有端点
+              await hub.outbound(`[DSH] ${retryBody}`, { exclude: msg.source, label: 'DSH 输出' });
               return { ok: true };
             }
             await status?.fail(retryAnswer.error);
@@ -1003,9 +1007,18 @@ export function apply(ctx, config) {
     // 流水账记**不带小尾巴**的回答原文（老 bot 同口径：速度尾巴是采样元数据，不是对话）。
     memory?.ledgerRecord('assistant', body, chatKey);
 
+    // TG 端交付需要带 [DSH] 前缀（与主程序 bot.js:1143 对齐）：
+    // status.finish() 把回答编辑进 TG 占位消息，必须带前缀；
+    // 微信端不走 ep.send() 时也会收到无前缀的 body，但微信有自己的广播路径。
+    const prefixReply = (text) => {
+      const t = String(text ?? '').trim();
+      return t ? '[DSH] ' + t : t;
+    };
+    const deliverBody = msg.source === 'tg' ? prefixReply(body) : body;
+
     // 收尾交付：TG 由 status.finish 把回答（含速度小尾巴）**编辑进占位消息**（返回 null）；
     // 微信由 status 取消「正在输入」并返回小尾巴，回答照常走端点发送、小尾巴拼在后面。
-    const tail = status ? await status.finish(body) : null;
+    const tail = status ? await status.finish(deliverBody) : null;
     if (!(status && msg.source === 'tg')) {
       const outText = tail ? `${body}\n\n${tail}` : body;
       await ep.send({ text: outText }).catch((err) => error(`发送失败（${chatKey}）: ${err?.message}`));
@@ -1292,15 +1305,14 @@ export function apply(ctx, config) {
     const launcher = config.restartCommand || findLauncher(cwd);
     const hasLauncher = Boolean(launcher) && existsSync(launcher);
     const [, scriptPath, ...extraArgs] = process.argv;
-    // 托管者检测：systemd 给每个 unit 进程注入 INVOCATION_ID；launchd 注入 XPC_SERVICE_NAME。
-    // ⚠️ 被托管时**绝不能**再 nohup 拉一份：托管者自己会把新实例拉起来，
-    //    两份会抢同一个 bot token → 409，而 409 只让其中一份停轮询、进程不退，
-    //    表现就是「机器人静默变哑、systemd 还显示 running」。
-    const supervisor = process.env.INVOCATION_ID
-      ? 'systemd'
-      : process.env.XPC_SERVICE_NAME
-        ? 'launchd'
-        : null;
+    // systemd 注入 INVOCATION_ID；systemd 的 cgroup 管理能可靠地重启进程，
+    // 所以 systemd 托管时可以安全走 RESTART_SUPERVISED（只杀宿主、不自己拉）。
+    //
+    // ⚠️ launchd 例外：bot.sh daemon 用 exec node bot.js，exit 0 时
+    // plist 的 SuccessfulExit=false 判定为"正常退出"→ 不重拉。
+    // 如果走 RESTART_SUPERVISED 路径，helper 只杀进程等 launchd 拉起 → 永远等不到。
+    // 所以 launchd 必须走 hasLauncher / 原始命令行路径，让 helper 自己 nohup 拉起。
+    const supervisor = process.env.INVOCATION_ID ? 'systemd' : null;
     if (!hasLauncher && !scriptPath && !supervisor) return null;
     return {
       RESTART_DELAY_SECONDS: '8',
