@@ -147,3 +147,30 @@ export function readWebLlmPiAi() {
     return null;
   }
 }
+
+/**
+ * 读 web 端 patch 里的 `llm-deepseek` 段（models + reasoningEffort）。
+ *
+ * ⚠️ 为什么内置 deepseek 也要先看 web 那份（2026-10-01 定案）：
+ *   插件的 deepseek 档位原先只读**自己 profile** 的 `llm-deepseek`，于是 bot 菜单
+ *   与 web 端对不上 —— web 端只声明 `deepseek-flash`，bot profile 自己声明了三档
+ *   （flash / v4-flash / v4-pro），菜单就多出两条，用户要的「网页端有什么就有什么」
+ *   落空。菜单口径 = web 端口径，所以这里跟 pi-ai 一样先读 web 那份。
+ *   读不到、或那段没声明 `models` → 返回 null，调用方退回自己 profile 的 settings。
+ */
+export function readWebLlmDeepseek() {
+  try {
+    const p = webPatchPath();
+    if (!existsSync(p)) return null;
+    const doc = parseYaml(readFileSync(p, 'utf8'));
+    const entries = Array.isArray(doc) ? doc : [];
+    const entry = entries.find((e) => e?.id === 'llm-deepseek');
+    const config = entry?.config;
+    if (!config || typeof config !== 'object') return null;
+    // 只有真的声明了 models 才认 —— 只写 reasoningEffort 的段不算「声明了目录」。
+    if (!Array.isArray(config.models) || config.models.length === 0) return null;
+    return config;
+  } catch {
+    return null;
+  }
+}

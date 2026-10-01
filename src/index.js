@@ -31,7 +31,7 @@ import { Memory } from './memory.js';
 import { BotRuntime } from './runtime.js';
 import { Hub, makeMessage, markAsHubOutput } from './hub.js';
 import { buildRoutes, routeByKey, routeFor, describeRoute, isRouteFailure, reasoningEffortFor } from './models.js';
-import { readWebLlmPiAi, webPatchPath } from './web-patch.js';
+import { readWebLlmPiAi, readWebLlmDeepseek, webPatchPath } from './web-patch.js';
 import { LiveStatus, describeTool } from './status.js';
 import { transcribe, configure as configureAsr, currentBackend } from './asr.js';
 import { installApprovalBridge } from './approval-bridge.js';
@@ -443,9 +443,12 @@ export function apply(ctx, config) {
     }
 
     // ② 内置 deepseek（llm-deepseek）。
-    //    web 端通常不声明 models；声明了以声明为准，否则向 llm 服务查动态目录
-    //    （sync 脚本是从插件源码读 DEFAULT_MODELS，进程内直接调 listModels 更准）。
-    const dsSection = readSection('llm-deepseek') ?? {};
+    //    ⚠️ 来源优先级与 ① 完全一致（2026-10-01 定案）：**先读 web 端 patch 文件**，
+    //    再退回自己 profile 的 settings。原先这里只读自己那份，于是 bot 菜单的
+    //    deepseek 档比 web 端多（web 端只声明 1 档，bot profile 自己声明 3 档 →
+    //    菜单凭空多两条），用户看到的「菜单多了」就是这么来的。
+    //    web 端那段没声明 models 时才向 llm 服务查动态目录，最后才是空。
+    const dsSection = readWebLlmDeepseek() ?? readSection('llm-deepseek') ?? {};
     const declared = (Array.isArray(dsSection.models) ? dsSection.models : []).filter((m) => m?.id);
     let dsModels = declared;
     if (dsModels.length === 0 && llm?.listModels) {
