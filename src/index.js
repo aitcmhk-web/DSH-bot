@@ -984,7 +984,7 @@ export function apply(ctx, config) {
               const retryTail = status ? await status.finish(retryDeliver) : null;
               if (!(status && msg.source === 'tg')) {
                 const outText = retryTail ? `${retryBody}\n\n${retryTail}` : retryBody;
-                await ep.send({ text: outText }).catch((err) => error(`发送失败（${chatKey}）: ${err?.message}`));
+                await ep.send({ text: prefixReply(outText) }).catch((err) => error(`发送失败（${chatKey}）: ${err?.message}`));
               }
               // 广播到所有端点
               await hub.outbound(`[DSH] ${retryBody}`, { exclude: msg.source, label: 'DSH 输出' });
@@ -1021,7 +1021,7 @@ export function apply(ctx, config) {
     const tail = status ? await status.finish(deliverBody) : null;
     if (!(status && msg.source === 'tg')) {
       const outText = tail ? `${body}\n\n${tail}` : body;
-      await ep.send({ text: outText }).catch((err) => error(`发送失败（${chatKey}）: ${err?.message}`));
+      await ep.send({ text: prefixReply(outText) }).catch((err) => error(`发送失败（${chatKey}）: ${err?.message}`));
     }
 
     // 广播回答到所有端点（DSH → 节点 → 所有端点）
