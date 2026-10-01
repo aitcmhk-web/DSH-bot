@@ -267,7 +267,7 @@ upgrade_plugins() {
     else
       say "⚠️ 工作区 ${PROF} 的插件没升成（大概是没网），现在还是：${OLDV:-?}"
     fi
-    # 恢复备份的 lockfile（让 pnpm 下次正常解析）
+    # 升级插件时删掉 lockfile 让它重新解析，⛔ 不恢复——否则旧 lockfile 会把版本锁死在老 commit。
     if [ -f "${LOCKFILE}.setupdsh-bak" ]; then mv "${LOCKFILE}.setupdsh-bak" "$LOCKFILE"; fi
   done < "$PLUGLIST_FILE"
   rm -f "$PLUGLIST_FILE" 2>/dev/null || true
