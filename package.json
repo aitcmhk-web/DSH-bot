@@ -1,4 +1,5 @@
 {
+  // ⛔ 每次改插件代码必须升版本号！改了 src/、脚本、配置就跟着升，commit message 带版本号，推送后打 tag。
   "name": "dsh-botplugin",
   "version": "0.0.38",
   "description": "Telegram and WeChat bridges plus handoff continuity for DeepSeek Harness (DSH)",
