@@ -253,6 +253,14 @@ upgrade_plugins() {
     [ -n "$PD" ] || continue
     PROF="$(basename "$(dirname "$(dirname "$PD")")")"
     OLDV="$(plugin_version "$PD")"
+    # 先更新 package.json 里的依赖声明为最新 tag（否则 pnpm 看到同 tag 就报 Already up to date）
+    PKG_JSON="$PD/package.json"
+    if [ -f "$PKG_JSON" ]; then
+      NEWTAG="${SPEC#*#}"
+      if printf '%s' "$NEWTAG" | grep -q '^v[0-9]'; then
+        sed -i '' "s|github:aitcmhk-web/DSH-bot#[^\"[:space:]]*|github:aitcmhk-web/DSH-bot#${NEWTAG}|g" "$PKG_JSON" 2>/dev/null || true
+      fi
+    fi
     # pnpm lockfile 会让同仓库的 add 报 "Already up to date"；先删掉让它重新解析。
     LOCKFILE="$PD/pnpm-lock.yaml"
     if [ -f "$LOCKFILE" ]; then mv "$LOCKFILE" "${LOCKFILE}.setupdsh-bak"; fi
