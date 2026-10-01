@@ -1702,8 +1702,9 @@ export function apply(ctx, config) {
     telegram
       .setMyCommands([
         { command: 'new', description: '开启新会话' },
-        { command: 'restart', description: '重启 bot 加载新代码' },
         { command: 'model', description: '切换模型' },
+        { command: 'restart', description: '重启 bot 加载新代码' },
+        { command: 'setupdsh', description: '升级 DSH&BOT' },
         { command: 'status', description: '查看当前状态' },
         { command: 'whoami', description: '查看我的用户 ID' },
         { command: 'help', description: '显示帮助' },
