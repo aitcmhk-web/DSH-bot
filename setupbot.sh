@@ -4,13 +4,13 @@
 # setupbot-self-marker（别删这行：脚本靠它认出「我自己」，避免把别的文件当自己复制）
 #
 # 给用户的命令（第一次跑一次，之后只要敲 setupbot）：
-#   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh | zsh
+#   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh | sh
 #
 # 它自己会办完：
 #   0) 把 setupbot 命令装进 PATH（以后直接敲 setupbot，可重复跑）
 #   1) 机器上没有 dsh → 自动跑一次 setupdsh 把它装上（有 dsh 就不动它，升级请自己敲 setupdsh）
 #   2) 列出已有工作区让你选编号，或直接回车新建（问你名字，直接回车就叫 mybot）
-#      （想直接指定：zsh setupbot.sh 你的工作区名）
+#      （想直接指定：sh setupbot.sh 你的工作区名）
 #   3) 把插件装进这个工作区（已经装过就顺手升到最新；平时的插件升级走 setupdsh）
 #   4) TG：列出这台机器上已用过的 token 让你选，或粘一个新的
 #   5) 微信：用已有的凭据、重新扫码、或先不绑
@@ -27,14 +27,14 @@
 
 set -u
 
-# ⚠️ zsh 在函数体里会把 $0 换成函数名，必须在这一层先记住脚本自己的路径
+# ⚠️ 别在函数里再取 $0：有的 shell（zsh）会把函数名塞给它，必须在最外层先记住脚本自己的路径
 SRC_PATH="$0"
-# 也支持老用法：zsh setupbot.sh 工作区名（不指定就问你）
+# 也支持老用法：sh setupbot.sh 工作区名（不指定就问你）
 ARG_PROFILE="${1:-}"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    2026-10-01 用户反馈「更新看不到提示」——跑起来先报自己是谁，才看得出手上这份是新是旧。
-SELF_VERSION="2026-10-01.5"
+SELF_VERSION="2026-10-01.6"
 
 SETUPBOT_URL="${SETUPBOT_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh}"
 SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot}"
@@ -50,7 +50,7 @@ export DSH_HOME="$DSH_HOME_DIR"
 say()  { printf '%s\n' "$*"; }
 die()  { printf '\n⛔ %s\n' "$*" >&2; exit 1; }
 
-# 问一句、读一行。⚠️ curl … | zsh 时脚本正文占着 stdin，必须从 /dev/tty 读。
+# 问一句、读一行。⚠️ curl … | sh 时脚本正文占着 stdin，必须从 /dev/tty 读。
 ask() {
   printf '%s' "$*"
   REPLY_V=""
@@ -131,8 +131,8 @@ fi
 # ============ 0. 把自己装成 setupbot 命令 ============
 install_self() {
   mkdir -p "$SELF_DIR" 2>/dev/null || return 0
-  # 有实体脚本文件（安装包里的 / 已落盘的）就复制自己；curl|zsh 手上没有实体文件，从网上留一份备用。
-  # ⚠️ curl|zsh 这条**每次都要刷本地副本**：否则启动器一旦联不上网就退回旧脚本，
+  # 有实体脚本文件（安装包里的 / 已落盘的）就复制自己；curl|sh 手上没有实体文件，从网上留一份备用。
+  # ⚠️ curl|sh 这条**每次都要刷本地副本**：否则启动器一旦联不上网就退回旧脚本，
   #    用户看到的还是老行为（2026-10-01 实测：GitHub 上已是新版，本机跑出来还是旧的）。
   if [ -f "$SRC_PATH" ] && grep -q 'setupbot-self-marker' "$SRC_PATH" 2>/dev/null; then
     cp "$SRC_PATH" "$SELF_PATH" 2>/dev/null || true
@@ -166,7 +166,7 @@ install_self() {
   mkdir -p "$BIN_DIR" 2>/dev/null || return 0
 
   {
-    printf '#!/bin/zsh\n'
+    printf '#!/bin/sh\n'
     printf '# setupbot — 自动生成。每次运行先试着从网上更新自己，没网就用本地这份。\n'
     printf 'URL="%s"\n' "$SETUPBOT_URL"
     printf '%s\n' 'SELF="$HOME/.dsh/setupbot/setupbot.sh"'
@@ -177,7 +177,7 @@ install_self() {
     printf '%s\n' '  rm -f "$SELF.new" 2>/dev/null'
     printf '%s\n' 'fi'
     printf '%s\n' '[ -s "$SELF" ] || { echo "⛔ setupbot 本体不在（可能没网）。请重跑一次安装命令。"; exit 1; }'
-    printf '%s\n' 'exec /bin/zsh "$SELF" "$@"'
+    printf '%s\n' 'exec /bin/sh "$SELF" "$@"'
   } > "$BIN_DIR/setupbot" 2>/dev/null || return 0
   chmod +x "$BIN_DIR/setupbot" 2>/dev/null || true
   SELF_BIN_DIR="$BIN_DIR"
@@ -185,9 +185,17 @@ install_self() {
   case ":${PATH}:" in
     *":${BIN_DIR}:"*) : ;;
     *)
-      if ! grep -qF "$BIN_DIR" "$HOME/.zshrc" 2>/dev/null; then
-        printf '\n# setupbot\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$HOME/.zshrc" 2>/dev/null || true
-        say "（已把 ${BIN_DIR} 写进 ~/.zshrc，新开一个终端 setupbot 就能直接敲）"
+      # ⚠️ 以前只写 ~/.zshrc —— 没装 zsh 的机器（多数 Linux 服务器）等于没写，
+      #    还会凭空造出一个 ~/.zshrc。现在只往**已经存在**的登录 rc 里加，不新建文件、不动别的配置。
+      ADDED_RC=""
+      for RC in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+        [ -f "$RC" ] || continue
+        grep -qF "$BIN_DIR" "$RC" 2>/dev/null && continue
+        printf '\n# setupbot\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$RC" 2>/dev/null || continue
+        ADDED_RC="${ADDED_RC} ${RC}"
+      done
+      if [ -n "$ADDED_RC" ]; then
+        say "（已把 ${BIN_DIR} 写进${ADDED_RC}，新开一个终端 setupbot 就能直接敲）"
       fi
       ;;
   esac
@@ -204,17 +212,17 @@ run_setupdsh() {
   HEAR_DSH="$(dirname "$SRC_PATH")/setupdsh.sh"
   if [ -f "$HEAR_DSH" ] && grep -q 'setupdsh-self-marker' "$HEAR_DSH" 2>/dev/null; then
     say "（用本机这份 setupdsh.sh）"
-    /bin/zsh "$HEAR_DSH"
+    /bin/sh "$HEAR_DSH"
     return $?
   fi
   if [ -s "$SETUPDSH_PATH" ]; then
     say "（用已装好的 setupdsh）"
-    /bin/zsh "$SETUPDSH_PATH"
+    /bin/sh "$SETUPDSH_PATH"
     return $?
   fi
   TMPD="$(mktemp -t setupdsh.XXXXXX 2>/dev/null || echo "/tmp/setupdsh.$$.sh")"
   if curl -fsSL --max-time 60 "${SETUPDSH_URL:-$SETUPDSH_URL_DEFAULT}" -o "$TMPD" 2>/dev/null && [ -s "$TMPD" ]; then
-    /bin/zsh "$TMPD"
+    /bin/sh "$TMPD"
     RC=$?
     rm -f "$TMPD" 2>/dev/null
     return $RC
@@ -228,7 +236,7 @@ ensure_dsh() {
   [ -n "$DSHBIN" ] && return 0
   say "这台机器还没装 dsh —— 先让 setupdsh 把它装上。"
   if ! run_setupdsh; then
-    die "没装成 dsh（大概是没网）。有网了先跑一次：curl -fsSL ${SETUPDSH_URL:-$SETUPDSH_URL_DEFAULT} | zsh"
+    die "没装成 dsh（大概是没网）。有网了先跑一次：curl -fsSL ${SETUPDSH_URL:-$SETUPDSH_URL_DEFAULT} | sh"
   fi
   DSHBIN="$(command -v dsh 2>/dev/null || true)"
   [ -n "$DSHBIN" ] || die "setupdsh 跑完了还是找不到 dsh 命令（重开一个终端再跑 setupbot 试试）。"

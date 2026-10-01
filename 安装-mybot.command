@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/sh
 # 双击运行 = 用安装包里自带的这份插件，走一遍完整安装流程。
 #
 # 这里什么都不实现，只负责两件事：
@@ -20,7 +20,7 @@ if [ ! -f "$SETUP" ]; then
   exit 1
 fi
 
-env BOTPLUGIN_SPEC="file:$PKGDIR/botplugin" /bin/zsh "$SETUP" "$@"
+env BOTPLUGIN_SPEC="file:$PKGDIR/botplugin" /bin/sh "$SETUP" "$@"
 RC=$?
 
 # 双击进来的窗口默认「成功就自动关掉」，那样上面的结果会一闪而过 —— 留一步等回车

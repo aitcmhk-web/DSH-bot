@@ -11,9 +11,9 @@
 ─────────────────────────────────
 【在线装（会用终端的人才需要）】
   第一条（装/升级本体，机器上没有 dsh 时先跑这条）：
-    curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh | zsh
+    curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh | sh
   第二条（建工作区 + 绑 TG / 微信）：
-    curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh | zsh
+    curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh | sh
   跑完这两条，终端里就多了 setupdsh 和 setupbot 两个词：
     setupdsh ＝ 升级（Git / Node / DSH 本体 + 已经装过机器人的工作区里的插件）
     setupbot ＝ 建工作区、首次装插件、重新绑 TG / 微信、重建那五个文件

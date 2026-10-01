@@ -4,7 +4,7 @@
 # setupdsh-self-marker（别删这行：脚本靠它认出「我自己」，避免把别的文件当自己复制）
 #
 # 给用户的命令（第一次跑一次，之后只要敲 setupdsh）：
-#   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh | zsh
+#   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh | sh
 #
 # 它自己会办完：
 #   0) 把 setupdsh 命令装进 PATH（以后直接敲 setupdsh，可重复跑）
@@ -24,12 +24,12 @@
 
 set -u
 
-# ⚠️ zsh 在函数体里会把 $0 换成函数名，必须在这一层先记住脚本自己的路径
+# ⚠️ 别在函数里再取 $0：有的 shell（zsh）会把函数名塞给它，必须在最外层先记住脚本自己的路径
 SRC_PATH="$0"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    2026-10-01 用户反馈「github 没有提示版本」——跑起来必须先报自己是谁，才看得出手上这份是新是旧。
-SELF_VERSION="2026-10-01.7"
+SELF_VERSION="2026-10-01.8"
 
 SETUPDSH_URL="${SETUPDSH_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh}"
 SELF_DIR="$HOME/.dsh/setupdsh"
@@ -42,8 +42,8 @@ die() { printf '\n⛔ %s\n' "$*" >&2; exit 1; }
 # ============ 0. 把自己装成 setupdsh 命令 ============
 install_self() {
   mkdir -p "$SELF_DIR" 2>/dev/null || return 0
-  # 有实体脚本文件（安装包里的）就复制自己；curl|zsh 手上没有实体文件，从网上留一份备用。
-  # ⚠️ curl|zsh 这条**每次都要刷本地副本**：否则启动器一旦联不上网就退回旧脚本，
+  # 有实体脚本文件（安装包里的）就复制自己；curl|sh 手上没有实体文件，从网上留一份备用。
+  # ⚠️ curl|sh 这条**每次都要刷本地副本**：否则启动器一旦联不上网就退回旧脚本，
   #    用户看到的还是老行为（2026-10-01 实测：GitHub 上已是新版，本机跑出来还是旧的）。
   if [ -f "$SRC_PATH" ] && grep -q 'setupdsh-self-marker' "$SRC_PATH" 2>/dev/null; then
     cp "$SRC_PATH" "$SELF_PATH" 2>/dev/null || true
@@ -90,7 +90,7 @@ install_self() {
   mkdir -p "$BIN_DIR" 2>/dev/null || return 0
 
   {
-    printf '#!/bin/zsh\n'
+    printf '#!/bin/sh\n'
     printf '# setupdsh — 自动生成。每次运行先试着从网上更新自己，没网就用本地这份。\n'
     printf 'URL="%s"\n' "$SETUPDSH_URL"
     printf '%s\n' 'SELF="$HOME/.dsh/setupdsh/setupdsh.sh"'
@@ -102,7 +102,7 @@ install_self() {
     printf '%s\n' '  echo "（这次没联上更新服务器，用本机存的那份 setupdsh 跑）"'
     printf '%s\n' 'fi'
     printf '%s\n' '[ -s "$SELF" ] || { echo "⛔ setupdsh 本体不在（可能没网）。请重跑一次安装命令。"; exit 1; }'
-    printf '%s\n' 'exec /bin/zsh "$SELF" "$@"'
+    printf '%s\n' 'exec /bin/sh "$SELF" "$@"'
   } > "$BIN_DIR/setupdsh" 2>/dev/null || return 0
   chmod +x "$BIN_DIR/setupdsh" 2>/dev/null || true
   SELF_BIN_DIR="$BIN_DIR"
@@ -110,9 +110,17 @@ install_self() {
   case ":${PATH}:" in
     *":${BIN_DIR}:"*) : ;;
     *)
-      if ! grep -qF "$BIN_DIR" "$HOME/.zshrc" 2>/dev/null; then
-        printf '\n# setupdsh\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$HOME/.zshrc" 2>/dev/null || true
-        say "（已把 ${BIN_DIR} 写进 ~/.zshrc，新开一个终端 setupdsh 就能直接敲）"
+      # ⚠️ 以前只写 ~/.zshrc —— 没装 zsh 的机器（多数 Linux 服务器）等于没写，
+      #    还会凭空造出一个 ~/.zshrc。现在只往**已经存在**的登录 rc 里加，不新建文件、不动别的配置。
+      ADDED_RC=""
+      for RC in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+        [ -f "$RC" ] || continue
+        grep -qF "$BIN_DIR" "$RC" 2>/dev/null && continue
+        printf '\n# setupdsh\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$RC" 2>/dev/null || continue
+        ADDED_RC="${ADDED_RC} ${RC}"
+      done
+      if [ -n "$ADDED_RC" ]; then
+        say "（已把 ${BIN_DIR} 写进${ADDED_RC}，新开一个终端 setupdsh 就能直接敲）"
       fi
       ;;
   esac
@@ -219,7 +227,7 @@ ensure_dsh() {
 # ⚠️ 这里写死的 tag 必须是**本次发布自己的 tag**（发新版本时同步改，别漏）。
 #    走 TG 菜单那条路会先上网拉最新这份脚本再跑，所以实际生效的永远是网上最新的 tag；
 #    没网时才退回包里这份 —— 那时它也只能装这个 tag。
-SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v0.0.45}"
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.0}"
 # ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
 #    ⛔ 绝不拿日期或路径冒充版本号（2026-10-01 用户骂过）。
 plugin_version() {
@@ -234,8 +242,8 @@ upgrade_plugins() {
     say "（跳过了插件升级：SETUPDSH_SKIP_UPGRADE=1）"
     return 0
   fi
-  # ⚠️ 不能用 `for X in $(find …)`：zsh（curl|zsh 那条路）不做单词切分，
-  #    多行结果会被当成一个路径，多个工作区时静默出错。改成 while read 逐行读，sh / zsh 都稳。
+  # ⚠️ 不能用 `for X in $(find …)`：路径里有空格会被拆开，多行结果还会被当成一个路径，
+  #    多个工作区时静默出错。改成 while read 逐行读，sh / zsh 都稳。
   PLUGLIST="$(find "${DSH_HOME:-$HOME/.dsh}/profiles" -maxdepth 4 \( -type d -o -type l \) -name dsh-botplugin 2>/dev/null || true)"
   if [ -z "$PLUGLIST" ]; then
     say ""
@@ -261,7 +269,11 @@ upgrade_plugins() {
     if [ -f "$PKG_JSON" ]; then
       NEWTAG="${SPEC#*#}"
       if printf '%s' "$NEWTAG" | grep -q '^v[0-9]'; then
-        sed -i '' "s|github:aitcmhk-web/DSH-bot#[^\"[:space:]]*|github:aitcmhk-web/DSH-bot#${NEWTAG}|g" "$PKG_JSON" 2>/dev/null || true
+        # ⚠️ 不用 `sed -i ''`：那是 macOS 专用写法，Linux 的 GNU sed 会报错，被 `|| true` 吞掉后
+        #    依赖声明其实没改。改成「写临时文件再 mv」，两个系统都能真正改到。
+        sed "s|github:aitcmhk-web/DSH-bot#[^\"[:space:]]*|github:aitcmhk-web/DSH-bot#${NEWTAG}|g" "$PKG_JSON" >"${PKG_JSON}.setupdsh-tmp" 2>/dev/null \
+          && mv "${PKG_JSON}.setupdsh-tmp" "$PKG_JSON" \
+          || rm -f "${PKG_JSON}.setupdsh-tmp"
       fi
     fi
     # pnpm lockfile 会让同仓库的 add 报 "Already up to date"；先删掉让它重新解析。

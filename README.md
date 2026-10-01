@@ -21,13 +21,13 @@
 0. 先装/升级本体（Git、Node、DSH 一起办，可重复跑）：
 
    ```
-   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh | zsh
+   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh | sh
    ```
 
 1. 再装机器人 —— 把下面这条整段贴进终端，回车：
 
    ```
-   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh | zsh
+   curl -fsSL https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh | sh
    ```
 
    它自己列出/新建工作区、自己把插件装好，然后**只问你三件事**：
