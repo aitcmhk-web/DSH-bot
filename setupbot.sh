@@ -887,6 +887,10 @@ ensure_provider_block() {
 # 外加一个隐藏的共用助手 .botctl.sh。
 # ⚠️ 文件名一律英文：云主机没有桌面，只能进文件夹手敲，中文名要切输入法。
 # ⚠️ 起停逻辑只有这一份（都在 .botctl.sh 里），5 个 .command 只是外壳 —— 别在别处再写一遍。
+# 平台检测：macOS → .command + launchd；Linux → .sh + nohup / systemd。
+IS_MACOS() { [ "$(uname -s)" = "Darwin" ]; }
+IS_SYSTEMD() { command -v systemctl >/dev/null 2>&1; }
+
 write_launchers() {
   WS="$LAUNCH_DIR/$PROFILE"
   LAUNCH_OK=""
@@ -898,11 +902,10 @@ write_launchers() {
     put "$1" 'pause() { [ -t 0 ] || return 0; echo; printf "按回车键关闭窗口…"; read -r _ 2>/dev/null || true; }'
   }
   head_fn() { # $1=文件 $2=窗口标题 $3=第一行说明 $4=终端里要敲的命令（可省）
-    put "$1" '#!/bin/zsh'
+    put "$1" '#!/bin/sh'
     put "$1" "# ${3}。此文件由 setupbot 生成，可以重复生成。"
     [ -n "${4:-}" ] && put "$1" "# 没有桌面（云主机 / 纯终端）：进到本文件夹，敲  $4"
     put "$1" 'cd "$(dirname "$0")" || exit 1'
-    put "$1" "printf '\\033]0;$PROFILE — $2\\007'"
     put "$1" 'clear'
     pause_fn "$1"
   }
@@ -910,7 +913,7 @@ write_launchers() {
   # ---- 共用助手：所有起停逻辑都在这儿 ----
   CTL="$WS/.botctl.sh"
   : > "$CTL" 2>/dev/null || return 1
-  put "$CTL" '#!/bin/zsh'
+  put "$CTL" '#!/bin/sh'
   put "$CTL" '# .botctl — 「启动 / 停止 / 重启」共用的逻辑。此文件由 setupbot 生成，可以重复生成。'
   put "$CTL" '# ⚠️ 别手改；要改文案或起停方式，重跑一次 setupbot（这个文件会被重新生成）。'
   put "$CTL" '# 用法：.botctl.sh start|stop|restart|status'
@@ -919,13 +922,10 @@ write_launchers() {
   put "$CTL" "export DSH_HOME=\"$DSH_HOME_DIR\""
   put "$CTL" "DSH=\"$DSHBIN\""
   put "$CTL" "PROFILE=\"$PROFILE\""
-  put "$CTL" "LABEL=\"com.local.dshbot.$PROFILE\""
-  put "$CTL" 'PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"'
   put "$CTL" 'PIDFILE="$WS/.bot.pid"'
   put "$CTL" 'LOG="$WS/bot.log"'
   put "$CTL" ''
   put "$CTL" '# 找「真在跑」的 pid：pidfile 可能是残骸，必须核对进程确实是本工作区的 dsh。'
-  put "$CTL" '# （pgrep 在本机有假阴性，这里用 ps 全表过滤）'
   put "$CTL" 'running_pid() {'
   put "$CTL" '  p=""'
   put "$CTL" '  [ -f "$PIDFILE" ] && p="$(cat "$PIDFILE" 2>/dev/null || echo)"'
@@ -936,32 +936,23 @@ write_launchers() {
   put "$CTL" '  if [ -n "$p" ]; then echo "$p"; return 0; fi'
   put "$CTL" '  return 1'
   put "$CTL" '}'
-  put "$CTL" 'plist_loaded() { [ -f "$PLIST" ] && launchctl list 2>/dev/null | grep -qF "$LABEL"; }'
   put "$CTL" ''
   put "$CTL" 'do_start() {'
   put "$CTL" '  p="$(running_pid)" && { echo "已经在跑（PID ${p}），没有重复启动。"; return 0; }'
-  put "$CTL" '  if plist_loaded; then'
-  put "$CTL" '    echo "这份装着开机自启，交给 launchd 拉起…"'
-  put "$CTL" '    launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || launchctl load "$PLIST" 2>/dev/null || true'
-  put "$CTL" '  else'
-  put "$CTL" '    echo "启动中…（日志：${LOG}）"'
-  put "$CTL" '    ( cd "$WS" && nohup "$DSH" --profile "$PROFILE" >>"$LOG" 2>&1 </dev/null & echo $! >"$PIDFILE" )'
-  put "$CTL" '  fi'
+  put "$CTL" '  echo "启动中…（日志：${LOG}）"'
+  put "$CTL" '  ( cd "$WS" && nohup "$DSH" --profile "$PROFILE" >>"$LOG" 2>&1 </dev/null & echo $! >"$PIDFILE" )'
   put "$CTL" '  sleep 3'
   put "$CTL" '  p="$(running_pid)" || { echo "⛔ 没能起来。日志最后几行："; tail -n 8 "$LOG" 2>/dev/null; return 1; }'
   put "$CTL" '  echo "✅ 已启动（PID ${p}）。日志：$LOG"'
   put "$CTL" '}'
   put "$CTL" ''
   put "$CTL" 'do_stop() {'
-  put "$CTL" '  if plist_loaded; then'
-  put "$CTL" '    echo "这份装着开机自启，先从 launchd 卸下（自启文件还留着，跑 ./install-autostart.command 可再装）…"'
-  put "$CTL" '    launchctl unload "$PLIST" 2>/dev/null || true'
-  put "$CTL" '  fi'
   put "$CTL" '  p="$(running_pid)" || { echo "现在没在跑。"; rm -f "$PIDFILE" 2>/dev/null; return 0; }'
   put "$CTL" '  echo "停止中（PID ${p}）…"'
   put "$CTL" '  kill "$p" 2>/dev/null || true'
   put "$CTL" '  i=0'
-  put "$CTL" '  while [ "$i" -lt 20 ]; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; i=$((i+1)); done'
+  put "$CTL" '  while [ "$i" -lt 20 ]; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; i=$((i+1))'
+  put "$CTL" '  done'
   put "$CTL" '  if kill -0 "$p" 2>/dev/null; then echo "它没理会，强杀…"; kill -9 "$p" 2>/dev/null || true; sleep 1; fi'
   put "$CTL" '  rm -f "$PIDFILE" 2>/dev/null'
   put "$CTL" '  if kill -0 "$p" 2>/dev/null; then echo "⛔ PID ${p} 还在，手动看一眼：ps -p ${p}"; return 1; fi'
@@ -977,121 +968,234 @@ write_launchers() {
   put "$CTL" 'esac'
   chmod +x "$CTL" 2>/dev/null
 
-  # ---- 启动 / 停止 / 重启：三个一样的外壳 ----
-  make_cmd() { # $1=文件名 $2=窗口标题 $3=动作 $4=.botctl 参数
-    f="$WS/$1"
+  # ---- macOS: .command + launchd ----
+  if IS_MACOS; then
+    make_cmd() { # $1=文件名 $2=窗口标题 $3=动作 $4=.botctl 参数
+      f="$WS/$1"
+      : > "$f" 2>/dev/null || return 1
+      head_fn "$f" "$2" "${3}「${PROFILE}」" "./$1"
+      put "$f" "printf '\\033]0;$PROFILE — $2\\007'"
+      put "$f" "echo \"${3}「${PROFILE}」\""
+      put "$f" 'echo "──────────────"'
+      put "$f" "\"\$(pwd)/.botctl.sh\" $4"
+      put "$f" 'RC=$?'
+      put "$f" 'pause'
+      put "$f" 'exit $RC'
+      chmod +x "$f" 2>/dev/null
+    }
+    make_cmd 'start.command' '启动' '启动' 'start'
+    make_cmd 'stop.command' '停止' '停止' 'stop'
+    make_cmd 'restart.command' '重启' '重启' 'restart'
+
+    # ---- 安装自启（launchd） ----
+    f="$WS/install-autostart.command"
     : > "$f" 2>/dev/null || return 1
-    head_fn "$f" "$2" "${3}「${PROFILE}」" "./$1"
-    put "$f" "echo \"${3}「${PROFILE}」\""
+    head_fn "$f" '安装自启' "让「${PROFILE}」开机自动跑" './install-autostart.command'
+    put "$f" "DSH=\"$DSHBIN\""
+    put "$f" "PROFILE=\"$PROFILE\""
+    put "$f" "export DSH_HOME=\"$DSH_HOME_DIR\""
+    put "$f" 'WS="$(pwd)"'
+    put "$f" "LABEL=\"com.local.dshbot.$PROFILE\""
+    put "$f" 'PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"'
+    put "$f" ''
+    put "$f" "echo \"给「${PROFILE}」装开机自启\""
     put "$f" 'echo "──────────────"'
-    put "$f" "\"\$(pwd)/.botctl.sh\" $4"
-    put "$f" 'RC=$?'
+    put "$f" '"$WS/.botctl.sh" stop'
+    put "$f" 'echo'
+    put "$f" 'if ! mkdir -p "$HOME/Library/LaunchAgents" 2>/dev/null; then'
+    put "$f" '  echo "⛔ 建不了 ~/Library/LaunchAgents，装不了。"; pause; exit 1'
+    put "$f" 'fi'
+    put "$f" 'if [ -f "$PLIST" ]; then'
+    put "$f" '  cp -p "$PLIST" "$PLIST.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null && echo "（旧的自启文件已备份成 $PLIST.bak.…）"'
+    put "$f" 'fi'
+    put "$f" 'cat > "$PLIST" <<PLIST_EOF'
+    put "$f" '<?xml version="1.0" encoding="UTF-8"?>'
+    put "$f" '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    put "$f" '<plist version="1.0">'
+    put "$f" '<dict>'
+    put "$f" '  <key>Label</key><string>${LABEL}</string>'
+    put "$f" '  <key>ProgramArguments</key>'
+    put "$f" '  <array>'
+    put "$f" '    <string>${DSH}</string>'
+    put "$f" '    <string>--profile</string>'
+    put "$f" '    <string>${PROFILE}</string>'
+    put "$f" '  </array>'
+    put "$f" '  <key>WorkingDirectory</key><string>${WS}</string>'
+    put "$f" '  <key>EnvironmentVariables</key>'
+    put "$f" '  <dict>'
+    put "$f" '    <key>DSH_HOME</key><string>${DSH_HOME}</string>'
+    put "$f" '    <key>PATH</key><string>${PATH}</string>'
+    put "$f" '  </dict>'
+    put "$f" '  <key>RunAtLoad</key><true/>'
+    put "$f" '  <key>StandardOutPath</key><string>${WS}/bot.log</string>'
+    put "$f" '  <key>StandardErrorPath</key><string>${WS}/bot.log</string>'
+    put "$f" '</dict>'
+    put "$f" '</plist>'
+    put "$f" 'PLIST_EOF'
+    put "$f" 'if ! plutil -lint "$PLIST" >/dev/null 2>&1; then'
+    put "$f" '  echo "⛔ 生成的自启文件格式不对，没有安装。把上面几行发我。"; pause; exit 1'
+    put "$f" 'fi'
+    put "$f" 'launchctl unload "$PLIST" 2>/dev/null || true'
+    put "$f" 'if ! launchctl load "$PLIST" 2>/dev/null; then'
+    put "$f" '  echo "⛔ launchctl load 失败了，把上面几行发我。"; pause; exit 1'
+    put "$f" 'fi'
+    put "$f" 'sleep 3'
+    put "$f" 'if launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
+    put "$f" '  echo "✅ 装好了：以后开机（登录）它自己就起来，日志还是工作区的 bot.log。"'
+    put "$f" '  echo "   想取消：跑 ./uninstall-autostart.command"'
+    put "$f" 'else'
+    put "$f" '  echo "⛔ 装了但 launchctl 里看不到，把上面几行发我。"'
+    put "$f" 'fi'
     put "$f" 'pause'
-    put "$f" 'exit $RC'
     chmod +x "$f" 2>/dev/null
-  }
-  # 文件名一律英文小写（云主机 / 纯终端里要手敲，中文得切输入法）；窗口标题和提示仍是中文
-  make_cmd 'start.command' '启动' '启动' 'start'
-  make_cmd 'stop.command' '停止' '停止' 'stop'
-  make_cmd 'restart.command' '重启' '重启' 'restart'
 
-  # ---- 安装自启（launchd） ----
-  f="$WS/install-autostart.command"
-  : > "$f" 2>/dev/null || return 1
-  head_fn "$f" '安装自启' "让「${PROFILE}」开机自动跑" './install-autostart.command'
-  put "$f" "DSH=\"$DSHBIN\""
-  put "$f" "PROFILE=\"$PROFILE\""
-  put "$f" "export DSH_HOME=\"$DSH_HOME_DIR\""
-  put "$f" 'WS="$(pwd)"'
-  put "$f" "LABEL=\"com.local.dshbot.$PROFILE\""
-  put "$f" 'PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"'
-  put "$f" ''
-  put "$f" "echo \"给「${PROFILE}」装开机自启\""
-  put "$f" 'echo "──────────────"'
-  put "$f" '# 先停掉手动起的这份，免得装完变成两个进程抢同一个 token'
-  put "$f" '"$WS/.botctl.sh" stop'
-  put "$f" 'echo'
-  put "$f" 'if ! mkdir -p "$HOME/Library/LaunchAgents" 2>/dev/null; then'
-  put "$f" '  echo "⛔ 建不了 ~/Library/LaunchAgents，装不了。"; pause; exit 1'
-  put "$f" 'fi'
-  put "$f" 'if [ -f "$PLIST" ]; then'
-  put "$f" '  cp -p "$PLIST" "$PLIST.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null && echo "（旧的自启文件已备份成 $PLIST.bak.…）"'
-  put "$f" 'fi'
-  put "$f" 'cat > "$PLIST" <<PLIST_EOF'
-  put "$f" '<?xml version="1.0" encoding="UTF-8"?>'
-  put "$f" '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
-  put "$f" '<plist version="1.0">'
-  put "$f" '<dict>'
-  put "$f" '  <key>Label</key><string>${LABEL}</string>'
-  put "$f" '  <key>ProgramArguments</key>'
-  put "$f" '  <array>'
-  put "$f" '    <string>${DSH}</string>'
-  put "$f" '    <string>--profile</string>'
-  put "$f" '    <string>${PROFILE}</string>'
-  put "$f" '  </array>'
-  put "$f" '  <key>WorkingDirectory</key><string>${WS}</string>'
-  put "$f" '  <key>EnvironmentVariables</key>'
-  put "$f" '  <dict>'
-  put "$f" '    <key>DSH_HOME</key><string>${DSH_HOME}</string>'
-  put "$f" '    <key>PATH</key><string>${PATH}</string>'
-  put "$f" '  </dict>'
-  put "$f" '  <key>RunAtLoad</key><true/>'
-  put "$f" '  <key>StandardOutPath</key><string>${WS}/bot.log</string>'
-  put "$f" '  <key>StandardErrorPath</key><string>${WS}/bot.log</string>'
-  put "$f" '</dict>'
-  put "$f" '</plist>'
-  put "$f" 'PLIST_EOF'
-  put "$f" '# ⚠️ 故意不写 KeepAlive：崩了不自动重拉，免得好好的「停止」按下去它又自己回来。'
-  put "$f" ''
-  put "$f" 'if ! plutil -lint "$PLIST" >/dev/null 2>&1; then'
-  put "$f" '  echo "⛔ 生成的自启文件格式不对，没有安装。把上面几行发我。"; pause; exit 1'
-  put "$f" 'fi'
-  put "$f" 'launchctl unload "$PLIST" 2>/dev/null || true'
-  put "$f" 'if ! launchctl load "$PLIST" 2>/dev/null; then'
-  put "$f" '  echo "⛔ launchctl load 失败了，把上面几行发我。"; pause; exit 1'
-  put "$f" 'fi'
-  put "$f" 'sleep 3'
-  put "$f" 'if launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
-  put "$f" '  echo "✅ 装好了：以后开机（登录）它自己就起来，日志还是工作区的 bot.log。"'
-  put "$f" '  echo "   想取消：跑 ./uninstall-autostart.command"'
-  put "$f" 'else'
-  put "$f" '  echo "⛔ 装了但 launchctl 里看不到，把上面几行发我。"'
-  put "$f" 'fi'
-  put "$f" 'pause'
-  chmod +x "$f" 2>/dev/null
+    # ---- 卸载自启 ----
+    f="$WS/uninstall-autostart.command"
+    : > "$f" 2>/dev/null || return 1
+    head_fn "$f" '卸载自启' "取消「${PROFILE}」的开机自启" './uninstall-autostart.command'
+    put "$f" "LABEL=\"com.local.dshbot.$PROFILE\""
+    put "$f" 'PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"'
+    put "$f" ''
+    put "$f" "echo \"取消「${PROFILE}」的开机自启\""
+    put "$f" 'echo "──────────────"'
+    put "$f" 'ran=0'
+    put "$f" 'if [ -f "$PLIST" ]; then'
+    put "$f" '  if launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
+    put "$f" '    launchctl unload "$PLIST" 2>/dev/null && ran=1 || true'
+    put "$f" '  fi'
+    put "$f" '  rm -f "$PLIST" 2>/dev/null'
+    put "$f" 'fi'
+    put "$f" 'if [ -f "$PLIST" ] || launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
+    put "$f" '  echo "⛔ 没卸干净，把上面几行发我。"'
+    put "$f" 'else'
+    put "$f" '  echo "✅ 已取消开机自启（自启文件已删）。"'
+    put "$f" '  if [ "$ran" = "1" ]; then echo "   （刚才那份进程也被 launchd 一起停了；要手动跑就 ./start.command）"; fi'
+    put "$f" 'fi'
+    put "$f" 'pause'
+    chmod +x "$f" 2>/dev/null
 
-  # ---- 卸载自启 ----
-  f="$WS/uninstall-autostart.command"
-  : > "$f" 2>/dev/null || return 1
-  head_fn "$f" '卸载自启' "取消「${PROFILE}」的开机自启" './uninstall-autostart.command'
-  put "$f" "LABEL=\"com.local.dshbot.$PROFILE\""
-  put "$f" 'PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"'
-  put "$f" ''
-  put "$f" "echo \"取消「${PROFILE}」的开机自启\""
-  put "$f" 'echo "──────────────"'
-  put "$f" 'ran=0'
-  put "$f" 'if [ -f "$PLIST" ]; then'
-  put "$f" '  if launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
-  put "$f" '    launchctl unload "$PLIST" 2>/dev/null && ran=1 || true'
-  put "$f" '  fi'
-  put "$f" '  rm -f "$PLIST" 2>/dev/null'
-  put "$f" 'fi'
-  put "$f" 'if [ -f "$PLIST" ] || launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
-  put "$f" '  echo "⛔ 没卸干净，把上面几行发我。"'
-  put "$f" 'else'
-  put "$f" '  echo "✅ 已取消开机自启（自启文件已删）。"'
-  put "$f" '  if [ "$ran" = "1" ]; then echo "   （刚才那份进程也被 launchd 一起停了；要手动跑就 ./start.command）"; fi'
-  put "$f" 'fi'
-  put "$f" 'pause'
-  chmod +x "$f" 2>/dev/null
+    # 旧产物收掉
+    for OLD in "$WS/启动-${PROFILE}.command" "$WS/启动.command" "$WS/停止.command" "$WS/重启.command" "$WS/安装自启.command" "$WS/卸载自启.command"; do
+      if [ -f "$OLD" ] && grep -q '此文件由 setupbot 生成' "$OLD" 2>/dev/null; then
+        rm -f "$OLD" 2>/dev/null && say "（旧的 $(basename "$OLD") 已换成英文名，收掉了）"
+      fi
+    done
 
-  # 旧产物收掉：① 老版本只生成的「启动-<名字>.command」；② 中文件名的 5 个旧文件（现在一律英文名）。
-  # 只删带「此文件由 setupbot 生成」标记的（确凿是我们生成的）；用户手写的同名文件不动。
-  for OLD in "$WS/启动-${PROFILE}.command" "$WS/启动.command" "$WS/停止.command" "$WS/重启.command" "$WS/安装自启.command" "$WS/卸载自启.command"; do
-    if [ -f "$OLD" ] && grep -q '此文件由 setupbot 生成' "$OLD" 2>/dev/null; then
-      rm -f "$OLD" 2>/dev/null && say "（旧的 $(basename "$OLD") 已换成英文名，收掉了）"
+  # ---- Linux: .sh + nohup / systemd ----
+  else
+    make_sh() { # $1=文件名 $2=动作 $3=.botctl 参数
+      f="$WS/$1"
+      : > "$f" 2>/dev/null || return 1
+      put "$f" '#!/bin/sh'
+      put "$f" "# ${2}「${PROFILE}」。此文件由 setupbot 生成，可以重复生成。"
+      put "$f" 'cd "$(dirname "$0")" || exit 1'
+      put "$f" 'echo "${2}「${PROFILE}」"'
+      put "$f" 'echo "──────────────"'
+      put "$f" '"$(pwd)/.botctl.sh" $3'
+      put "$f" 'exit $?'
+      chmod +x "$f" 2>/dev/null
+    }
+    make_sh 'start.sh' '启动' 'start'
+    make_sh 'stop.sh' '停止' 'stop'
+    make_sh 'restart.sh' '重启' 'restart'
+
+    # ---- systemd 自启（有 systemctl 时生成 service 文件） ----
+    if IS_SYSTEMD; then
+      SVC_NAME="dsh-bot-${PROFILE}"
+      SVC_FILE="/etc/systemd/system/${SVC_NAME}.service"
+      SVC_BAK="${SVC_FILE}.setupdsh-bak"
+
+      f="$WS/install-autostart.sh"
+      : > "$f" 2>/dev/null || return 1
+      put "$f" '#!/bin/sh'
+      put "$f" "# 给「${PROFILE}」装开机自启（systemd）"
+      put "$f" 'echo "给「${PROFILE}」装开机自启（systemd）"'
+      put "$f" 'echo "──────────────"'
+      put "$f" '"$(pwd)/.botctl.sh" stop'
+      put "$f" 'echo'
+      put "$f" 'cat > "$SVC_FILE" <<SVC_EOF'
+      put "$f" '[Unit]'
+      put "$f" "Description=DSH Bot - ${PROFILE}"
+      put "$f" 'After=network.target'
+      put "$f" ''
+      put "$f" '[Service]'
+      put "$f" 'Type=simple'
+      put "$f" "User=${USER:-root}"
+      put "$f" 'WorkingDirectory=${WS}'
+      put "$f" "ExecStart=${DSH} --profile ${PROFILE}"
+      put "$f" 'Restart=on-failure'
+      put "$f" 'RestartSec=5'
+      put "$f" 'StandardOutput=append:${WS}/bot.log'
+      put "$f" 'StandardError=append:${WS}/bot.log'
+      put "$f" 'Environment=DSH_HOME=${DSH_HOME_DIR}'
+      put "$f" 'SVC_EOF'
+      put "$f" 'sed -i "s|\${WS}|$(echo "$WS" | sed "s|/|\\\\\/|g")|g" "$SVC_FILE"'
+      put "$f" 'sed -i "s|\${DSH_HOME_DIR}|$(echo "$DSH_HOME_DIR" | sed "s|/|\\\\\/|g")|g" "$SVC_FILE"'
+      put "$f" 'if [ -f "$SVC_FILE" ]; then cp -p "$SVC_FILE" "$SVC_BAK" 2>/dev/null; fi'
+      put "$f" 'if sudo systemctl daemon-reload && sudo systemctl enable "${SVC_NAME}" && sudo systemctl start "${SVC_NAME}"; then'
+      put "$f" '  echo "✅ 装好了：systemd 管理，开机自启、崩溃自动重启。"'
+      put "$f" '  echo "   查看状态：systemctl status ${SVC_NAME}"'
+      put "$f" '  echo "   取消自启：./uninstall-autostart.sh"'
+      put "$f" 'else'
+      put "$f" '  echo "⛔ systemd 安装失败（可能需要 root 权限）。"'
+      put "$f" '  echo "   手动启动：cd ${WS} && nohup ${DSH} --profile ${PROFILE} >> bot.log 2>&1 &"'
+      put "$f" 'fi'
+      chmod +x "$f" 2>/dev/null
+
+      f="$WS/uninstall-autostart.sh"
+      : > "$f" 2>/dev/null || return 1
+      put "$f" '#!/bin/sh'
+      put "$f" "# 取消「${PROFILE}」的开机自启（systemd）"
+      put "$f" 'echo "取消「${PROFILE}」的开机自启（systemd）"'
+      put "$f" 'echo "──────────────"'
+      put "$f" 'if sudo systemctl is-active "${SVC_NAME}" >/dev/null 2>&1; then'
+      put "$f" '  sudo systemctl stop "${SVC_NAME}" 2>/dev/null || true'
+      put "$f" '  sudo systemctl disable "${SVC_NAME}" 2>/dev/null || true'
+      put "$f" 'fi'
+      put "$f" 'rm -f "$SVC_FILE" 2>/dev/null'
+      put "$f" 'sudo systemctl daemon-reload 2>/dev/null || true'
+      put "$f" 'echo "✅ 已取消开机自启（service 文件已删）。"'
+      chmod +x "$f" 2>/dev/null
+    else
+      # 无 systemd：提示手动 nohup
+      f="$WS/install-autostart.sh"
+      : > "$f" 2>/dev/null || return 1
+      put "$f" '#!/bin/sh'
+      put "$f" "# 让「${PROFILE}」开机自启（nohup，无 systemd）"
+      put "$f" 'echo "这台机器没有 systemd，用 nohup 方式自启"'
+      put "$f" 'echo "──────────────"'
+      put "$f" '"$(pwd)/.botctl.sh" stop'
+      put "$f" 'echo'
+      put "$f" 'rc="$HOME/.config/start-dsh-bot.sh"'
+      put "$f" 'mkdir -p "$(dirname "$rc")" 2>/dev/null'
+      put "$f" 'cat > "$rc" <<EOF'
+      put "$f" '#!/bin/sh'
+      put "$f" 'sleep 10'
+      put "$f" 'cd "$WS" && nohup "$DSH" --profile "$PROFILE" >> "$WS/bot.log" 2>&1 </dev/null &'
+      put "$f" 'EOF'
+      put "$f" 'chmod +x "$rc"'
+      put "$f" 'echo "✅ 写了 ~/.config/start-dsh-bot.sh，需要配合 crontab -e 加一行："'
+      put "$f" 'echo "   @reboot $rc"'
+      chmod +x "$f" 2>/dev/null
+
+      f="$WS/uninstall-autostart.sh"
+      : > "$f" 2>/dev/null || return 1
+      put "$f" '#!/bin/sh'
+      put "$f" "# 取消「${PROFILE}」的开机自启"
+      put "$f" 'echo "取消「${PROFILE}」的开机自启"'
+      put "$f" 'echo "──────────────"'
+      put "$f" 'rm -f "$HOME/.config/start-dsh-bot.sh"'
+      put "$f" 'echo "✅ 已取消。"'
+      chmod +x "$f" 2>/dev/null
     fi
-  done
+
+    # 旧产物收掉
+    for OLD in "$WS/启动-${PROFILE}.sh" "$WS/启动.sh" "$WS/停止.sh" "$WS/重启.sh" "$WS/安装自启.sh" "$WS/卸载自启.sh"; do
+      if [ -f "$OLD" ] && grep -q '此文件由 setupbot 生成' "$OLD" 2>/dev/null; then
+        rm -f "$OLD" 2>/dev/null && say "（旧的 $(basename "$OLD") 已收掉了）"
+      fi
+    done
+  fi
 
   LAUNCH_OK=1
   return 0
@@ -1177,7 +1281,11 @@ finish() {
 
   if write_launchers; then
     say "✅ 工作区文件已生成：${LAUNCH_DIR}/${PROFILE}/"
-    say "   start / stop / restart / install-autostart / uninstall-autostart —— 双击能用，终端里 ./start.command 也能用"
+    if IS_MACOS; then
+      say "   start / stop / restart / install-autostart / uninstall-autostart —— 双击能用，终端里 ./start.command 也能用"
+    else
+      say "   start.sh / stop.sh / restart.sh / install-autostart.sh / uninstall-autostart.sh"
+    fi
   else
     say "⚠️ 工作区文件没生成（${LAUNCH_DIR}/${PROFILE} 不可写？）—— 还能敲 dsh --profile ${PROFILE} 启动。"
   fi
@@ -1186,9 +1294,15 @@ finish() {
   say "============ 机器人安装配置完成 ============"
   say "工作区：${PROFILE}（${LAUNCH_DIR}/${PROFILE}）"
   if [ -n "$LAUNCH_OK" ]; then
-    say "启动：双击 ${LAUNCH_DIR}/${PROFILE}/start.command"
-    say "      （没有桌面就进这个文件夹敲 ./start.command；后台跑，窗口关了也活着）"
-    say "停止 / 重启 / 开机自启：同一个文件夹里的 stop.command、restart.command、install-autostart.command"
+    if IS_MACOS; then
+      say "启动：双击 ${LAUNCH_DIR}/${PROFILE}/start.command"
+      say "      （没有桌面就进这个文件夹敲 ./start.command；后台跑，窗口关了也活着）"
+      say "停止 / 重启 / 开机自启：同一个文件夹里的 stop.command、restart.command、install-autostart.command"
+    else
+      say "启动：cd ${LAUNCH_DIR}/${PROFILE} && ./start.sh"
+      say "停止 / 重启：./stop.sh / ./restart.sh"
+      say "开机自启：./install-autostart.sh（需要 sudo 权限）"
+    fi
   else
     say "启动：敲 dsh --profile ${PROFILE}"
   fi
