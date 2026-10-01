@@ -922,7 +922,9 @@ write_launchers() {
   put "$CTL" 'WS="$(cd "$(dirname "$0")" && pwd)"'
   put "$CTL" "export DSH_HOME=\"$DSH_HOME_DIR\""
   put "$CTL" "DSH=\"$DSHBIN\""
-  put "$CTL" "PROFILE=\"$PROFILE\""
+  # ⚠️ 兜底：如果 PROFILE 为空，从工作区目录名推断（老版 setupbot 残留时可能为空）
+  put "$CTL" '[ -z "${PROFILE:-}" ] && PROFILE="$(basename "$WS")"'
+  put "$CTL" "PROFILE=\"${PROFILE}\""
   put "$CTL" 'PIDFILE="$WS/.bot.pid"'
   put "$CTL" 'LOG="$WS/bot.log"'
   put "$CTL" ''
