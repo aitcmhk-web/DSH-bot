@@ -34,7 +34,7 @@ ARG_PROFILE="${1:-}"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    2026-10-01 用户反馈「更新看不到提示」——跑起来先报自己是谁，才看得出手上这份是新是旧。
-SELF_VERSION="2026-10-01.1"
+SELF_VERSION="2026-10-01.5"
 
 SETUPBOT_URL="${SETUPBOT_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh}"
 SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot}"

@@ -29,7 +29,7 @@ SRC_PATH="$0"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    2026-10-01 用户反馈「github 没有提示版本」——跑起来必须先报自己是谁，才看得出手上这份是新是旧。
-SELF_VERSION="2026-10-01.4"
+SELF_VERSION="2026-10-01.5"
 
 SETUPDSH_URL="${SETUPDSH_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh}"
 SELF_DIR="$HOME/.dsh/setupdsh"
@@ -60,6 +60,19 @@ install_self() {
   fi
   [ -s "$SELF_PATH" ] || return 0
   chmod +x "$SELF_PATH" 2>/dev/null || true
+
+  # 版本比较：远程有新版本就覆盖本地（防止本地副本长期不更新）
+  REMOTE_VER=""
+  LOCAL_VER="$(grep '^SELF_VERSION=' "$SELF_PATH" 2>/dev/null | sed "s/.*\"\([^\"]*\)\".*/\1/")"
+  if curl -fsSL --max-time 25 "$SETUPDSH_URL" -o "$SELF_PATH.new" 2>/dev/null && [ -s "$SELF_PATH.new" ]; then
+    REMOTE_VER="$(grep '^SELF_VERSION=' "$SELF_PATH.new" 2>/dev/null | sed "s/.*\"\([^\"]*\)\".*/\1/")"
+    if [ -n "$REMOTE_VER" ] && [ -n "$LOCAL_VER" ] && [ "$REMOTE_VER" != "$LOCAL_VER" ]; then
+      say "（setupdsh 有新版本：${LOCAL_VER} → ${REMOTE_VER}，正在更新）"
+      mv "$SELF_PATH.new" "$SELF_PATH" 2>/dev/null || rm -f "$SELF_PATH.new" 2>/dev/null
+    else
+      rm -f "$SELF_PATH.new" 2>/dev/null
+    fi
+  fi
 
   # 挑一个「在 PATH 里、又能写」的目录放启动器
   BIN_DIR=""
