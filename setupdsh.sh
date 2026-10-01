@@ -240,6 +240,9 @@ upgrade_plugins() {
     [ -n "$PD" ] || continue
     PROF="$(basename "$(dirname "$(dirname "$PD")")")"
     OLDV="$(plugin_version "$PD")"
+    # pnpm lockfile 会让同仓库的 add 报 "Already up to date"；先删掉让它重新解析。
+    LOCKFILE="$PD/pnpm-lock.yaml"
+    if [ -f "$LOCKFILE" ]; then mv "$LOCKFILE" "${LOCKFILE}.setupdsh-bak"; fi
     if ( cd "$HOME" && "$DSHBIN" plugin --profile "$PROF" add "$SPEC" ); then
       NEWV="$(plugin_version "$PD")"
       if [ -n "$NEWV" ] && [ "$NEWV" != "$OLDV" ]; then
@@ -251,6 +254,8 @@ upgrade_plugins() {
     else
       say "⚠️ 工作区 ${PROF} 的插件没升成（大概是没网），现在还是：${OLDV:-?}"
     fi
+    # 恢复备份的 lockfile（让 pnpm 下次正常解析）
+    if [ -f "${LOCKFILE}.setupdsh-bak" ]; then mv "${LOCKFILE}.setupdsh-bak" "$LOCKFILE"; fi
   done < "$PLUGLIST_FILE"
   rm -f "$PLUGLIST_FILE" 2>/dev/null || true
 }
