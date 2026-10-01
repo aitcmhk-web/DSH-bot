@@ -699,11 +699,41 @@ export function apply(ctx, config) {
 
   const wxEndpoint = {
     id: 'wx',
+    lastSendError: null,
     async send(msg) {
       if (!weixin.enabled) return;
-      const to = config.weixinAllowedUserId || weixin.ownerWxUserId || state.ownerUserId;
-      if (!to) return;
-      await weixin.sendText(String(to), msg.text, wxContextTokens.get(String(to)) ?? undefined);
+      // ⚠️ 目标解析优先级（与 endpoints/tg.js#send 对称，2026-09-19 实测踩坑）：
+      //    TG 入站广播过来的消息 `chatId` 是 **Telegram 数字 id**（如 7934872283），
+      //    直接拿去当微信 target 会 `ret=-1 invalid request`。
+      //    所以只有来源是 wx 时才认 chatId，否则一律发到微信主人。
+      const target = msg.source === 'wx' && msg.chatId != null ? msg.chatId : (config.weixinAllowedUserId || weixin.ownerWxUserId || state.ownerUserId);
+      if (!target) throw new Error('微信端点没有可投递的目标');
+
+      // ⛔ 不要写成 `msg.contextToken ?? this.lastContextToken`：
+      //    hub.outbound() 造的消息（hub.js:145）**永远不带 contextToken**，
+      //    所以那条回落分支等于「永远用缓存里那个陈旧的 token」→ 必然 ret=-2。
+      //    只有端点自己入站时带上的 token 才新鲜，才值得传。
+      const fresh = msg.source === 'wx' ? msg.contextToken : undefined;
+
+      try {
+        console.log(`[wx] send to ${target}: ${String(msg.text).slice(0, 50)}… (token=${fresh ? 'yes' : 'no'})`);
+        await weixin.sendText(target, msg.text, fresh);
+        this.lastSendError = null;
+      } catch (err) {
+        // ret=-2 = 服务端会话失效。
+        // 策略：无论是否带了 token，都去掉 token 重试一次；同时触发 reconnect
+        // 清除本地缓存（旧 token 不再污染后续发送）。通道恢复依赖用户入站消息
+        // 带新鲜 context_token，reconnect 至少清了缓存让下次发送不再被旧 token 污染。
+        if (/ret=-2/.test(err.message)) {
+          console.warn(`[wx] sendText ret=-2，去掉 token 重试 + 清理缓存`);
+          await weixin.reconnect().catch(() => {});
+          await weixin.sendText(target, msg.text, undefined);
+          this.lastSendError = null;
+          return;
+        }
+        this.lastSendError = err.message;
+        throw err;
+      }
     },
   };
 
