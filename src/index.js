@@ -1560,6 +1560,25 @@ export function apply(ctx, config) {
         return true;
       }
 
+      case '/setupdsh': {
+        // 升级 DSH + bot（调用 setupdsh.sh）
+        const helper = join(dirname(fileURLToPath(import.meta.url)), '..', 'setupdsh-helper.sh');
+        if (existsSync(helper)) {
+          await telegram.sendMessage(chatId, '⬆️ 正在启动 SetupDSH&BOT 升级…', {
+            parse_mode: 'HTML',
+          });
+          const child = spawn('bash', [helper], {
+            detached: true,
+            stdio: 'ignore',
+            env: { ...process.env },
+          });
+          child.unref();
+          return true;
+        }
+        await reply('⚠️ 未找到 setupdsh-helper.sh，无法执行升级。');
+        return true;
+      }
+
       case '/start':
       case '/help': {
         // 老 bot 同款文案（/model 一行列出所有模型 label）。
@@ -1574,6 +1593,7 @@ export function apply(ctx, config) {
             '/new — 开启一个全新会话(清空上下文)',
             `/model — 切换模型(${labels})`,
             '/restart — 重启 bot 加载新代码（会断开当前会话）',
+            '/setupdsh — SetupDSH&BOT（升级 DSH + bot 插件）',
             '/status — 查看当前会话和运行状态',
             source === 'wx' ? '/whoami — 查看你的用户 ID' : '/whoami — 查看你的 Telegram 用户 ID',
             '/help — 显示这份帮助',
