@@ -125,7 +125,7 @@ export class Hub {
   /**
    * 端点 → 节点。
    *
-   * 一条进来，同步给 ① DSH ② 其他所有端点。
+   * 一条进来，同步给 ① 其他所有端点（镜像）② DSH。
    * ⛔ 不去重、不合并、不判断。进来几条就是几条。
    *
    * 端点适配器收到用户消息后调这个。
@@ -139,7 +139,15 @@ export class Hub {
 
     this.log(`[hub] 入站 ← ${msg.source}:${msg.chatId} (${String(msg.text).slice(0, 40)}…)`);
 
-    // ① 给 DSH
+    // ① 先镜像给其他所有端点
+    //
+    // ⛔ 顺序不能反：DSH 的回答是在 onInbound 里跑完才产生的，
+    //    先 await onInbound 的话镜像只能排在回答后面 —— 别人的微信里就成了
+    //    「回答在上面、问话在下面」。broadcast 内部每个端点各自 try/catch、
+    //    只把失败记进 failed 不往外抛，所以放前面不会卡住 DSH。
+    await this.broadcast(msg, { exclude: msg.source, label: `${msg.source} 入站` });
+
+    // ② 再交给 DSH
     if (this.onInbound) {
       try {
         await this.onInbound(msg);
@@ -147,9 +155,6 @@ export class Hub {
         console.error(`[hub] onInbound 失败: ${err.stack ?? err.message}`);
       }
     }
-
-    // ② 给其他所有端点
-    await this.broadcast(msg, { exclude: msg.source, label: `${msg.source} 入站` });
   }
 
   /**
