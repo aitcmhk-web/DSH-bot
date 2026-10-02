@@ -439,8 +439,15 @@ pick_token() {
 
 # ============ 5. 微信 ============
 WXFILE=""
-# 本工作区的微信凭据可能在两个地方：profile 目录里，或工作区目录（~/DSH/<名字>）里。
-# 只扫前者会漏掉 setupbot 自己写的那份（2026-09-30 用户报「没检查有没有绑过」就是这个）。
+# 凭据落点（2026-10-02 用户定：跟 TG 一样收进 ~/.dsh，不再散在工作区）：
+#   WXDEST = 新位置，跟 profile 走（$DSH_HOME/profiles/<profile>/weixin-account.json）
+#   WXOLD  = 老位置（工作区 $HOME/DSH/<profile>/）—— **只用于升级时自动搬迁**，新装不再写它
+WXDEST="$PROFILES/$PROFILE/weixin-account.json"
+WXOLD="$LAUNCH_DIR/$PROFILE/weixin-account.json"
+# 升级迁移时记下"从哪儿搬来的"，只用于给用户提示。
+WXMOVED_FROM=""
+# 本工作区的微信凭据可能在三个地方：新位置、老位置（工作区）、config 里指的老路径。
+# 只扫一个会漏掉 setupbot 自己写的那份（2026-09-30 用户报「没检查有没有绑过」就是这个）。
 collect_wechat() {
   : > "$WX_FILE"
   while IFS= read -r p; do
@@ -450,7 +457,7 @@ collect_wechat() {
       case "$f" in /*) ;; *) f="$p/$f" ;; esac
       if [ -f "$f" ]; then printf '%s\t%s\n' "$pn" "$f" >> "$WX_FILE"; fi
     fi
-    for c in "$p/weixin-account.json" "$LAUNCH_DIR/$pn/weixin-account.json"; do
+    for c in "$PROFILES/$pn/weixin-account.json" "$p/weixin-account.json" "$LAUNCH_DIR/$pn/weixin-account.json"; do
       if [ -f "$c" ] && ! grep -qF "$c" "$WX_FILE" 2>/dev/null; then
         printf '%s\t%s\n' "$pn" "$c" >> "$WX_FILE"
       fi
@@ -458,11 +465,38 @@ collect_wechat() {
   done < "$WS_FILE"
 }
 
+# 升级迁移（2026-10-02）：老位置的凭据自动搬进 ~/.dsh，搬完 config 路径也跟着改。
+# 为什么必须自动搬：插件是发给别人装的，人家的工作区在万里之外，不可能靠手工迁。
+migrate_wechat_file() {
+  [ -f "$WXDEST" ] && return 0
+  OLD_WX="$(cfg_get "$PROFILES/$PROFILE/cordis.patch.yml" weixinAccountFile)"
+  for cand in "$WXOLD" "$OLD_WX"; do
+    [ -n "$cand" ] || continue
+    case "$cand" in /*) ;; *) cand="$PROFILES/$PROFILE/$cand" ;; esac
+    [ -f "$cand" ] || continue
+    [ "$cand" = "$WXDEST" ] && return 0
+    mkdir -p "$PROFILES/$PROFILE" 2>/dev/null || true
+    if cp "$cand" "$WXDEST" 2>/dev/null; then
+      WXMOVED_FROM="$cand"
+      return 0
+    fi
+  done
+  return 0
+}
+
 pick_wechat() {
   say ""
+  migrate_wechat_file
   OLD_WX="$(cfg_get "$PROFILES/$PROFILE/cordis.patch.yml" weixinAccountFile)"
-  if [ -z "$OLD_WX" ] && [ -f "$LAUNCH_DIR/$PROFILE/weixin-account.json" ]; then
-    OLD_WX="$LAUNCH_DIR/$PROFILE/weixin-account.json"
+  if [ -f "$WXDEST" ]; then
+    OLD_WX="$WXDEST"
+  elif [ -z "$OLD_WX" ] && [ -f "$WXOLD" ]; then
+    OLD_WX="$WXOLD"
+  fi
+  if [ -n "$WXMOVED_FROM" ]; then
+    say "ℹ️ 微信凭据已从老位置搬进 ~/.dsh："
+    say "     ${WXMOVED_FROM}"
+    say "   → ${WXDEST}"
   fi
   collect_wechat
   WCOUNT="$(wc -l < "$WX_FILE" | tr -d ' ')"
@@ -492,8 +526,8 @@ pick_wechat() {
 
   if [ "$ANS" -ge 1 ] 2>/dev/null && [ "$ANS" -le "$WCOUNT" ] 2>/dev/null; then
     src="$(sed -n "${ANS}p" "$WX_FILE" | cut -f2)"
-    dst="$LAUNCH_DIR/$PROFILE/weixin-account.json"
-    mkdir -p "$LAUNCH_DIR/$PROFILE" 2>/dev/null || true
+    dst="$WXDEST"
+    mkdir -p "$PROFILES/$PROFILE" 2>/dev/null || true
     if [ "$src" = "$dst" ]; then
       WXFILE="$dst"
       say "✅ 微信沿用本工作区原来那份凭据。"
@@ -510,8 +544,8 @@ pick_wechat() {
       say "⚠️ 找不到扫码程序，先跳过微信（重跑 setupbot 再试）。"
       return 0
     fi
-    dst="$LAUNCH_DIR/$PROFILE/weixin-account.json"
-    mkdir -p "$LAUNCH_DIR/$PROFILE" 2>/dev/null || true
+    dst="$WXDEST"
+    mkdir -p "$PROFILES/$PROFILE" 2>/dev/null || true
     command -v node >/dev/null 2>&1 || { say "⚠️ 这台机器没有 node 命令，先跳过微信。"; return 0; }
     say "这就开始扫码：用微信扫屏幕上出现的二维码，扫完这个窗口自己回来。"
     node "$WXLOGIN" --out "$dst" || { say "⚠️ 扫码没成功，先跳过微信。"; return 0; }
