@@ -794,8 +794,8 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------------------
   // 最高指令（HARD-RULES.md）：每动一次手，就把原文重新顶进上下文
   // -------------------------------------------------------------------------
-  // 用户 2026-10-02 定：不是「开头读过一次就算」，而是「每动一次手就再出现一次」，
-  // 否则干着干着就忘了。
+  // 用户 2026-10-02 定：不是「开头读过一次就算」，而是「每动若干次手就再出现一次」，
+  // 否则干着干着就忘了。频率 = 第 1 次 + 之后每 10 次（见 HARD_RULES_EVERY_N）。
   //
   // 机制：DSH 的 `tools/post-execute` 是 waterfall（dsh-tools/lib/index.js:3504），
   // 监听者可以返回 `{ kind: 'accept', additionalContexts: [message] }` ——
@@ -809,6 +809,13 @@ export function apply(ctx, config) {
   // ⚠️ 只挂「动手」类工具；read / grep / glob 这些不挂，省 token。
   const HARD_RULES_PATH = new URL('../HARD-RULES.md', import.meta.url);
   const HARD_RULES_TOOLS = new Set(['bash', 'edit', 'write', 'str-replace', 'str_replace']);
+  /**
+   * 每多少次动手类调用才注入一次。
+   * 用户 2026-10-02 定：每次都注入太频繁（一次任务动 20 次手要堆 20 份规则 ≈ 6000 token）。
+   * 计数规则：第 1 次就注入（开工先看到规则），之后每 N 次再来一次（1, N+1, 2N+1…）。
+   * ⚠️ 口径必须与 `DSH/hard-rules/index.mjs`（本机那份）保持一致。
+   */
+  const HARD_RULES_EVERY_N = 10;
   let hardRulesText = '';
   try {
     hardRulesText = readFileSync(HARD_RULES_PATH, 'utf8').trim();
@@ -816,8 +823,13 @@ export function apply(ctx, config) {
     hardRulesText = '';
   }
   if (hardRulesText.length > 0) {
+    /** 动手类调用计数（插件实例级，ctx / ctx.root 两次挂载共用）。 */
+    let hardRulesCalls = 0;
     const hardRulesHandler = (exec, _result, next) => {
       if (!HARD_RULES_TOOLS.has(String(exec?.name ?? ''))) return next();
+      hardRulesCalls += 1;
+      // 第 1 次就注入（开工先看到规则），之后每 HARD_RULES_EVERY_N 次一次：1, N+1, 2N+1…
+      if (hardRulesCalls % HARD_RULES_EVERY_N !== 1) return next();
       return {
         kind: 'accept',
         additionalContexts: [{
