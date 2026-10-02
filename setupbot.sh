@@ -442,8 +442,9 @@ WXFILE=""
 # 凭据落点（2026-10-02 用户定：跟 TG 一样收进 ~/.dsh，不再散在工作区）：
 #   WXDEST = 新位置，跟 profile 走（$DSH_HOME/profiles/<profile>/weixin-account.json）
 #   WXOLD  = 老位置（工作区 $HOME/DSH/<profile>/）—— **只用于升级时自动搬迁**，新装不再写它
-WXDEST="$PROFILES/$PROFILE/weixin-account.json"
-WXOLD="$LAUNCH_DIR/$PROFILE/weixin-account.json"
+# ⚠️⛔ 这两个**必须**在 pick_wechat() 里算，不能写在脚本顶层：顶层跑到这里时 $PROFILE
+#    还是空的（要等 pick_workspace 问完），会算出 `profiles//weixin-account.json` 这种
+#    坏路径 —— 2026-10-02 实测踩到，把 dshbot 的 config 写坏了。
 # 升级迁移时记下"从哪儿搬来的"，只用于给用户提示。
 WXMOVED_FROM=""
 # 本工作区的微信凭据可能在三个地方：新位置、老位置（工作区）、config 里指的老路径。
@@ -486,6 +487,9 @@ migrate_wechat_file() {
 
 pick_wechat() {
   say ""
+  # ⚠️ 落点在这里算（此刻 $PROFILE 已定）—— ⛔ 别提到脚本顶层，见上面那段告警。
+  WXDEST="$PROFILES/$PROFILE/weixin-account.json"
+  WXOLD="$LAUNCH_DIR/$PROFILE/weixin-account.json"
   migrate_wechat_file
   OLD_WX="$(cfg_get "$PROFILES/$PROFILE/cordis.patch.yml" weixinAccountFile)"
   if [ -f "$WXDEST" ]; then
