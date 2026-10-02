@@ -1678,18 +1678,21 @@ export function apply(ctx, config) {
         // 升级 DSH + bot（调用 setupdsh.sh）
         const helper = join(dirname(fileURLToPath(import.meta.url)), '..', 'setupdsh-helper.sh');
         if (existsSync(helper)) {
-          await telegram.sendMessage(chatId, '⬆️ 正在启动 SetupDSH&BOT 升级…', {
-            parse_mode: 'HTML',
-          });
+          // ⚠️ 先 spawn 再回执：回执曾经写死走 telegram.sendMessage(chatId)，
+          //    微信入站时 chatId 是微信用户 id → 必报 chat not found，
+          //    异常又发生在 spawn 之前 → 升级脚本根本没被拉起（2026-10-02 实测）。
+          //    现在回执走 reply（微信走微信、TG 走 TG），且失败只当没回执，不挡升级。
           const child = spawn('bash', [helper], {
             detached: true,
             stdio: 'ignore',
             env: { ...process.env },
           });
+          child.on('error', (err) => error(`setupdsh 升级脚本拉起失败: ${err.message}`));
           child.unref();
+          await reply('⬆️ 正在启动 SetupDSH&BOT 升级…').catch(() => {});
           return true;
         }
-        await reply('⚠️ 未找到 setupdsh-helper.sh，无法执行升级。');
+        await reply('⚠️ 未找到 setupdsh-helper.sh，无法执行升级。').catch(() => {});
         return true;
       }
 
