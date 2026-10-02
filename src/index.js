@@ -336,7 +336,9 @@ export function apply(ctx, config) {
 
   // ── 宿主模型表：跟随 web 端「设置 → 模型」，加减模型即时生效 ──
   //    key 规则：单模型 provider 用别名，多模型 `<别名>:<模型id>`。
-  const KEY_ALIAS = { alibailian: 'ali', 'deepseek-official': 'ds', qwen36vq: 'local', qwen36iq4xs: 'iq4' };
+  // ⚠️ 2026-10-02：`dsa` = DeepSeek **账户**档（桌面版登录后 Web 端多出来的那一档）。
+  //    和 `ds`（API key 档）**模型名完全一样**，只能靠 provider 区分，别想靠名字区分。
+  const KEY_ALIAS = { alibailian: 'ali', 'deepseek-official': 'ds', 'deepseek-account': 'dsa', qwen36vq: 'local', qwen36iq4xs: 'iq4' };
   const menuKey = (pid) => KEY_ALIAS[pid] ?? pid;
   const routeKeyFor = (pid, modelId, isOnlyModel) => {
     const alias = menuKey(pid);
@@ -470,6 +472,39 @@ export function apply(ctx, config) {
           reasoningEffort: dsSection.reasoningEffort ?? 'none',
           isDefault: def?.provider === 'deepseek-official' && def?.model === id,
         });
+      }
+    }
+
+    // ③ DeepSeek **账户**档（dsh-base 内置的 dsh-llm-deepseek-account，provider = deepseek-account）。
+    //
+    //    用户 2026-10-02 要求：桌面版登录账户后 Web 端模型列表多出这一档，菜单要跟上。
+    //
+    //    ⚠️ 模型名和上面 ② 的 ds 档**一模一样**（两档同源，都是 dsh-llm-deepseek 的
+    //       DEFAULT_MODELS；账户档的 Config 直接复用它）。区分只能靠 provider：
+    //       key 前缀 `dsa:` vs `ds:`，菜单前缀 `DeepSeek Account` vs `深度求索`。
+    //    ⚠️ **不能**读 web patch 找它：账户档的目录是登录后向服务端**动态发现**的，
+    //       不落在任何配置文件里；web patch 里只有 llm-pi-ai 和 llm-deepseek 两段。
+    //       所以这里问 llm 服务（listModels('deepseek-account')）—— 没登录 → 空 → 不出现。
+    if (llm?.listModels) {
+      try {
+        const acctModels = (await llm.listModels('deepseek-account')) ?? [];
+        for (const m of acctModels) {
+          const id = m?.id ?? m;
+          if (!id) continue;
+          list.push({
+            key: routeKeyFor('deepseek-account', id, acctModels.length === 1),
+            label: 'DeepSeek Account',
+            short: `DeepSeek Account:${m?.name ?? id}`,
+            provider: 'deepseek-account',
+            model: id,
+            displayName: m?.name ?? id,
+            // 账户档没有独立的 settings 段可读；与 ds 档同口径，'none' = 不发参数。
+            reasoningEffort: 'none',
+            isDefault: def?.provider === 'deepseek-account' && def?.model === id,
+          });
+        }
+      } catch {
+        // 账户档目录拿不到就跳过，绝不影响其它档位（未登录时就是这条路径）。
       }
     }
 
