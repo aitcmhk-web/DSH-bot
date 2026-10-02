@@ -140,6 +140,41 @@ const sleepAbortable = (ms, signal) =>
 const LOCK_RETRY_MS = 60 * 1000;
 
 /**
+ * 心跳多久不刷新 = 陈旧，可以接管。
+ *
+ * 为什么不能只看「pid 还活着」：进程活着 ≠ 在干活。
+ *   getUpdates 挂死（黑洞 / 代理吞包）时进程活着、日志只有一行、消息全收不到，
+ *   老逻辑却因为 pidAlive(pid) 为真而把锁让给它 —— 一份半瘫实例能永久霸着锁，
+ *   重起的健康实例永远轮不上。90 秒 ≈ 3 个长轮询周期。
+ */
+const LOCK_STALE_MS = 90 * 1000;
+
+/**
+ * 单次 getUpdates 请求的硬超时。
+ *
+ * 为什么需要：调用方传进去的 signal 是**关停信号**（插件卸载时 abort），
+ *   它只保证「卸载能立刻停」，不保证「请求不会永远挂着」。长轮询本该 30 秒返回，
+ *   黑洞 / 代理吞包时 fetch 能挂到天荒地老 —— 进程活着、日志干净、消息全丢。
+ *   45 秒 = 长轮询 30 秒 + 15 秒余量。
+ */
+const POLL_REQUEST_TIMEOUT_MS = 45 * 1000;
+
+/**
+ * 把「关停信号」和「单次请求超时」合成一个信号。
+ *
+ * @param {AbortSignal|undefined} signal 关停信号（可空）
+ * @param {number} timeoutMs 单次请求最长等待
+ * @returns {AbortSignal|undefined}
+ */
+function withRequestTimeout(signal, timeoutMs) {
+  // 老 Node 没有 AbortSignal.timeout/any 时退回原行为（至少关停还能停）。
+  if (typeof AbortSignal?.timeout !== 'function') return signal;
+  const timeout = AbortSignal.timeout(timeoutMs);
+  if (!signal) return timeout;
+  return typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : signal;
+}
+
+/**
  * 409 之后的重试间隔。
  *
  * 为什么是「暂停 + 重试」而不是停死：409 只说明**此刻**有别人在 getUpdates，
@@ -152,7 +187,7 @@ const CONFLICT_RETRY_MS = 30 * 1000;
 const CONFLICT_NOTICE = '⚠️ 检测到另一个进程在用同一个 bot token（409）。我这边暂停轮询、稍后自动重试。如果机器人一直不回话，请检查是否有两份实例在跑（比如重复双击了启动器）。';
 
 /** 单实例锁被别人持有时发给主人的通知（同上口径）。 */
-const LOCK_BUSY_NOTICE = '⚠️ 检测到已有另一份实例在跑（单实例锁被占）。我这边先不轮询，每 60 秒重试一次，等它退出后自动接上。如果机器人一直不回话，请检查是否有两份实例在跑（比如重复双击了启动器）。';
+const LOCK_BUSY_NOTICE = '⚠️ 检测到已有另一份实例在跑（单实例锁被占）。我这边先不轮询，每 60 秒重试一次，等它退出、或它的心跳停 90 秒（判定为收不到消息的半瘫）后自动接上。如果机器人一直不回话，请检查是否有两份实例在跑（比如重复双击了启动器）。';
 
 /**
  * Telegram 返回 409 时另一个进程正在轮询同一个 bot token。
@@ -176,10 +211,16 @@ function isConflict(err) {
  *   第二个进程会让先启动的那个收到 409；而 409 原先只停轮询、不退进程，
  *   于是机器人静默变哑、服务状态还显示 running。与其事后救火，不如先决出唯一。
  *
- * 判定规则（锁文件内容就是一行 pid）：
+ * 判定规则（锁文件内容 = JSON `{pid, heartbeat}`）：
  *   - 文件不存在        → 独占创建（flag 'wx' 原子：两个实例同时启动也只有一个赢）；
- *   - 里面的 pid 还活着 → 让位：本次不轮询，由调用方 60 秒后再来（见 LOCK_RETRY_MS）；
- *   - pid 已死 / 内容坏 / 就是自己 → 陈旧残留（断电、被 kill 留下的），直接接管。
+ *   - pid 活着 + 心跳新鲜（< LOCK_STALE_MS）→ 让位：本次不轮询，由调用方 60 秒后再来；
+ *   - pid 活着但心跳停了 → **半瘫**（进程在、消息收不到）→ 接管，不能让它霸着锁；
+ *   - pid 已死 / 内容坏 / 就是自己 → 陈旧残留（断电、被 kill 留下的），直接接管；
+ *   - 旧格式（一行纯数字、没有心跳）→ 按老规矩「pid 活着就让位」，不误抢。
+ *
+ * 心跳由**轮询进度**驱动（pollLoop 每成功收一轮就调一次 beat），不是独立定时器：
+ *   进程活着但 getUpdates 挂死时，心跳自然停 —— 这才是「半瘫」的判据。
+ *   若用心跳定时器，挂死的实例照样按时报平安，那就白做了。
  *
  * ⚠️ fail-open：锁相关的任何异常都不许把插件弄崩，也不许让 bot 彻底不工作 ——
  *    读不了写不了就记日志、当作拿到了锁继续跑，只是失去这层保护。
@@ -208,35 +249,108 @@ export function createInstanceLock({ lockPath, log, error }) {
     }
   };
 
+  /** 本实例是否**真的写下了**锁文件（fail-open 时为 false，心跳也就没什么可刷的）。 */
+  let ownsFile = false;
+
+  /**
+   * 读锁文件 → `{pid, heartbeat, raw}`。
+   *
+   * 新格式是 JSON；旧格式（一行纯数字 pid、没有心跳）照样认，只是 heartbeat = NaN
+   * → 判定时退回「pid 活着就让位」，不误抢老实例的锁。
+   * 内容坏掉 → pid = NaN → 走「陈旧残留、直接接管」。
+   */
+  async function readLock() {
+    const raw = String(await readFile(lockPath, 'utf8').catch(() => '')).trim();
+    if (!raw) return { pid: NaN, heartbeat: NaN, raw };
+    if (raw.startsWith('{')) {
+      try {
+        const obj = JSON.parse(raw);
+        return { pid: Number(obj?.pid), heartbeat: Number(obj?.heartbeat), raw };
+      } catch {
+        return { pid: NaN, heartbeat: NaN, raw };
+      }
+    }
+    return { pid: Number.parseInt(raw, 10), heartbeat: NaN, raw };
+  }
+
+  /** 锁文件内容：pid + 心跳时间戳。 */
+  const serialize = (pid) => `${JSON.stringify({ pid, heartbeat: Date.now() })}\n`;
+
+  /**
+   * 续心跳 / 查归属 —— 由 pollLoop 每轮调用。
+   *
+   * ⚠️ `refresh` 只有**收得到消息**的那一轮才为 true：心跳的语义是「我还在正常收消息」，
+   *    超时/失败的一轮照样续期的话，半瘫实例又会按时报平安，那这套判定就白做了。
+   *
+   * ⚠️ 只刷新/认账「还是自己的」锁：这期间我们可能已被判陈旧、锁被别人接管，
+   *    无脑重写会把新实例的锁覆盖掉 —— 那个新实例还以为自己独占，结果两个一起轮询。
+   *
+   * @param {boolean} [refresh] 是否顺手刷新心跳时间
+   * @returns {Promise<boolean>} 锁是否仍在自己手上（false = 该让出轮询了）
+   */
+  async function beat(refresh = true) {
+    if (!held) return false;
+    if (!ownsFile) return true; // fail-open：没有文件可续，也谈不上被接管
+    try {
+      const { pid } = await readLock();
+      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
+        // 锁已经是别人的 → 认账，别再假装持有（继续轮询只会跟对方抢同一个 token）。
+        held = false;
+        ownsFile = false;
+        error('单实例锁已被别的实例接管 —— 本实例停止续心跳，让出 Telegram 轮询');
+        return false;
+      }
+      if (refresh) await writeFile(lockPath, serialize(process.pid));
+      return true;
+    } catch (err) {
+      if (refresh) error(`刷新单实例锁心跳失败: ${err?.message}`);
+      return true; // 读/写失败不判死，下次再看
+    }
+  }
+
   /** 尝试获取。true = 现在可以轮询（含 fail-open 的情况）。 */
   async function acquire() {
     try {
       try {
         // 'wx' = 独占创建：文件已存在就 EEXIST，绝不覆盖别人写的 pid。
-        await writeFile(lockPath, String(process.pid), { flag: 'wx' });
+        await writeFile(lockPath, serialize(process.pid), { flag: 'wx' });
         held = true;
+        ownsFile = true;
         log(`已取得单实例锁（${lockPath}，pid ${process.pid}）`);
         return true;
       } catch (err) {
         if (err?.code !== 'EEXIST') throw err;
       }
 
-      const raw = String(await readFile(lockPath, 'utf8').catch(() => '')).trim();
-      const pid = Number.parseInt(raw, 10);
+      const { pid, heartbeat, raw } = await readLock();
       if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && pidAlive(pid)) {
-        log(`单实例锁被活着的 pid ${pid} 持有 —— 本实例先不轮询，${LOCK_RETRY_MS / 1000} 秒后再看`);
-        return false;
+        const staleMs = Date.now() - heartbeat;
+        // 心跳新鲜 → 让位；心跳缺失（旧格式）也按老规矩让位，不误抢。
+        if (!Number.isFinite(heartbeat) || staleMs < LOCK_STALE_MS) {
+          log(`单实例锁被活着的 pid ${pid} 持有 —— 本实例先不轮询，${LOCK_RETRY_MS / 1000} 秒后再看`);
+          return false;
+        }
+        error(
+          `单实例锁的持有者 pid ${pid} 还活着，但心跳已停 ${Math.round(staleMs / 1000)} 秒`
+            + `（超过 ${LOCK_STALE_MS / 1000} 秒 = 收不到消息的半瘫实例）—— 本实例接管（pid ${process.pid}）`,
+        );
+        await writeFile(lockPath, serialize(process.pid));
+        held = true;
+        ownsFile = true;
+        return true;
       }
 
       // pid 是死的（僵尸残留）/ 内容坏掉 / 就是自己（不可能有两个同 pid 的进程）→ 接管。
-      await writeFile(lockPath, String(process.pid));
+      await writeFile(lockPath, serialize(process.pid));
       held = true;
+      ownsFile = true;
       log(`单实例锁是陈旧残留（文件里的 pid：${raw || '(空)'}）—— 已接管（pid ${process.pid}）`);
       return true;
     } catch (err) {
       // fail-open：拿锁本身出问题，不能连累 bot 不工作。
       error(`单实例锁不可用（${err?.message}）—— 继续运行，只是失去这层保护`);
       held = true;
+      ownsFile = false; // 没写下文件 → 不续心跳（beat 直接跳过），也不去删别人的锁
       return true;
     }
   }
@@ -250,10 +364,11 @@ export function createInstanceLock({ lockPath, log, error }) {
   async function release() {
     if (!held) return;
     held = false;
+    if (!ownsFile) return; // fail-open 时没写过文件，也没什么可删
+    ownsFile = false;
     try {
-      const raw = await readFile(lockPath, 'utf8').catch(() => null);
-      if (raw === null) return; // 文件已经不在了
-      if (Number.parseInt(String(raw).trim(), 10) !== process.pid) return; // 已经是别人的锁
+      const { pid } = await readLock();
+      if (pid !== process.pid) return; // 已经是别人的锁 / 文件已不在
       await unlink(lockPath);
       log('已释放单实例锁');
     } catch (err) {
@@ -261,7 +376,7 @@ export function createInstanceLock({ lockPath, log, error }) {
     }
   }
 
-  return { acquire, release, path: lockPath, get held() { return held; } };
+  return { acquire, release, beat, path: lockPath, get held() { return held; } };
 }
 
 /**
@@ -1173,10 +1288,20 @@ export function apply(ctx, config) {
     let conflictStreak = 0;
     while (!state.stopped) {
       let updates;
+      // 单实例锁是否仍在自己手上（收得到消息的那一轮才算数，见下面 beat）。
+      let stillOurs = true;
       try {
-        updates = await telegram.getUpdates(offset, 30, pollAbort?.signal);
+        updates = await telegram.getUpdates(
+          offset,
+          30,
+          withRequestTimeout(pollAbort?.signal, POLL_REQUEST_TIMEOUT_MS),
+        );
         // 这一轮拿到了（哪怕是空数组）说明此刻没人和我们抢 → 冲突计数归零。
         conflictStreak = 0;
+        // 收得到消息 = 还活着 → 续一次单实例锁的心跳（半瘫的实例得不到这一步）。
+        // 若锁已被判陈旧、被别的实例接管：先把手上这批消息处理完，再让出轮询（见循环末尾），
+        // ⛔ 不能在这一步直接 return —— 那会把已经取回来的消息丢掉。
+        stillOurs = lock ? await lock.beat(true) : true;
       } catch (err) {
         if (state.stopped) break;
         if (isConflict(err)) {
@@ -1194,9 +1319,14 @@ export function apply(ctx, config) {
           await sleep(CONFLICT_RETRY_MS);
           continue;
         }
-        if (!/abort/i.test(err.message ?? '')) {
+        if (err?.name === 'TimeoutError') {
+          // 单次请求超时：连接被吞了（黑洞 / 代理），必须断开重来 —— 挂死的实例永远收不到消息。
+          error(`getUpdates 单次请求超时（${POLL_REQUEST_TIMEOUT_MS / 1000} 秒无响应）—— 断开这次连接，3 秒后重试`);
+        } else if (!/abort/i.test(err.message ?? '')) {
           error(`getUpdates 失败: ${err.message}`);
         }
+        // 这一轮没收到消息 → **不续心跳**（半瘫的判据），但顺手看看锁还是不是自己的。
+        if (lock && !(await lock.beat(false))) return;
         await sleep(3000);
         continue;
       }
@@ -1230,6 +1360,12 @@ export function apply(ctx, config) {
         error(`跳过 ${skippedStale} 条超过 ${Math.round(config.backlogMaxAgeSeconds / 3600)} 小时的积压消息`);
       }
       if (newest !== null) offset = newest + 1;
+
+      // 锁已归别人（我们被判半瘫）→ 处理完这批就回外层重新排队，别跟它抢同一个 token。
+      if (!stillOurs) {
+        error('单实例锁已被别的实例接管 —— 让出 Telegram 轮询，回队伍重新排队');
+        return;
+      }
     }
   }
 
@@ -1908,25 +2044,30 @@ export function apply(ctx, config) {
   async function telegramPollWhenLocked() {
     if (!telegram || !lock) return;
     let waits = 0;
-    while (!state.stopped && !(await lock.acquire())) {
+    // 外层循环 = 「排队等锁 → 拿到就轮询 → 若被判半瘫、锁被接管，就回队伍里重排」。
+    // 有这一层，被接管的实例不会永久哑掉：接管的那个一旦退出/也半瘫，本实例能再接上。
+    while (!state.stopped) {
+      if (await lock.acquire()) {
+        waits = 0;
+        // pollLoop 只在两种情况下返回：插件被卸载（state.stopped），
+        // 或本实例被判半瘫、锁已被别的实例接管 → 回到外层重新排队。
+        await pollLoop();
+        continue;
+      }
       waits += 1;
       // 大声说一次就够，重试本身每 60 秒都会在 acquire 里留下可读的日志。
       if (waits === 1) {
         error('');
         error('❌ 单实例锁被另一个活着的进程持有 —— 本实例暂不轮询（不会退出进程）。');
         error('   常见原因：同一个 token 有两份实例在跑（比如重复双击了启动器）。');
-        error(`   每 ${LOCK_RETRY_MS / 1000} 秒重试一次，那份实例退出后本实例会自动接上。`);
+        error(`   每 ${LOCK_RETRY_MS / 1000} 秒重试一次；对方退出、或心跳停 ${LOCK_STALE_MS / 1000} 秒被判半瘫后，本实例自动接上。`);
       }
       // 通知同样节流：第 1 次 + 之后每 10 次一次（≈10 分钟），别刷屏。
       if (waits === 1 || waits % 10 === 0) await notifyOwner(LOCK_BUSY_NOTICE);
       await sleepAbortable(LOCK_RETRY_MS, pollAbort?.signal);
     }
-    if (state.stopped) {
-      // 等锁期间被卸载：锁若刚好被自己拿到就还回去，别给下一个进程留僵尸锁。
-      await lock.release();
-      return;
-    }
-    await pollLoop();
+    // 卸载（含等锁期间被卸载）：锁若还在自己手上就还回去，别给下一个进程留僵尸锁。
+    await lock.release();
   }
 
   // 两个轮询并行跑；单个挂掉不影响另一个（微信没登录也必须让 TG 照跑）。
