@@ -792,6 +792,63 @@ export function apply(ctx, config) {
   });
 
   // -------------------------------------------------------------------------
+  // 最高指令（HARD-RULES.md）：每动一次手，就把原文重新顶进上下文
+  // -------------------------------------------------------------------------
+  // 用户 2026-10-02 定：不是「开头读过一次就算」，而是「每动一次手就再出现一次」，
+  // 否则干着干着就忘了。
+  //
+  // 机制：DSH 的 `tools/post-execute` 是 waterfall（dsh-tools/lib/index.js:3504），
+  // 监听者可以返回 `{ kind: 'accept', additionalContexts: [message] }` ——
+  // 这些 context 会被原样 splice 进 loop 的 next-step inbox
+  // （dsh-agent-loop/lib/index.js:1154，**不做任何形状校验**），
+  // 于是它作为一条独立消息出现在我下一次请求里。
+  //
+  // ⚠️ 刻意**不**引 `@deepseek-ai/dsh-llm` 的 createUserMessage：本插件坚持零内部
+  //    依赖（见文件开头）。上游只 splice 不校验，所以这里手搓同形状的 user message。
+  // ⚠️ 文件在**启动时读一次**并缓存（用户 2026-10-02 定）—— 改完内容要重启 bot 才生效。
+  // ⚠️ 只挂「动手」类工具；read / grep / glob 这些不挂，省 token。
+  const HARD_RULES_PATH = new URL('../HARD-RULES.md', import.meta.url);
+  const HARD_RULES_TOOLS = new Set(['bash', 'edit', 'write', 'str-replace', 'str_replace']);
+  let hardRulesText = '';
+  try {
+    hardRulesText = readFileSync(HARD_RULES_PATH, 'utf8').trim();
+  } catch {
+    hardRulesText = '';
+  }
+  if (hardRulesText.length > 0) {
+    const hardRulesHandler = (exec, _result, next) => {
+      if (!HARD_RULES_TOOLS.has(String(exec?.name ?? ''))) return next();
+      return {
+        kind: 'accept',
+        additionalContexts: [{
+          id: randomUUID(),
+          role: 'user',
+          content: [{ type: 'text', text: hardRulesText }],
+          source: { kind: 'hard-rules' },
+        }],
+      };
+    };
+    // ⚠️ 挂两份（ctx + ctx.root）：`tools/post-execute` 是 agent 作用域事件，
+    //    插件根 ctx 通常收得到，但被挂到不相关 scope 下就会漏 —— 与
+    //    approval-bridge.js 同款做法（理由见其文件头注释）。waterfall 在第一个
+    //    返回决定值的监听者处终止，所以两份不会重复注入。
+    const targets = ctx.root && ctx.root !== ctx ? [ctx, ctx.root] : [ctx];
+    let mounted = 0;
+    for (const target of targets) {
+      if (typeof target?.on !== 'function') continue;
+      try {
+        target.on('tools/post-execute', hardRulesHandler);
+        mounted += 1;
+      } catch (err) {
+        log(`最高指令挂载失败: ${err?.message ?? err}`);
+      }
+    }
+    log(`最高指令已挂载（${mounted} 处 / ${hardRulesText.length} 字）：${HARD_RULES_PATH.pathname}`);
+  } else {
+    log(`最高指令文件为空或不存在，跳过挂载：${HARD_RULES_PATH.pathname}`);
+  }
+
+  // -------------------------------------------------------------------------
   // 排队：同一个会话的回合必须串行
   // -------------------------------------------------------------------------
   /** chatKey → Promise 链尾。 */
