@@ -825,9 +825,16 @@ export function apply(ctx, config) {
   if (hardRulesText.length > 0) {
     /** 动手类调用计数（插件实例级，ctx / ctx.root 两次挂载共用）。 */
     let hardRulesCalls = 0;
+    /** ⚠️ 同一次调用会被 ctx 与 ctx.root 两个挂载**各触发一次** —— 按 exec 对象身份去重，
+     *  保证「一次动手只计 1」。否则 HARD_RULES_EVERY_N=10 实际每 5 次就注一次
+     *  （2026-10-02 实测：注入落在第 1,6,11,16… 次动手）。 */
+    let hardRulesLastExec = null;
     const hardRulesHandler = (exec, _result, next) => {
       if (!HARD_RULES_TOOLS.has(String(exec?.name ?? ''))) return next();
-      hardRulesCalls += 1;
+      if (exec !== hardRulesLastExec) {
+        hardRulesLastExec = exec;
+        hardRulesCalls += 1;
+      }
       // 第 1 次就注入（开工先看到规则），之后每 HARD_RULES_EVERY_N 次一次：1, N+1, 2N+1…
       if (hardRulesCalls % HARD_RULES_EVERY_N !== 1) return next();
       return {
