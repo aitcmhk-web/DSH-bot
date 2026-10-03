@@ -431,6 +431,11 @@ export function apply(ctx, config) {
   //      进程重启 / 重启电脑 / 升级后重启**都不许动它**；只有 /model 手点那次才改。
   const pickedKeyFile = join(config.cwd || process.cwd(), '.botplugin-state.json');
   let hostPickedKey = null;
+  // 每个 chat 当前在用的会话 id（2026-10-03 加）。`/new` 换 id 后必须记住，
+  // 否则下一条消息又按老 id resume 回同一份历史 = 换了等于没换。
+  // ⚠️ 和 hostPickedKey 同住一个文件，所以**写入只能走 writePluginState()**：
+  //    两边各写各的整个 JSON 会互相抹掉（同 419 行那个教训）。
+  const chatSessionIds = new Map();
   try {
     // 同步读：文件只有几十字节，且 apply() 不是 async（不能用 await）。
     const saved = JSON.parse(readFileSync(pickedKeyFile, 'utf8'));
@@ -439,14 +444,27 @@ export function apply(ctx, config) {
     if (saved && typeof saved.hostPickedKey === 'string' && saved.hostPickedKey.trim()) {
       hostPickedKey = saved.hostPickedKey;
     }
+    // 会话 id 同理：读到就信。读不到 = 这个 chat 没有（会现造一个新的）。
+    if (saved && saved.sessions && typeof saved.sessions === 'object') {
+      for (const [key, id] of Object.entries(saved.sessions)) {
+        if (typeof id === 'string' && id) chatSessionIds.set(key, id);
+      }
+    }
   } catch { /* 文件不存在 / JSON 坏了 → 当没有记忆，照常回落默认档 */ }
+  /** 落盘插件状态：模型记忆位 + 各 chat 的会话 id（唯一写入点）。 */
+  const writePluginState = () => {
+    try {
+      writeFileSync(
+        pickedKeyFile,
+        JSON.stringify({ hostPickedKey, sessions: Object.fromEntries(chatSessionIds) }, null, 2),
+      );
+    } catch { /* 写不了不影响本次运行，只是重启后仍会回落 / 换新会话 */ }
+  };
   /** 记住用户手选的档位（含落盘）。⚠️ 只该在用户**手点切换**时调用。 */
   const rememberPickedKey = (key) => {
     if (hostPickedKey === key) return;
     hostPickedKey = key;
-    try {
-      writeFileSync(pickedKeyFile, JSON.stringify({ hostPickedKey: key }, null, 2));
-    } catch { /* 写不了不影响本次运行，只是重启后仍会回落 */ }
+    writePluginState();
   };
 
   // ── 宿主模型表：跟随 web 端「设置 → 模型」，加减模型即时生效 ──
@@ -795,6 +813,14 @@ export function apply(ctx, config) {
     ctx,
     route: activeRoute,
     cwd: config.cwd || process.cwd(),
+    // 会话 id 落盘口：`/new` 换新会话后要记住新 id，否则下一条消息又 resume 回旧会话。
+    sessionIds: {
+      get: (key) => chatSessionIds.get(key) ?? null,
+      set: (key, id) => {
+        chatSessionIds.set(key, id);
+        writePluginState();
+      },
+    },
   });
 
   // -------------------------------------------------------------------------
@@ -1756,7 +1782,9 @@ export function apply(ctx, config) {
             sessionCreatedAt: sessionCreatedAt.get(chatKey) ?? 0,
           });
         }
-        await runtime.closeSession(chatKey);
+        // ⚠️ 必须用 resetSession（连会话 id 一起换），⛔ 不是 closeSession（只关句柄）——
+        //    老 id 还在的话，下一条消息会按它 resume 回同一份历史，「新会话」是假的。
+        await runtime.resetSession(chatKey);
         sessionCreatedAt.set(chatKey, Date.now());
         await telegram.sendMessage(chatId, '🆕 已开新会话（上一段进展已存进 handoff）。');
         return true;
@@ -1774,6 +1802,9 @@ export function apply(ctx, config) {
             workspace: config.cwd || process.cwd(),
           });
         }
+        // 重启前先把会话 id 换掉（与 /new、老 bot 同口径）：重启后第一条消息
+        // 开的是全新会话，靠冷启动记忆衔接，而不是 resume 回旧历史。
+        await runtime.resetSession(chatKey);
         // 真·重启：动作交给**进程外**的接力脚本（spawn detached → setsid 独立进程组），
         // 由它延迟几秒后杀宿主进程树、再拉起新宿主 —— 与老 bot 的 restart-helper.sh 同路。
         // 插件自己绝不能动手：自杀 = 当前回合被 dispose，连确认消息都发不出去。
@@ -1800,7 +1831,7 @@ export function apply(ctx, config) {
         }
         // 拉不起新进程（没有 helper/启动器/命令行）→ 退回「只重开会话」，
         // 绝不能让 bot 凭空消失。
-        await runtime.closeSession(chatKey);
+        await runtime.resetSession(chatKey);
         sessionCreatedAt.set(chatKey, Date.now());
         await telegram.sendMessage(
           chatId,

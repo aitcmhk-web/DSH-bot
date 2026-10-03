@@ -11,6 +11,13 @@
  *    session/disposed 只做最后冲刷），重建时 create 抛 already exists → 走
  *    resume —— 完整历史回放给新模型接着聊，上下文跨档保留；handoff 只是
  *    记忆兜底，不是衔接必需。
+ *
+ * 会话 id（2026-10-03 改）：`/new` 要**真的换一个 id** —— 老实现是
+ * `botplugin:<chatKey>` 固定一个，`/new` 只关句柄，下一条消息 create 又撞
+ * `already exists` → resume 回同一份持久化历史，用户看到的等于「没换」。
+ * 现在 id = `botplugin:<chatKey>:<时间戳36进制+随机>`，由 index.js 的
+ * `.botplugin-state.json` 记住（options.sessionIds），落盘里查不到就现造一个
+ * （老 chat 升级后第一条消息即从零开始，配合 index.js 的冷启动记忆注入）。
  */
 
 // 故意不 import 任何 @deepseek-ai/* 包；需要的东西都已本地实现：
@@ -86,15 +93,26 @@ export class BotRuntime {
   #cwd = process.cwd();
 
   /**
+   * 会话 id 的落盘口（见构造函数 JSDoc）。null = 没接，退回老口径
+   * 「一个 chat 一个固定 id」。
+   */
+  #sessionIds = null;
+
+  /**
    * @param {object} options
    * @param {object} options.ctx Cordis 插件上下文（apply 的第一个参数）
    * @param {{provider:string, model:string, reasoningEffort?:string}} [options.route] 默认档位
    * @param {string} [options.cwd] 会话工作区，默认进程 cwd
+   * @param {{get:(chatKey:string)=>(string|null), set:(chatKey:string, id:string)=>void}} [options.sessionIds]
+   *   会话 id 的落盘口（2026-10-03 加）。给了它，每个 chat 当前用哪个会话 id 由它记住，
+   *   `/new` 换 id 之后下一条消息才真的开新会话；不给则退回老口径
+   *   `${SESSION_PREFIX}:${chatKey}` 固定 id（`/new` 只关句柄、下次仍 resume 回旧历史）。
    */
-  constructor({ ctx, route, cwd } = {}) {
+  constructor({ ctx, route, cwd, sessionIds } = {}) {
     this.#ctx = ctx ?? null;
     if (route) this.#defaultRoute = route;
     if (cwd) this.#cwd = cwd;
+    if (sessionIds) this.#sessionIds = sessionIds;
     // ctx 级事件订阅必须在构造时就挂上：ctx.on('session/event') 跟具体 agent
     //    无关，等到建会话才挂会丢掉之前的事件。
     this.#bridgeCtxEvents();
@@ -291,6 +309,9 @@ export class BotRuntime {
 
   /**
    * 主动结束某个 chat 的会话（保留其它 chat）。
+   *
+   * ⚠️ 只关句柄，**不换会话 id**：下一条消息还会 resume 同一份持久化历史。
+   *    要真的从零开始请用 {@link BotRuntime#resetSession}。
    * @param {string} chatKey
    */
   async closeSession(chatKey) {
@@ -298,6 +319,25 @@ export class BotRuntime {
     if (!rec) return;
     this.#sessions.delete(chatKey);
     await this.#dispose(chatKey, rec);
+  }
+
+  /**
+   * 换新会话：关掉旧句柄，并作废旧会话 id —— 下一条消息建一个全新会话。
+   *
+   * 与 {@link BotRuntime#closeSession} 的区别就是这一步「作废 id」：
+   * 老 id 不变的话，`/new` 之后 create 会撞 `already exists` → resume 回旧历史。
+   *
+   * ⚠️ 调用顺序：要写 handoff / 记账，必须在**本方法之前**做
+   *    （`sessionIdOf()` 拿的是旧句柄，作废后就查不到了）。
+   * @param {string} chatKey
+   */
+  async resetSession(chatKey) {
+    const rec = this.#sessions.get(chatKey);
+    if (rec) {
+      this.#sessions.delete(chatKey);
+      await this.#dispose(chatKey, rec);
+    }
+    this.#mintSessionId(chatKey);
   }
 
   /**
@@ -462,6 +502,42 @@ export class BotRuntime {
     }
   }
 
+  /**
+   * 造一个新会话 id 并落盘（当前 chat 的下一条消息就用它）。
+   *
+   * 格式对齐老 bot 的 `tg-<chatId>-<时间戳>-<随机>`：**同一毫秒连点两次也不会重**。
+   * @param {string} chatKey
+   * @returns {string} 新会话 id
+   */
+  #mintSessionId(chatKey) {
+    const id = `${SESSION_PREFIX}:${chatKey}:${Date.now().toString(36)}${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+    try {
+      this.#sessionIds?.set?.(chatKey, id);
+    } catch (err) {
+      // 落盘失败不算致命：本次运行照常用新 id，只是重启后会再开一个新的。
+      logErr(`session id 落盘失败（重启后会另开新会话）: ${err?.message ?? err}`);
+    }
+    return id;
+  }
+
+  /**
+   * 这个 chat 现在该用哪个会话 id。
+   *
+   * ⚠️ 落盘里查不到就**现造一个**，不能退回「固定 id」—— 老 chat 升级上来的
+   *    第一份固定 id 会话在磁盘上还躺着，resume 回去就是几十万 token 的旧历史。
+   * @param {string} chatKey
+   * @returns {string}
+   */
+  #sessionIdFor(chatKey) {
+    const saved = this.#sessionIds?.get?.(chatKey);
+    if (typeof saved === 'string' && saved) return saved;
+    // 没接落盘口（如单测直接 new）：退回老口径，至少模型切换/重启能续上。
+    if (!this.#sessionIds) return `${SESSION_PREFIX}:${chatKey}`;
+    return this.#mintSessionId(chatKey);
+  }
+
   async #create(chatKey) {
     const agents = this.#agents();
     if (agents === undefined) {
@@ -474,6 +550,8 @@ export class BotRuntime {
     // 启动时序：inject:['agents'] 只保证服务对象在，不保证 agent 工厂已注册。
     //    第一条消息可能赶在工厂注册前进来，create/resume 会抛
     //    "no agent factory registered" —— 纯时序问题，等一等就好（最多 30s）。
+    // 会话 id 在进循环前定死一次：重试/回退 resume 都必须用同一个，别每次重造。
+    const sessionId = this.#sessionIdFor(chatKey);
     const deadline = Date.now() + 30000;
     for (;;) {
       try {
@@ -491,7 +569,7 @@ export class BotRuntime {
             // ⚠️ 官方写法是 `brandString(\`...\`)`，但 brandString 的官方实现就是
             //    `return value`（dsh-brand/lib/index.js:9）—— 纯类型标记，运行时是空操作。
             //    这里直接传字符串，语义完全相同，且省掉一个解析不到的依赖。
-            sessionId: `${SESSION_PREFIX}:${chatKey}`,
+            sessionId,
             meta: { cwd: this.#cwd },
             agentOptions,
           });
@@ -504,7 +582,7 @@ export class BotRuntime {
           //    重开持久化日志、回放事件、接着聊 —— 这正是聊天机器人重启后该有的行为。
           if (!String(err?.message ?? err).includes('already exists')) throw err;
           handle = await agents.resume({
-            resumeSessionId: `${SESSION_PREFIX}:${chatKey}`,
+            resumeSessionId: sessionId,
             agentOptions,
           });
           created = false;
