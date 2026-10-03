@@ -15,6 +15,32 @@ import { readFileSync, unlinkSync } from 'node:fs';
 
 const DEFAULT_API_ROOT = 'https://api.telegram.org';
 
+// 网络级失败重试节奏（共 3 次尝试）。只覆盖网络错误：机器到 api.telegram.org 会
+// 间歇性断（`fetch failed` / UND_ERR_CONNECT_TIMEOUT），而每个调用点都只有一次机会，
+// 断在收尾那几秒就会留下永远的「⏳ 正在处理…」并丢掉答案。Telegram 自己的业务错误
+// （400/429 等）不重试，原样抛给调用方。同款实现见仓库根 telegram.js。
+const RETRY_DELAYS_MS = [500, 1500];
+const TRANSIENT_CODES = new Set([
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_SOCKET',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'EPIPE',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+]);
+
+function isTransientNetworkError(err) {
+  if (err?.errorCode) return false; // 带 error_code = Telegram 业务错误
+  if (err?.name === 'AbortError') return false; // 长轮询被主动取消
+  const code = err?.cause?.code ?? err?.code ?? '';
+  if (TRANSIENT_CODES.has(code)) return true;
+  return /fetch failed|socket hang up|other side closed|terminated/i.test(String(err?.message ?? ''));
+}
+
 export class Telegram {
   /**
    * @param {string} token BotFather 给的 token（每个用户自己的）
@@ -27,8 +53,26 @@ export class Telegram {
     this.fileBase = `${root}/file/bot${token}`;
   }
 
-  /** Call any Bot API method; throws a descriptive error when `ok` is false. */
+  /**
+   * Call any Bot API method; throws a descriptive error when `ok` is false.
+   *
+   * 网络级失败自动重试（见 isTransientNetworkError），业务错误不重试。
+   */
   async call(method, payload = {}, options = {}) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.#callOnce(method, payload, options);
+      } catch (err) {
+        const delay = RETRY_DELAYS_MS[attempt];
+        if (delay === undefined || !isTransientNetworkError(err)) throw err;
+        const code = err.cause?.code ?? err.message;
+        console.error(`[tg] ${method} 网络失败(${code}),${delay}ms 后重试 [${attempt + 1}/${RETRY_DELAYS_MS.length}]`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  async #callOnce(method, payload, options) {
     const response = await fetch(`${this.base}/${method}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
