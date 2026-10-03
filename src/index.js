@@ -35,6 +35,7 @@ import { readWebLlmPiAi, readWebLlmDeepseek, webPatchPath } from './web-patch.js
 import { LiveStatus, describeTool } from './status.js';
 import { transcribe, configure as configureAsr, currentBackend } from './asr.js';
 import { installApprovalBridge } from './approval-bridge.js';
+import { createHardRulesHandler, HARD_RULES_EVERY_N } from './hard-rules.js';
 
 /** Cordis 插件名。 */
 export const name = 'botplugin';
@@ -933,77 +934,43 @@ export function apply(ctx, config) {
   });
 
   // -------------------------------------------------------------------------
-  // 最高指令（HARD-RULES.md）：每动一次手，就把原文重新顶进上下文
+  // 最高指令（HARD-RULES.md）：每干若干步，就把原文重新顶进上下文
   // -------------------------------------------------------------------------
-  // 用户 2026-10-02 定：不是「开头读过一次就算」，而是「每动若干次手就再出现一次」，
-  // 否则干着干着就忘了。频率 = 第 1 次 + 之后每 10 次（见 HARD_RULES_EVERY_N）。
-  //
-  // 机制：DSH 的 `tools/post-execute` 是 waterfall（dsh-tools/lib/index.js:3504），
-  // 监听者可以返回 `{ kind: 'accept', additionalContexts: [message] }` ——
-  // 这些 context 会被原样 splice 进 loop 的 next-step inbox
-  // （dsh-agent-loop/lib/index.js:1154，**不做任何形状校验**），
-  // 于是它作为一条独立消息出现在我下一次请求里。
-  //
-  // ⚠️ 刻意**不**引 `@deepseek-ai/dsh-llm` 的 createUserMessage：本插件坚持零内部
-  //    依赖（见文件开头）。上游只 splice 不校验，所以这里手搓同形状的 user message。
+  // 用户 2026-10-02 定：不是「开头读过一次就算」，而是「每干若干步就再出现一次」，
+  // 否则干着干着就忘了。2026-10-03 定：挂载点从 `tools/post-execute`（工具已经跑完才
+  // 触发，第一次动手本身来不及约束）换成 `agent/pre-step`（模型这一步的请求发出之前），
+  // 计数也从「按动手次数」改成「按步」—— 逻辑抽在 `src/hard-rules.js`，文件头写了机制
+  // 和两个必须守住的坑（空转步不记账、双挂载按 `agent:turn:step` 去重）。
   // ⚠️ 文件在**启动时读一次**并缓存（用户 2026-10-02 定）—— 改完内容要重启 bot 才生效。
-  // ⚠️ 只挂「动手」类工具；read / grep / glob 这些不挂，省 token。
   const HARD_RULES_PATH = new URL('../HARD-RULES.md', import.meta.url);
-  const HARD_RULES_TOOLS = new Set(['bash', 'edit', 'write', 'str-replace', 'str_replace']);
-  /**
-   * 每多少次动手类调用才注入一次。
-   * 用户 2026-10-02 定：每次都注入太频繁（一次任务动 20 次手要堆 20 份规则 ≈ 6000 token）。
-   * 计数规则：第 1 次就注入（开工先看到规则），之后每 N 次再来一次（1, N+1, 2N+1…）。
-   * ⚠️ 口径必须与 `DSH/hard-rules/index.mjs`（本机那份）保持一致。
-   */
-  const HARD_RULES_EVERY_N = 10;
   let hardRulesText = '';
   try {
     hardRulesText = readFileSync(HARD_RULES_PATH, 'utf8').trim();
   } catch {
     hardRulesText = '';
   }
-  if (hardRulesText.length > 0) {
-    /** 动手类调用计数（插件实例级，ctx / ctx.root 两次挂载共用）。 */
-    let hardRulesCalls = 0;
-    /** ⚠️ 同一次调用会被 ctx 与 ctx.root 两个挂载**各触发一次** —— 按 exec 对象身份去重，
-     *  保证「一次动手只计 1」。否则 HARD_RULES_EVERY_N=10 实际每 5 次就注一次
-     *  （2026-10-02 实测：注入落在第 1,6,11,16… 次动手）。 */
-    let hardRulesLastExec = null;
-    const hardRulesHandler = (exec, _result, next) => {
-      if (!HARD_RULES_TOOLS.has(String(exec?.name ?? ''))) return next();
-      if (exec !== hardRulesLastExec) {
-        hardRulesLastExec = exec;
-        hardRulesCalls += 1;
-      }
-      // 第 1 次就注入（开工先看到规则），之后每 HARD_RULES_EVERY_N 次一次：1, N+1, 2N+1…
-      if (hardRulesCalls % HARD_RULES_EVERY_N !== 1) return next();
-      return {
-        kind: 'accept',
-        additionalContexts: [{
-          id: randomUUID(),
-          role: 'user',
-          content: [{ type: 'text', text: hardRulesText }],
-          source: { kind: 'hard-rules' },
-        }],
-      };
-    };
-    // ⚠️ 挂两份（ctx + ctx.root）：`tools/post-execute` 是 agent 作用域事件，
+  const hardRulesHandler = createHardRulesHandler({
+    text: hardRulesText,
+    everyN: HARD_RULES_EVERY_N,
+    log: (msg) => log(msg),
+  });
+  if (hardRulesHandler !== null) {
+    // ⚠️ 挂两份（ctx + ctx.root）：`agent/pre-step` 是 agent 作用域事件，
     //    插件根 ctx 通常收得到，但被挂到不相关 scope 下就会漏 —— 与
-    //    approval-bridge.js 同款做法（理由见其文件头注释）。waterfall 在第一个
-    //    返回决定值的监听者处终止，所以两份不会重复注入。
+    //    approval-bridge.js 同款做法（理由见其文件头注释）。handler 内部按
+    //    `agent:turn:step` 去重，所以两份不会重复注入。
     const targets = ctx.root && ctx.root !== ctx ? [ctx, ctx.root] : [ctx];
     let mounted = 0;
     for (const target of targets) {
       if (typeof target?.on !== 'function') continue;
       try {
-        target.on('tools/post-execute', hardRulesHandler);
+        target.on('agent/pre-step', hardRulesHandler);
         mounted += 1;
       } catch (err) {
         log(`最高指令挂载失败: ${err?.message ?? err}`);
       }
     }
-    log(`最高指令已挂载（${mounted} 处 / ${hardRulesText.length} 字）：${HARD_RULES_PATH.pathname}`);
+    log(`最高指令已挂载（${mounted} 处 / 第 1 步 + 每 ${HARD_RULES_EVERY_N} 步 / ${hardRulesText.length} 字）：${HARD_RULES_PATH.pathname}`);
   } else {
     log(`最高指令文件为空或不存在，跳过挂载：${HARD_RULES_PATH.pathname}`);
   }
