@@ -9,3 +9,4 @@ weixin-account.json
 probe-resolution.mjs
 test-telegram-parity.mjs
 .staging/
+models-authority.json
