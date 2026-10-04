@@ -1633,12 +1633,7 @@ export function apply(ctx, config) {
               '',
               `当前：${current ? describeRoute(current) : '(未配置)'}`,
               '',
-              '点下面的按钮切换。切换后当前会话的完整历史由新模型接着用（上下文保留，不会丢）。',
-              '',
-              // ⚠️ 文案必须跟着机制走：跟随宿主时根本没有「回退顺序」——
-              //    真实依据是 web 端「设置 → 模型」里那份表的默认档。
-              useHostRoutes ? '可选档位（跟随 web 端「设置 → 模型」）：' : '启动回退顺序：',
-              ...picks.map((r) => `  ${r.short}`),
+              '点下面的按钮切换。',
             ].join('\n');
             await telegram.sendMessage(chatId, menu, {
               reply_markup: {
@@ -1666,10 +1661,6 @@ export function apply(ctx, config) {
               '',
               '回复 /model <编号> 直接切换，例如 /model 2',
               `（也认 key，例如 /model ${(picks.find((r) => !current || r.key !== current.key) ?? picks[0])?.key ?? ''}）`,
-              '',
-              useHostRoutes ? '可选档位（跟随 web 端「设置 → 模型」）:' : '自动回退顺序:' + picks.map((r) => `\n- ${r.short}`).join(''),
-              '',
-              '⚠️ 切换后当前会话历史由新模型接着用（上下文保留）。',
             ].join('\n');
             await reply(lines);
           }
