@@ -10,3 +10,7 @@ probe-resolution.mjs
 test-telegram-parity.mjs
 .staging/
 models-authority.json
+.env
+.env.*
+!.env.example
+!.env.instance.example

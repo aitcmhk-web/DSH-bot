@@ -43,14 +43,31 @@ import {
 //   子进程 cwd 跟着跑偏，BOT 的 agent 就去看 TG 的目录了 —— 正是「项目间串味」。
 // BOT 自己的配置必须由 BOT 自己说了算，不受「谁启动它」影响。
 const ENV_FILE_RAW = loadEnv();
+
+// ─── 多开实例（2026-10-06）─────────────────────────────────────────────────
+// 一个 TG 机器人身份 = 一个 token = 一个进程；同一套代码多开靠 BOT_INSTANCE 名字区分。
+// 用法：BOT_INSTANCE=bot2 node bot.js（bot.sh 对应 `./bot.sh -n bot2 start`）。
+// 实例名决定三件事，文件全部带 `-<名字>` 后缀，实例之间互不踩：
+//   ① 配置：.env.<名字> 存在则加载，其键**无条件覆盖**基础 .env（实例说了算）；
+//   ② 状态：.state-<名字>.json / .bot.lock-<名字>/ / .bot.pid-<名字>（见下文）；
+//   ③ 记忆：memory-<名字>/（流水账、handoff 是单份覆盖文件，共用会互相冲掉）。
+// ⛔ token 防撞 guard 在 config 之后：实例没有自己的 token 就拒绝启动——
+//    一个 token 只能一个进程，第二个进程会把先启动的撞成 409（AGENTS.md 第 8 条）。
+const INSTANCE = (process.env.BOT_INSTANCE ?? '').trim().replace(/[^A-Za-z0-9_-]/g, '');
+const INSTANCE_SUFFIX = INSTANCE ? `-${INSTANCE}` : '';
+const INSTANCE_RAW = INSTANCE ? loadEnv(join(ROOT, `.env.${INSTANCE}`)) : {};
+// loadEnv 对「已在 process.env 的键」跳过不写，所以实例覆盖必须手动赋值一遍。
+for (const [key, value] of Object.entries(INSTANCE_RAW)) process.env[key] = value;
 // ⚠️ 这里**只**强制 BOT 自己的目录类配置，**不含 HARNESS_HOME**：
 //    HARNESS_HOME 必须保持 ~/.dsh（模型凭据 `$DSH_HOME/.credentials.yaml` 在那，
 //    是「模型只有一份、web 端统一管」的单一事实源）。见 .env 末尾的详细说明。
 // ⚠️ 也不含 HARNESS_BIN：那个键走另一套规则 —— bot.sh 会解析出 dsh 的**绝对路径**并
 //    export（PATH 里没有 dsh 时这是唯一能起子进程的办法，见 bot.sh:122-131），
 //    而 .env 里写的是裸的 "dsh"。强行用 .env 覆盖会把 bot.sh 的努力抹掉 → 找不到 dsh。
+// 实例在跑时用「base .env + 实例文件」的合并结果来强制，实例自己的 HARNESS_PROFILE 才能生效。
+const MERGED_ENV_RAW = { ...ENV_FILE_RAW, ...INSTANCE_RAW };
 for (const key of ['HARNESS_WORKSPACE', 'HARNESS_PROFILE']) {
-  if (ENV_FILE_RAW[key]) process.env[key] = ENV_FILE_RAW[key];
+  if (MERGED_ENV_RAW[key]) process.env[key] = MERGED_ENV_RAW[key];
 }
 
 // ─── 流水账（用户 2026-09-16 定死的设计）─────────────────────
@@ -78,7 +95,9 @@ for (const key of ['HARNESS_WORKSPACE', 'HARNESS_PROFILE']) {
 //
 // ⚠️ 记忆目录 ≠ 工作目录：`config.workspace` 是 **DSH 子进程的 cwd**（必须 BOT/），
 //    两者概念不同，但 BOT 恰好都落在 `BOT/` 下。
-const MEMORY_DIR = process.env.HARNESS_MEMORY_DIR?.trim() || join(ROOT, 'memory');
+// 多开实例默认各用各的记忆目录；实例文件里显式写了 HARNESS_MEMORY_DIR 则以写的为准。
+const MEMORY_DIR = process.env.HARNESS_MEMORY_DIR?.trim()
+  || (INSTANCE ? join(ROOT, `memory-${INSTANCE}`) : join(ROOT, 'memory'));
 const LEDGER_DIR = join(MEMORY_DIR, 'conversation-cache', 'raw', 'ledger');
 // ⚠️ **程序**（共享）与**数据**（本项目独占）是两个东西：
 //   `MEMORY_SCRIPT` = 那份共享的 cache-manager.mjs（工具代码，所有项目共用一份）
@@ -188,11 +207,27 @@ if (!config.token) {
   process.exit(1);
 }
 
+// ⛔ 多开 token 防撞（409 guard）：实例没有「自己的 token」就拒绝启动。
+// 触发情形二选一：① .env.<实例> 不存在或缺 TELEGRAM_BOT_TOKEN → 继承了 base .env 的；
+// ② 写的 token 跟主实例一模一样。任何一种都是两个进程抢一个 token，
+// 先启动的会被 Telegram 踢成 409 Conflict（规矩：一个 token 只能一个进程）。
+if (INSTANCE) {
+  const baseToken = (ENV_FILE_RAW.TELEGRAM_BOT_TOKEN ?? '').trim();
+  if (config.token && config.token === baseToken) {
+    console.error(
+      `\n[bot] 实例 "${INSTANCE}" 没有自己独立的 TELEGRAM_BOT_TOKEN` +
+        `（检查 .env.${INSTANCE} 是否存在、是否填了它自己的 token）。\n` +
+        '[bot] 拒绝启动：两个进程共用一个 token，会把先启动的 bot 撞成 409。\n',
+    );
+    process.exit(1);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Persistent state: which Telegram user owns the bot, and each chat's session.
 // ---------------------------------------------------------------------------
 
-const STATE_FILE = join(ROOT, '.state.json');
+const STATE_FILE = join(ROOT, `.state${INSTANCE_SUFFIX}.json`);
 
 function loadState() {
   const blank = () => ({
@@ -3068,8 +3103,8 @@ function conflictExit() {
  *    这样无论从哪条路径拉起（bot.sh / restart-helper.sh / 双击 .command / 手动 node），
  *    锁都必然是真 pid —— 单一事实源，不再依赖调用方的自觉。
  */
-const LOCK_DIR = join(ROOT, '.bot.lock');
-const PID_FILE = join(ROOT, '.bot.pid');
+const LOCK_DIR = join(ROOT, `.bot.lock${INSTANCE_SUFFIX}`);
+const PID_FILE = join(ROOT, `.bot.pid${INSTANCE_SUFFIX}`);
 
 function claimInstanceLock() {
   try {
@@ -3182,6 +3217,9 @@ try {
 console.log(`[bot] logged in as @${botInfo.username} (${botInfo.id})`);
 // 登录成功才认领实例锁：启动失败（比如网络不通）不该留下一个指向死进程的锁。
 claimInstanceLock();
+console.log(
+  `[bot] instance: ${INSTANCE || 'main(默认)'} | state: ${STATE_FILE} | lock: ${LOCK_DIR}`,
+);
 console.log(`[bot] workspace: ${config.workspace}`);
 console.log(`[bot] model: ${activeRoute.key} — ${activeRoute.provider}/${activeRoute.model}`);
 if (config.allowedUsers.length > 0) {
