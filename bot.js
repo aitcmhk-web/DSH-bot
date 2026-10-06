@@ -1245,6 +1245,20 @@ async function handleMessage(message) {
   const rawTextPre = (message.text ?? message.caption ?? '').trim();
   if (rawTextPre.startsWith(WX_MIRROR_TAG)) return;
 
+  // ---- 群模式（2026-10-06 用户定）----
+  // 群里只应点名：@我 才接活，没人点名不抢话；陌生人的消息静默忽略
+  // （⛔ 不把「已绑定别的用户」这种私聊提示发进群里刷屏）；/指令仍留在私聊。
+  const isGroupChat = message.chat?.type === 'group' || message.chat?.type === 'supergroup';
+  let groupText = null;
+  if (isGroupChat) {
+    if (state.ownerUserId !== userId) return; // 陌生人：静默
+    const raw = (message.text ?? message.caption ?? '').trim();
+    const mention = `@${botInfo?.username ?? ''}`;
+    if (!botInfo?.username || !raw.includes(mention)) return; // 没点名 → 不接
+    groupText = raw.split(mention).join('').trim();
+    if (groupText.startsWith('/')) return; // 指令不进群，回私聊用
+  }
+
   const decision = authorize(userId);
   if (!decision.ok) {
     const why =
@@ -1255,7 +1269,7 @@ async function handleMessage(message) {
     return;
   }
 
-  const rawText = (message.text ?? message.caption ?? '').trim();
+  const rawText = isGroupChat ? groupText : (message.text ?? message.caption ?? '').trim();
 
   if (rawText.startsWith('/')) {
     const [command] = rawText.split(/\s+/);

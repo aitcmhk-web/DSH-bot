@@ -1443,9 +1443,26 @@ export function apply(ctx, config) {
    * 统一路径：TG → hub.inbound → ① 交给 DSH ② 镜像到其他端点。
    *    不要写成对镜像（mirrorTgToWeixin 那种）—— 那是 O(n²)。
    */
+  /** 本 bot 的 TG 用户名（群模式点名用，getMe 后填）。 */
+  let tgBotUsername = null;
+
   async function handleTelegramMessage(message) {
     const chatId = message.chat.id;
     const userId = message.from?.id;
+
+    // ---- 群模式（2026-10-06 用户定）----
+    // 群里只应点名：@我 才接活，没人点名不抢话；陌生人的消息静默忽略
+    // （⛔ 不把「已绑定别的用户」这种私聊提示发进群里刷屏）；/指令仍留在私聊。
+    const isGroupChat = message.chat?.type === 'group' || message.chat?.type === 'supergroup';
+    let groupText = null;
+    if (isGroupChat) {
+      if (state.ownerUserId !== userId) return; // 陌生人：静默
+      const raw = String(message.text ?? message.caption ?? '').trim();
+      const mention = `@${tgBotUsername ?? ''}`;
+      if (!tgBotUsername || !raw.includes(mention)) return; // 没点名 → 不接
+      groupText = raw.split(mention).join('').trim();
+      if (groupText.startsWith('/')) return; // 指令不进群，回私聊用
+    }
 
     const decision = authorize(userId);
     if (!decision.ok) {
@@ -1457,7 +1474,7 @@ export function apply(ctx, config) {
       return;
     }
 
-    const rawText = (message.text ?? message.caption ?? '').trim();
+    const rawText = isGroupChat ? groupText : (message.text ?? message.caption ?? '').trim();
 
     if (rawText.startsWith('/')) {
       const parts = rawText.split(/\s+/);
@@ -2033,7 +2050,10 @@ export function apply(ctx, config) {
 
     telegram
       .getMe()
-      .then((info) => log(`Telegram 已登录：@${info.username} (${info.id})`))
+      .then((info) => {
+        tgBotUsername = info.username ?? null;
+        log(`Telegram 已登录：@${info.username} (${info.id})`);
+      })
       .catch((err) => error(`连不上 Telegram：${err.message}`));
 
     // ---- 识图能力自动探测（与老 bot 的 bot.sh 启动钩子同款）----
