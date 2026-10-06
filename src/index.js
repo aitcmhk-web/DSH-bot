@@ -19,7 +19,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { existsSync, openSync, appendFileSync, readFileSync, readdirSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, openSync, appendFileSync, readFileSync, readdirSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { readFile, writeFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -1504,6 +1504,25 @@ export function apply(ctx, config) {
       return;
     }
 
+    // ---- 审核打回原因（任务 #4）：老板对卡片点了 ❌ 之后，下一句私聊文本 = 原因 ----
+    if (!isGroupChat && pendingRejects.size > 0) {
+      const hit = [...pendingRejects.entries()].find(([, info]) => info.chatId === chatId);
+      if (hit) {
+        const [no, info] = hit;
+        pendingRejects.delete(no);
+        const reasonText = String(message.text ?? '').trim();
+        if (!reasonText || reasonText.startsWith('/')) {
+          await telegram.sendMessage(chatId, `已取消 #${no} 的打回，卡片保持原样可重按。`);
+        } else {
+          const groupId = groupChatIdFromTable() ?? REVIEW_GROUP_FALLBACK;
+          await telegram.sendMessage(groupId, `打回 #${no}：${reasonText}`);
+          await editReviewCard(info.chatId, info.messageId, `❌ #${no} 已打回 —— 原因已发协作群，等小工返工。`);
+          log(`[审核] #${no} 打回原因已发协作群`);
+        }
+        return;
+      }
+    }
+
     const rawText = isGroupChat ? groupText : (message.text ?? message.caption ?? '').trim();
 
     if (rawText.startsWith('/')) {
@@ -1620,6 +1639,23 @@ export function apply(ctx, config) {
     const data = String(query.data ?? '');
     // 审批按钮（appr:ok:/appr:no:）优先于模型菜单处理。
     if (approvalBridge?.handleApprovalCallback(data, query)) return;
+    // 审核卡（任务 #4）：✅ → 群发「通过 #N」（主 bot 接力发版）；❌ → 等老板回复原因再群发。
+    if (data.startsWith('review:approve:') || data.startsWith('review:reject:')) {
+      const no = data.split(':')[2];
+      const cardChat = query.message?.chat?.id;
+      const cardMsgId = query.message?.message_id;
+      const groupId = groupChatIdFromTable() ?? REVIEW_GROUP_FALLBACK;
+      if (data.startsWith('review:approve:')) {
+        await telegram.sendMessage(groupId, `通过 #${no}`);
+        await editReviewCard(cardChat, cardMsgId, `✅ #${no} 已通过 —— 「通过 #${no}」已发协作群，等主 bot 发布。`);
+        log(`[审核] #${no} 老板点通过 → 已发协作群`);
+      } else {
+        pendingRejects.set(no, { chatId: cardChat, messageId: cardMsgId });
+        await telegram.sendMessage(cardChat, `❌ #${no} 打回 —— 请直接回复打回原因（一句话），我原样转进协作群；发 /cancel 取消。`);
+        log(`[审核] #${no} 老板点打回 → 等原因`);
+      }
+      return;
+    }
     if (data.startsWith('model:')) {
       await handleCommand(
         (t) => telegram.sendMessage(query.message.chat.id, t),
@@ -1691,19 +1727,28 @@ export function apply(ctx, config) {
     // systemd 注入 INVOCATION_ID；systemd 的 cgroup 管理能可靠地重启进程，
     // 所以 systemd 托管时可以安全走 RESTART_SUPERVISED（只杀宿主、不自己拉）。
     //
-    // ⚠️ launchd 例外：bot.sh daemon 用 exec node bot.js，exit 0 时
-    // plist 的 SuccessfulExit=false 判定为"正常退出"→ 不重拉。
-    // 如果走 RESTART_SUPERVISED 路径，helper 只杀进程等 launchd 拉起 → 永远等不到。
-    // 所以 launchd 必须走 hasLauncher / 原始命令行路径，让 helper 自己 nohup 拉起。
-    const supervisor = process.env.INVOCATION_ID ? 'systemd' : null;
+    // launchd（任务 #4，2026-10-07）：旧的「launchd 例外 → helper 自己 nohup 拉起」
+    // 废除 —— 那会造出**不受监管的孤儿实例**：它持有单实例锁，kickstart -k 杀不到，
+    // 只能人工 TERM（实例 93512 事故）。现在把 label 传给 helper，由它
+    // `launchctl kickstart -k` 杀旧 + 由 launchd 拉受监管的新实例 → 锁持有者=被监管进程。
+    // kickstart 不依赖宿主退出码（dsh 宿主吃 TERM 是 exit 0，SuccessfulExit=false 的
+    // KeepAlive 不会拉 —— kickstart -k 直接杀+拉，绕开这个坑）。
+    const launchdLabel = /^[\w.+-]+\.[\w.+-]+$/.test(String(process.env.XPC_SERVICE_NAME ?? '').trim())
+      ? String(process.env.XPC_SERVICE_NAME).trim()
+      : null;
+    const supervisor = process.env.INVOCATION_ID ? 'systemd' : launchdLabel ? 'launchd' : null;
     if (!hasLauncher && !scriptPath && !supervisor) return null;
     return {
       RESTART_DELAY_SECONDS: '8',
       RESTART_TARGET_PID: String(process.pid),
       RESTART_LOG: join(cwd, 'dsh-restart.log'),
-      // 被托管：只杀宿主，交给托管者拉起（helper 内不再 nohup / 不再 open 启动器）
+      // 被托管：launchd → kickstart -k（杀旧+受监管拉新）；systemd → 只杀，cgroup 拉新。
+      // ⛔ 两条路都不再 nohup 另起脱离进程。
       ...(supervisor
-        ? { RESTART_SUPERVISED: supervisor }
+        ? {
+            RESTART_SUPERVISED: supervisor,
+            ...(launchdLabel ? { RESTART_LAUNCHD_LABEL: launchdLabel } : {}),
+          }
         : hasLauncher
           ? { RESTART_LAUNCHER: launcher }
           : {
@@ -2256,27 +2301,29 @@ export function apply(ctx, config) {
         const table = readTaskTable();
         if (!table) return;
         const row = findTaskRow(table, '待领取');
-        if (!row) return;
-        setTaskStatus(row, '进行中'); // 先占位，防下轮重复触发
-        const groupId = groupChatIdFromTable();
-        const chatId = groupId ? Number(groupId) : state.ownerUserId;
-        if (!chatId) return;
-        const prompt = [
-          '<自动派活（系统触发，无需回复此段）>',
-          `任务表 #${row.no} 派给你。任务：${row.task}`,
-          '规矩：只改文件 + 自测，⛔ git 提交/推送/发版由主 bot 验收后做；改完把任务表该行状态改成「待验收」；进度随时发回协作群。',
-          '</自动派活>',
-        ].join('\n');
-        const msg = { source: 'tg', chatId, text: prompt, raw: null };
-        void enqueue(`tg:${chatId}`, () => promptFromHub(msg));
-        log(`[任务表] #${row.no} 已领活 → chat ${chatId}`);
+        if (row) {
+          setTaskStatus(row, '进行中'); // 先占位，防下轮重复触发
+          const groupId = groupChatIdFromTable();
+          const chatId = groupId ? Number(groupId) : state.ownerUserId;
+          if (chatId) {
+            const prompt = [
+              '<自动派活（系统触发，无需回复此段）>',
+              `任务表 #${row.no} 派给你。任务：${row.task}`,
+              '规矩：只改文件 + 自测，⛔ git 提交/推送/发版由主 bot 验收后做；改完把任务表该行状态改成「待验收」；进度随时发回协作群。',
+              '</自动派活>',
+            ].join('\n');
+            const msg = { source: 'tg', chatId, text: prompt, raw: null };
+            void enqueue(`tg:${chatId}`, () => promptFromHub(msg));
+            log(`[任务表] #${row.no} 已领活 → chat ${chatId}`);
+          }
+        }
+        // 审核卡（任务 #4）：同一轮询顺带扫「待审核」行 → 老板私聊卡片（REVIEWER_MODE 才开）
+        reviewTick(table);
       } catch (err) {
         error(`[任务表] 轮询失败: ${err?.message ?? err}`);
       }
     }, TASK_POLL_MS);
   }
-  watchTaskTable();
-
   // -------------------------------------------------------------------------
   // 审核弹窗（任务 #4，2026-10-07）：插件版 = 审核实例。任务表出现「待审核」行 →
   // 给老板 TG 私聊发审核卡片（inline_keyboard：✅通过 #N / ❌打回 #N）。
@@ -2334,31 +2381,133 @@ export function apply(ctx, config) {
     log(`[审核] #${row.no} 审核卡片已发老板私聊`);
   }
 
-  function watchReviewCards() {
-    setInterval(() => {
-      try {
-        if (state.stopped || !REVIEWER_MODE) return;
-        const table = readTaskTable();
-        if (!table) return;
-        const row = findReviewRow(table);
-        if (!row || reviewCardsSent.has(row.no)) return;
-        reviewCardsSent.add(row.no); // 先记后发：发送失败就移除，下一轮重试（成功恰好一次）
-        sendReviewCard(row).catch((err) => {
-          reviewCardsSent.delete(row.no);
-          error(`[审核] #${row.no} 卡片发送失败，下轮重试: ${err?.message ?? err}`);
-        });
-      } catch (err) {
-        error(`[审核] 轮询失败: ${err?.message ?? err}`);
-      }
-    }, TASK_POLL_MS);
+  /** 审核轮：发现「待审核」行就发卡（挂在 watchTaskTable 的同一个 5s 轮询里）。 */
+  function reviewTick(table) {
+    if (!REVIEWER_MODE) return;
+    const row = findReviewRow(table);
+    if (!row || reviewCardsSent.has(row.no)) return;
+    reviewCardsSent.add(row.no); // 先记后发：发送失败就移除，下一轮重试（成功恰好一次）
+    sendReviewCard(row).catch((err) => {
+      reviewCardsSent.delete(row.no);
+      error(`[审核] #${row.no} 卡片发送失败，下轮重试: ${err?.message ?? err}`);
+    });
   }
-  watchReviewCards();
+  watchTaskTable();
+
+  // ── 互为看门狗（任务 #11，2026-10-07 老板令）：插件版 ↔ 主 bot 对等互查 + 拉活 ──
+  // 每 5 分钟查主 bot（BOT/.bot.pid kill -0 + BOT/bot.log mtime——主 bot #11 起心跳
+  // 保鲜，空闲期不再静默）；判死/假活 → 协作群公告 → `launchctl kickstart -k`
+  // 拉**对方**（com.local.dsbot，launchctl print 实查可达）的 launchd 服务——
+  // 锁持有者=被监管进程（#4 孤儿教训）。防风暴：拉活冷却 10 分钟；连续 3 次拉不活
+  // → 升级公告请老板人工处理并停止重试，对端恢复后自动重新纳入看护。
+  // ⛔ 自杀禁令：插件版只拉主 bot 标签，绝不碰自己（com.local.dshbot.dshbot）。
+  const PEER_ROOT = process.env.DSH_PEER_ROOT ?? '/Users/tcm/DSH/BOT';
+  const PEER_LAUNCHD_LABEL = process.env.DSH_PEER_LAUNCHD_LABEL ?? 'com.local.dsbot';
+  const PEER_COOLDOWN_MS = 10 * 60 * 1000;
+  const PEER_LOG_STALE_MS = 15 * 60 * 1000;
+  const PEER_MAX_REVIVES = 3;
+  const peerState = { badSince: null, attempts: 0, gaveUp: false, lastKickAt: 0 };
+
+  function peerPidAlive(pid) {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return err?.code === 'EPERM';
+    }
+  }
+
+  /** 对端（主 bot）存活检查：判定与主 bot bot.js 的 livenessVerdict 同款
+   *  （跨运行时各一份，改判定两边同步）。健康返回 null。 */
+  function checkPeerAlive(now, root = PEER_ROOT) {
+    let pid = NaN;
+    try {
+      pid = parseInt(readFileSync(join(root, '.bot.pid'), 'utf8').trim(), 10);
+    } catch {
+      /* 无 pidfile */
+    }
+    if (!Number.isInteger(pid) || !peerPidAlive(pid)) {
+      return `主 bot 判死：pidfile 缺失或 pid ${pid || '?'} 已不在（kill -0 失败）`;
+    }
+    let mtimeMs = 0;
+    try {
+      mtimeMs = statSync(join(root, 'bot.log')).mtimeMs;
+    } catch {
+      return `主 bot 判假活：pid ${pid} 活着但日志 bot.log 不存在`;
+    }
+    const staleMin = Math.round((now - mtimeMs) / 60000);
+    if (now - mtimeMs > PEER_LOG_STALE_MS) {
+      return `主 bot 判假活：pid ${pid} 活着，但日志已 ${staleMin} 分钟没动（心跳 ≥3 次缺席）`;
+    }
+    return null;
+  }
+
+  function announcePeer(text) {
+    const chatId = Number(groupChatIdFromTable() ?? PEER_GROUP_FALLBACK);
+    if (!telegram || !Number.isInteger(chatId)) return;
+    void telegram.sendRich(chatId, text).catch((err) => error(`[peer] 公告发送失败: ${err.message}`));
+  }
+
+  function defaultPeerKick() {
+    const child = spawn('launchctl', ['kickstart', '-k', `gui/${process.getuid()}/${PEER_LAUNCHD_LABEL}`], { stdio: 'ignore' });
+    child.on('error', (err) => error(`[peer] kickstart 失败: ${err.message}`));
+  }
+
+  /** 对端巡检一步：判定 → 公告 → 拉活（冷却/升级在状态里）。kick 可注入（测试用）。 */
+  function peerTick(now = Date.now(), kick = defaultPeerKick) {
+    const v = checkPeerAlive(now);
+    if (!v) {
+      if (peerState.gaveUp) log('[peer] 对端恢复 —— 重新纳入看护');
+      peerState.badSince = null;
+      peerState.attempts = 0;
+      peerState.gaveUp = false;
+      peerState.lastKickAt = 0;
+      return;
+    }
+    if (!peerState.badSince) {
+      peerState.badSince = now;
+      peerState.attempts = 0;
+    }
+    if (peerState.gaveUp) return;
+    if (peerState.attempts > 0 && now - peerState.lastKickAt < PEER_COOLDOWN_MS) return; // 冷却期
+    if (peerState.attempts >= PEER_MAX_REVIVES) {
+      peerState.gaveUp = true;
+      error(`[peer] 连续 ${peerState.attempts} 次拉活无效 —— 停止重试，升级给老板人工处理`);
+      announcePeer(`🐕 看门狗升级：${v}；已连续拉活 ${peerState.attempts} 次无效 → 停止自动重试，请老板人工处理`);
+      return;
+    }
+    peerState.attempts += 1;
+    peerState.lastKickAt = now;
+    error(`[peer] ${v} → kickstart 拉活（第 ${peerState.attempts}/${PEER_MAX_REVIVES} 次）`);
+    announcePeer(`🐕 看门狗：${v} → 已 launchctl kickstart 拉活（第 ${peerState.attempts}/${PEER_MAX_REVIVES} 次）`);
+    kick();
+  }
+
+  function watchPeerHerd() {
+    return setInterval(() => {
+      try {
+        if (!state.stopped) peerTick();
+      } catch (err) {
+        error(`[peer] 巡检失败: ${err?.stack ?? err?.message}`);
+      }
+    }, 5 * 60 * 1000);
+  }
 
   // 卸载
   // -------------------------------------------------------------------------
+  // #11 对等看门狗 + 心跳的定时器：注册在任务表切片之外（测试桩只捕获任务表轮询）。
+  // 心跳两边都要发：本插件侧 bot.log 是 master 反查我的 mtime 判据；master 的
+  // bot.log 由它自己的心跳保鲜。对端巡检只在审核实例开（REVIEWER_MODE 且配了
+  // telegram —— 有嗓子的实例才有权拉活：没 token 的插件实例拉了主 bot 也没人通报）。
+  let peerTimer = null;
+  if (REVIEWER_MODE && telegram) peerTimer = watchPeerHerd();
+  const hbTimer = setInterval(() => log('[hb] 心跳正常（插件活、事件循环通）'), 5 * 60 * 1000);
+
   ctx.on('dispose', async () => {
     state.stopped = true;
     if (taskTimer) clearInterval(taskTimer);
+    if (peerTimer) clearInterval(peerTimer);
+    if (hbTimer) clearInterval(hbTimer);
     approvalBridge?.dispose();
     pollAbort?.abort();
     wxAbort?.abort();

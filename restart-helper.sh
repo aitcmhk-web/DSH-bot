@@ -11,8 +11,12 @@
 #   RESTART_NODE/RESTART_SCRIPT/RESTART_ARGS/RESTART_CWD
 #                          没有启动器时按原始命令行 nohup 拉起（尽力而为）
 #   RESTART_TG_TOKEN       Telegram token（用于等旧进程真正释放 token，防 409；可选）
-#   RESTART_SUPERVISED     托管者名（systemd / launchd）。有它时**只杀宿主、不再拉起** ——
-#                          托管者会把新实例拉起来，再 nohup 一份就是双实例抢 token（409）。
+#   RESTART_SUPERVISED     托管者名（systemd / launchd）。
+#                          systemd → 只杀宿主（cgroup 拉新）；
+#                          launchd → 配 RESTART_LAUNCHD_LABEL 走 `launchctl kickstart -k`
+#                          （杀旧 + 受监管拉新，锁持有者=被监管进程，不留孤儿）。
+#                          ⛔ 两者的兜底语义都是「不 nohup 另起脱离进程」——
+#                          再 nohup 一份就是孤儿锁持有者 + 双实例抢 token（409）。
 #   RESTART_LOG            日志文件（默认 <工作目录>/dsh-restart.log）
 #   RESTART_DELAY_SECONDS  动手前的延迟（默认 8s：让确认消息发出、当前回合走完）
 #
@@ -31,6 +35,22 @@ sleep "$DELAY"
 
 [ -n "$TARGET_PID" ] || { log "❌ 没给目标 pid，放弃重启"; exit 1; }
 kill -0 "$TARGET_PID" 2>/dev/null || { log "ℹ️ 目标 pid=$TARGET_PID 已不在（可能别人先停了），只负责拉起"; }
+
+# launchd 托管（任务 #4，2026-10-07）：kickstart -k = 杀旧 + 由 launchd 拉受监管新实例。
+# ⛔ 不再 nohup 另起脱离进程 —— 那会造出「锁持有者不受监管」的孤儿（kickstart -k
+#    杀不到，只能人工 TERM，实例 93512 事故）。kickstart 不依赖宿主退出码
+#    （dsh 宿主吃 TERM 是 exit 0，SuccessfulExit=false 的 KeepAlive 不会拉）。
+if [ "${RESTART_SUPERVISED:-}" = "launchd" ] && [ -n "${RESTART_LAUNCHD_LABEL:-}" ]; then
+  log "ℹ️ 宿主由 launchd 托管（label=${RESTART_LAUNCHD_LABEL}）：kickstart -k 杀旧 + 受监管拉新"
+  if launchctl kickstart -k "gui/$(id -u)/${RESTART_LAUNCHD_LABEL}" >> "$LOG" 2>&1; then
+    log "✅ kickstart 已发出；新实例由 launchd 监管"
+  else
+    log "❌ kickstart 失败（label 对不上 / 权限？）—— 宿主未动，请手工 launchctl kickstart 或重启"
+  fi
+  sleep 3
+  log "restart-helper 结束"
+  exit 0
+fi
 
 # 杀进程树：不假设目标是组长（nohup & 不新建进程组），先查真实 PGID；
 # 递归收子孙（DSH 宿主下面挂着会话子进程），先杀子孙再杀本体；

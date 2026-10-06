@@ -115,6 +115,11 @@ export class Telegram {
     return this.call('sendMessage', { chat_id: chatId, text, ...extra });
   }
 
+  /** 编辑已发出消息的文本（审核卡片按完按钮后改状态用；失败由调用方兜底）。 */
+  editMessageText(chatId, messageId, text, extra = {}) {
+    return this.call('editMessageText', { chat_id: chatId, message_id: messageId, text, ...extra });
+  }
+
   /**
    * 发送带格式的消息：markdown → Telegram HTML。
    *

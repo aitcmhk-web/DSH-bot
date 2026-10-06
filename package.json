@@ -1,6 +1,6 @@
 {
   "name": "dsh-botplugin",
-  "version": "1.0.29",
+  "version": "1.0.30",
   "description": "Telegram and WeChat bridges plus handoff continuity for DeepSeek Harness (DSH)",
   "keywords": [
     "dsh-plugin",

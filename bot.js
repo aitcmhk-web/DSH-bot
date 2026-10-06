@@ -1361,12 +1361,61 @@ function setTaskStatus(row, nextStatus) {
 /** 任务表轮询（worker 侧）：领「负责=本实例名 且 状态=待领取 / 打回」的行 → 占位「进行中」→ 触发干活轮。
  *  干活的播报不走「回群消息」（worker 群消息一律静默），走这轮 submitTurn 的回答发回协作群。 */
 function watchWorkerTasks() {
+  // 任务纯净（任务 #10，2026-10-07 老板令，防「越干越糊」）：
+  //   ① 每个任务完结（行离开「进行中」：交付待验收/被改派/打回后回合结束）→
+  //      接下一段活之前 resetSession()（等价 /new）：新 sessionId，下一条领活
+  //      prompt 走新会话首条 → takeBootstrapPrefix 照常注入记忆/AGENTS/最高指令；
+  //      历史不丢（各实例流水账兜底）。workerCurrentTask 挂 state 持久化——
+  //      进程重启后照样能判「上一单已完结」。
+  //   ② 行打回累计 ≥3 次（结论列数「❌ 打回」）→ ⛔ 不再回流原小工：自动把行
+  //      改派给队列最短（进行中行数最少）的其他小工，结论注明「3 次打回换人」。
+  let workerCurrentTask = state?.workerTask ?? null; // { no, chatId }
   setInterval(() => {
     try {
       if (!INSTANCE) return; // worker 必有名（BOT_INSTANCE）；没名就当没这角色
       const table = readTaskTable();
       if (!table) return;
       const lines = table.split('\n');
+
+      // ── ① 上一单完结检测 → 重置会话（必须在领新活之前）──
+      if (workerCurrentTask) {
+        const rowLine = lines.find((l) => new RegExp(`^\\|\\s*${workerCurrentTask.no}\\s*\\|`).test(l));
+        const cells = rowLine ? rowLine.split('|') : [];
+        const stillMine = cells.length >= 6 && cells[3].trim() === INSTANCE && cells[4].trim() === '进行中';
+        if (!stillMine) {
+          resetSession(workerCurrentTask.chatId);
+          console.log(`[${_ts()}][任务表] #${workerCurrentTask.no} 完结 → 会话已重置（任务纯净，等价 /new）`);
+          workerCurrentTask = null;
+          delete state.workerTask;
+          saveState();
+        }
+      }
+
+      // ── ② 打回 ≥3 次的行：不再回流原小工，换队列最短的其他小工 ──
+      for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*打回\s*\|/);
+        if (!m || m[3] !== INSTANCE) continue;
+        const cells = lines[i].split('|');
+        const rejections = (cells[5] ?? '').match(/❌ 打回/g)?.length ?? 0;
+        if (rejections < 3) continue;
+        const queue = {};
+        for (const n of WORKER_NAMES) if (n !== INSTANCE) queue[n] = 0;
+        for (const line of lines) {
+          const mm = line.match(/^\|\s*\d+\s*\|[^|]+\|\s*([^\s|]+)\s*\|\s*进行中\s*\|/);
+          if (mm && mm[1] in queue) queue[mm[1]] += 1;
+        }
+        const target = Object.entries(queue).sort((a, b) => a[1] - b[1])[0]?.[0];
+        if (!target) continue;
+        cells[3] = ` ${target} `;
+        cells[4] = ' 待领取 ';
+        const prev = cells[5].trim();
+        cells[5] = ` ${(prev && prev !== '—' ? `${prev}；` : '') + `3 次打回换人 → 改派 ${target}`} `;
+        lines[i] = cells.join('|');
+        writeTaskTable(lines.join('\n'));
+        console.log(`[${_ts()}][任务表] #${cells[1].trim()} 打回 ${rejections} 次 → 换人 ${target}（任务纯净）`);
+        return; // 一轮只动一件事：换人后再等下一轮扫描（防同轮重复写表）
+      }
+
       let picked = -1;
       for (let i = 0; i < lines.length; i++) {
         const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*(?:待领取|打回)\s*\|/);
@@ -1384,6 +1433,9 @@ function watchWorkerTasks() {
       const groupId = groupChatIdFromTable();
       const chatId = groupId ? Number(groupId) : state.ownerUserId;
       if (!chatId) return;
+      workerCurrentTask = { no, chatId };
+      state.workerTask = workerCurrentTask;
+      saveState();
       const hasProgress = conclusionCol.includes(`你是子 bot ${INSTANCE}`) || conclusionCol.includes(`bot ${INSTANCE}`);
       const reasonBlock = conclusionCol ? [
         '',
@@ -1441,6 +1493,238 @@ function watchTaskTable() {
       console.error(`[${_ts()}][任务表] 轮询失败: ${err.message}`);
     }
   }, TASK_POLL_MS);
+}
+
+// ── 小工看门狗（任务 #9，2026-10-07 老板令：不能只派活不管）──────────────────
+// master 每 5 分钟静默巡检四个小工，两级判据：
+//   ① 存活：.bot.pid-00Xbot kill -0 **且** bot-00Xbot.log mtime 新鲜。
+//      ⚠️ 光 pid 活 ≠ 活着（004bot 实案：pid 8950 活着、日志停摆 12 分钟+）。
+//      小工侧每 5 分钟写一行心跳（见下）当活体信号 —— TG 轮询空闲期 getUpdates
+//      空转没有输出，日志本会静默；有心跳才能把「健康空闲」和「假活」分开，
+//      防误报才锁得住：日志 15 分钟没动（心跳 ≥3 次缺席）才算假活。
+//   ② 进度：任务表行「进行中/待领取」距上次快照 ≥30 分钟纹丝不动 = 停
+//      （只盯小工的活：待审核=等老板、待验收=主 bot 自己、已发布=终态，不算小工停）。
+// 判死/判停 → 协作群公告一句（谁+判据+多久没动）→ 进行中的行自动翻「待领取」
+// + 结论列注明改派原因（沿用现规矩）。⛔ 不杀进程、⛔ 不动 launchd —— 卡死的进程
+// 交它自己的 #4 自退（60 轮失败 exit 1）+ launchd KeepAlive 兜底，看门狗只看不动手。
+const WORKER_HEARTBEAT_MS = 5 * 60 * 1000;
+const HERD_CHECK_MS = 5 * 60 * 1000;
+const HERD_LOG_STALE_MS = 15 * 60 * 1000; // 3 次心跳缺席 = 假活
+const HERD_STALL_MS = 30 * 60 * 1000;
+const HERD_GROUP_FALLBACK = '-5334440553';
+const herdAlarmed = new Set(); // 边沿触发记忆：alive:<name> / stall:<no>:<status>
+const herdProgress = new Map(); // 任务表进度快照：no → { status, since }
+
+// 心跳（#9+#11）：活体信号。worker 和 master 都要写 —— master 的 bot.log 是
+// 插件版反查主 bot 的 mtime 判据（#11 对等互查），空闲期没心跳会误报假活。
+function startHeartbeat() {
+  setInterval(() => console.log(`[${_ts()}][hb] 心跳正常（进程活、事件循环通）`), WORKER_HEARTBEAT_MS).unref();
+}
+
+function workerPidPath(name) {
+  return join(APP_DIR, `.bot.pid-${name}`);
+}
+function workerLogPath(name) {
+  return join(APP_DIR, `bot-${name}.log`);
+}
+
+/** kill -0 探活：EPERM = 进程在但无权发信号，也算活。 */
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+/** 存活判据唯一实现（#9 小工 / #11 对端共用同一函数，别复制第二份判定）：
+ *  pidfile kill -0 **且** 日志 mtime 在 staleMs 内。健康返回 null。 */
+function livenessVerdict(name, pidPath, logPath, now, staleMs = HERD_LOG_STALE_MS) {
+  let pid = NaN;
+  try {
+    pid = parseInt(readFileSync(pidPath, 'utf8').trim(), 10);
+  } catch {
+    /* 无 pidfile */
+  }
+  if (!Number.isInteger(pid) || !pidAlive(pid)) {
+    return `${name} 判死：pidfile 缺失或 pid ${pid || '?'} 已不在（kill -0 失败）`;
+  }
+  let mtimeMs = 0;
+  try {
+    mtimeMs = statSync(logPath).mtimeMs;
+  } catch {
+    return `${name} 判假活：pid ${pid} 活着但日志 ${logPath.split('/').pop()} 不存在`;
+  }
+  const staleMin = Math.round((now - mtimeMs) / 60000);
+  if (now - mtimeMs > staleMs) {
+    return `${name} 判假活：pid ${pid} 活着，但日志已 ${staleMin} 分钟没动（心跳 ≥3 次缺席）`;
+  }
+  return null;
+}
+
+/** 单个小工存活检查。健康返回 null；否则返回「谁+判据+多久没动」一句话。 */
+function checkWorkerAlive(name, now) {
+  return livenessVerdict(name, workerPidPath(name), workerLogPath(name), now);
+}
+
+/** 把一行翻「待领取」并在结论列追加改派原因（行被别人动过/不是进行中 → 放弃）。 */
+function reassignTaskRow(no, reason, now = Date.now()) {
+  const table = readTaskTable();
+  if (!table) return false;
+  const lines = table.split('\n');
+  const i = lines.findIndex((l) => new RegExp(`^\\|\\s*${no}\\s*\\|`).test(l));
+  if (i < 0) return false;
+  const cells = lines[i].split('|');
+  if (cells.length < 6 || !WORKER_NAMES.includes(cells[3].trim())) return false;
+  if (cells[4].trim() !== '进行中') return false;
+  cells[4] = ' 待领取 ';
+  const stamp = new Date(now).toISOString().slice(5, 16).replace('T', ' ');
+  const prev = cells[5].trim();
+  cells[5] = ` ${(prev && prev !== '—' ? `${prev}；` : '') + `🐕 看门狗改派（${stamp}）：${reason}`} `;
+  lines[i] = cells.join('|');
+  writeTaskTable(lines.join('\n'));
+  return true;
+}
+
+/** 一次巡检：存活 + 进度。公告合并成一条发协作群（群 id 表头优先，兜底协作群）。 */
+function herdTick(now = Date.now()) {
+  const verdicts = [];
+  // ① 存活（边沿触发：健康→判死才公告并改派，恢复后清除记忆）
+  for (const name of WORKER_NAMES) {
+    const v = checkWorkerAlive(name, now);
+    if (v) {
+      if (!herdAlarmed.has(`alive:${name}`)) {
+        herdAlarmed.add(`alive:${name}`);
+        verdicts.push(v);
+        for (const line of (readTaskTable() ?? '').split('\n')) {
+          const m = line.match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*([^|]+?)\s*\|/);
+          if (m && m[3] === name && m[4] === '进行中') {
+            verdicts.push(`#${m[1]}（${name}）→ 翻「待领取」改派`);
+            reassignTaskRow(m[1], `看门狗：${v}`, now);
+          }
+        }
+      }
+    } else {
+      herdAlarmed.delete(`alive:${name}`);
+    }
+  }
+  // ② 进度：同状态 ≥30 分钟 = 停（快照首见只记时，不判）
+  const table = readTaskTable();
+  if (table) {
+    for (const line of table.split('\n')) {
+      const m = line.match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*([^|]+?)\s*\|/);
+      if (!m || !WORKER_NAMES.includes(m[3])) continue;
+      const no = m[1];
+      const status = m[4];
+      if (status !== '进行中' && status !== '待领取') continue;
+      const prev = herdProgress.get(no);
+      if (!prev || prev.status !== status) {
+        herdProgress.set(no, { status, since: now });
+        continue;
+      }
+      const stuckMin = Math.round((now - prev.since) / 60000);
+      if (now - prev.since < HERD_STALL_MS || herdAlarmed.has(`stall:${no}:${status}`)) continue;
+      herdAlarmed.add(`stall:${no}:${status}`);
+      if (status === '进行中') {
+        verdicts.push(`#${no}（${m[3]}）停摆：「进行中」已 ${stuckMin} 分钟纹丝不动 → 翻「待领取」改派`);
+        reassignTaskRow(no, `看门狗：进行中 ${stuckMin} 分钟无进展，自动改派`, now);
+      } else {
+        verdicts.push(`#${no}（${m[3]}）卡住：「待领取」已 ${stuckMin} 分钟没人领 → 查小工是否全趴`);
+      }
+    }
+  }
+  if (verdicts.length > 0) {
+    console.error(`[${_ts()}][herd] ${verdicts.join('；')}`);
+    const chatId = Number(groupChatIdFromTable() ?? HERD_GROUP_FALLBACK);
+    if (telegram && Number.isInteger(chatId)) {
+      void telegram
+        .sendRich(chatId, `🐕 看门狗播报：\n${verdicts.map((v) => `· ${v}`).join('\n')}`)
+        .catch((err) => console.error(`[${_ts()}][herd] 公告发送失败: ${err.message}`));
+    }
+  }
+}
+
+function watchWorkerHerd() {
+  setInterval(() => {
+    try {
+      if (!shuttingDown) herdTick();
+    } catch (err) {
+      console.error(`[${_ts()}][herd] 巡检失败: ${err?.stack ?? err?.message}`);
+    }
+  }, HERD_CHECK_MS).unref();
+}
+
+// ── 互为看门狗（任务 #11，2026-10-07 老板令）：master ↔ 插件版 对等互查 + 拉活 ──
+// master 每 5 分钟查插件版（dshbot/.bot.pid kill -0 + dshbot/bot.log mtime——
+// 插件侧 #11 起有心跳写 stdout→plist 重定向进 bot.log，空闲期不再静默）；
+// 判死/假活 → 协作群公告 → `launchctl kickstart -k` 拉**对方**的 launchd 服务
+//（锁持有者=被监管进程，#4 孤儿教训）。防风暴：拉活后冷却 10 分钟；连续 3 次
+// 拉不活 → 升级公告请老板人工处理并停止重试，对端恢复后自动重新纳入看护。
+// ⛔ 自杀禁令：master 只拉 dshbot 标签，绝不碰自己（com.local.dsbot）。
+const PEER_ROOT = process.env.DSH_PEER_ROOT ?? '/Users/tcm/DSH/dshbot';
+const PEER_LAUNCHD_LABEL = process.env.DSH_PEER_LAUNCHD_LABEL ?? 'com.local.dshbot.dshbot';
+const PEER_COOLDOWN_MS = 10 * 60 * 1000;
+const PEER_MAX_REVIVES = 3;
+const peerState = { badSince: null, attempts: 0, gaveUp: false, lastKickAt: 0 };
+
+/** 对端（插件版）存活检查：同一份 livenessVerdict，换路径。 */
+function checkPeerAlive(now, root = PEER_ROOT) {
+  return livenessVerdict('插件版', join(root, '.bot.pid'), join(root, 'bot.log'), now);
+}
+
+function defaultPeerKick() {
+  const args = ['kickstart', '-k', `gui/${process.getuid()}/${PEER_LAUNCHD_LABEL}`];
+  const child = spawn('launchctl', args, { stdio: 'ignore' });
+  child.on('error', (err) => console.error(`[${_ts()}][peer] kickstart 失败: ${err.message}`));
+}
+
+/** 对端巡检一步：判定 → 公告 → 拉活（冷却/升淹没在状态里）。kick 可注入（测试用）。 */
+function peerTick(now = Date.now(), kick = defaultPeerKick) {
+  const v = checkPeerAlive(now);
+  if (!v) {
+    if (peerState.gaveUp) console.log(`[${_ts()}][peer] 对端恢复 —— 重新纳入看护`);
+    peerState.badSince = null;
+    peerState.attempts = 0;
+    peerState.gaveUp = false;
+    peerState.lastKickAt = 0;
+    return;
+  }
+  if (!peerState.badSince) {
+    peerState.badSince = now;
+    peerState.attempts = 0;
+  }
+  if (peerState.gaveUp) return;
+  if (peerState.attempts > 0 && now - peerState.lastKickAt < PEER_COOLDOWN_MS) return; // 冷却期
+  if (peerState.attempts >= PEER_MAX_REVIVES) {
+    peerState.gaveUp = true;
+    console.error(`[${_ts()}][peer] 连续 ${peerState.attempts} 次拉活无效 —— 停止重试，升级给老板人工处理`);
+    announcePeer(`🐕 看门狗升级：${v}；已连续拉活 ${peerState.attempts} 次无效 → 停止自动重试，请老板人工处理`);
+    return;
+  }
+  peerState.attempts += 1;
+  peerState.lastKickAt = now;
+  console.error(`[${_ts()}][peer] ${v} → kickstart 拉活（第 ${peerState.attempts}/${PEER_MAX_REVIVES} 次）`);
+  announcePeer(`🐕 看门狗：${v} → 已 launchctl kickstart 拉活（第 ${peerState.attempts}/${PEER_MAX_REVIVES} 次）`);
+  kick();
+}
+
+function announcePeer(text) {
+  const chatId = Number(groupChatIdFromTable() ?? HERD_GROUP_FALLBACK);
+  if (!telegram || !Number.isInteger(chatId)) return;
+  void telegram
+    .sendRich(chatId, text)
+    .catch((err) => console.error(`[${_ts()}][peer] 公告发送失败: ${err.message}`));
+}
+
+function watchPeerHerd() {
+  setInterval(() => {
+    try {
+      if (!shuttingDown) peerTick();
+    } catch (err) {
+      console.error(`[${_ts()}][peer] 巡检失败: ${err?.stack ?? err?.message}`);
+    }
+  }, HERD_CHECK_MS).unref();
 }
 
 async function handleMessage(message) {
@@ -1780,6 +2064,12 @@ async function handleRestartCommand(chatId, reply) {
       //    补齐插件同款变量，软件版才真的会重启。
       RESTART_TARGET_PID: String(process.pid),
       RESTART_LOG: join(APP_DIR, 'dsh-restart.log'),
+      // launchd 托管（任务 #4，2026-10-07）：helper 改走 `launchctl kickstart -k`
+      // 杀旧 + 受监管拉新 —— 不再 nohup 另起孤儿（锁持有者必须=被监管进程）。
+      // 判据：launchd 会给被它拉起的进程注入 XPC_SERVICE_NAME（带点号的 label 形状）。
+      ...(/^[\w.+-]+\.[\w.+-]+$/.test(String(process.env.XPC_SERVICE_NAME ?? '').trim())
+        ? { RESTART_SUPERVISED: 'launchd', RESTART_LAUNCHD_LABEL: String(process.env.XPC_SERVICE_NAME).trim() }
+        : {}),
       ...(existsSync(join(APP_DIR, '启动.command'))
         ? { RESTART_LAUNCHER: join(APP_DIR, '启动.command') }
         : {
@@ -3073,10 +3363,24 @@ async function pollLoop() {
     console.log(`[tg] 从 update ${state.lastUpdateId} 之后继续(停机期间的消息会补上)`);
   }
 
+  // 任务 #4（2026-10-07）：单次请求硬超时 + 连续失败自退。
+  // 硬超时与插件 src/index.js 同口径：45s = 长轮询 30s + 15s 余量 —— 黑洞/代理
+  // 吞包时 fetch 能挂到天荒地老，进程活着、消息全丢 = 假活（实例 81743 事故）。
+  // 连续 60 轮无成功收包（快速失败 ~3s/轮 ≈ 3 分钟；全走满超时 ≈ 45 分钟）就
+  // exit(1) 交外层拉起 —— launchd KeepAlive(SuccessfulExit=false) 会重拉非零退出。
+  const POLL_REQUEST_TIMEOUT_MS = 45 * 1000;
+  const POLL_FAIL_EXIT_ROUNDS = 60;
+  let pollFailStreak = 0;
+
   while (!shuttingDown) {
     let updates;
     try {
-      updates = await telegram.getUpdates(offset, 30, abortController.signal);
+      updates = await telegram.getUpdates(
+        offset,
+        30,
+        AbortSignal.any([abortController.signal, AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS)]),
+      );
+      pollFailStreak = 0;
     } catch (err) {
       if (shuttingDown) break;
       // Telegram hands updates to exactly one poller. A second process using the
@@ -3087,6 +3391,11 @@ async function pollLoop() {
       // only log real failures.
       if (!/abort/i.test(err.message ?? '')) {
         console.error(`[${_ts()}][tg] getUpdates failed: ${err.message}`);
+        pollFailStreak += 1;
+        if (pollFailStreak >= POLL_FAIL_EXIT_ROUNDS) {
+          console.error(`[${_ts()}][tg] 连续 ${pollFailStreak} 轮 getUpdates 失败（无一次成功收包）—— exit(1) 交外层（launchd KeepAlive）拉起新实例`);
+          process.exit(1);
+        }
       }
       await sleep(3000);
       continue;
@@ -3476,6 +3785,6 @@ try {
 
 // ---- 协作任务表轮询（主 bot = 验收/发布；派活逻辑见 watchTaskTable 头注释）----
 // 角色分流：worker（001bot…）只盯领活；master 盯验收。同一个 5 秒轮询节奏，账本同一张。
-if (BOT_ROLE === 'worker') watchWorkerTasks(); else watchTaskTable();
+if (BOT_ROLE === 'worker') { watchWorkerTasks(); startHeartbeat(); } else { watchTaskTable(); watchWorkerHerd(); watchPeerHerd(); startHeartbeat(); }
 
 await Promise.all([pollLoop(), weixinPollLoop()]);
