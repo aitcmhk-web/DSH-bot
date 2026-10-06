@@ -821,6 +821,56 @@ function enqueue(chatId, task) {
   return next;
 }
 
+/**
+ * 忙时合包（2026-10-06 用户定，TG 侧专用）：
+ * 我正在处理上一条消息时你又连发的几条，不再一条一条各开一轮，
+ * 而是先落进信箱，等当前这轮跑完，把积压的几条**合并成一条**投给模型（几条并作一次提问、一次回答）。
+ * 我空闲时你发的消息仍然**立刻**处理，零等待 —— 与消息窗口「打包间隔秒」那种固定等候是两回事。
+ * 微信侧不动：那边仍走原 enqueue 串行。
+ */
+const chatMailboxes = new Map(); // chatId -> { running, pending: Array<blocks> }
+
+/** 多条消息合成一份 blocks：相邻文本块用换行拼接；图片等非文本块按原顺序保留。 */
+function mergeBlocks(batches) {
+  if (batches.length === 1) return batches[0];
+  const merged = [];
+  for (const part of batches) {
+    for (const b of part) {
+      const last = merged[merged.length - 1];
+      if (b.type === 'text' && last?.type === 'text') last.text = `${last.text}\n${b.text}`;
+      else merged.push({ ...b });
+    }
+  }
+  return merged;
+}
+
+async function drainMailbox(chatId, box) {
+  try {
+    while (box.pending.length > 0) {
+      const batch = box.pending.splice(0);
+      console.log(`[tg] 忙时合包：本轮合并 ${batch.length} 条消息为一次提问`);
+      await runPrompt(chatId, mergeBlocks(batch)).catch((err) =>
+        console.error(`[tg] 合包轮次失败: ${err.message}`),
+      );
+    }
+  } finally {
+    if (box.pending.length === 0) chatMailboxes.delete(chatId);
+    else await drainMailbox(chatId, box).catch(() => {}); // 收尾间隙又来了新消息 → 继续清
+  }
+}
+
+function submitTurn(chatId, blocks) {
+  let box = chatMailboxes.get(chatId);
+  if (!box) {
+    box = { running: false, pending: [] };
+    chatMailboxes.set(chatId, box);
+  }
+  box.pending.push(blocks);
+  if (box.running) return; // 忙：先攒着，等当前轮跑完由 drain 合并带走
+  box.running = true;
+  drainMailbox(chatId, box).catch(() => {});
+}
+
 // ---------------------------------------------------------------------------
 // Mid-turn crash detection (advisory only)
 //
@@ -1283,6 +1333,11 @@ async function handleMessage(message) {
       if (result) {
         console.log(`[tg] voice transcription for ${userId}: ${result}`);
         blocks.push({ type: 'text', text: result });
+        // 语音回显（2026-10-06 用户定）：把听到的文字原样发回，让你核对转写对不对。
+        // 纯 sendMessage（不走富文本）：转写内容是原话，可能含 markdown/HTML 特殊字符。
+        await telegram
+          .sendMessage(chatId, `🎤 ${result}`)
+          .catch((err) => console.error(`[tg] 语音回显发送失败: ${err.message}`));
       } else {
         await telegram.sendMessage(chatId, '⚠️ 语音转文字结果为空，请确认语音内容是否清晰。');
         return;
@@ -1329,7 +1384,7 @@ async function handleMessage(message) {
     if (userText) ledgerRecord('user', userText, chatId);
   }
 
-  await enqueue(chatId, () => runPrompt(chatId, blocks));
+  submitTurn(chatId, blocks); // 忙时合包：空闲立刻跑，忙碌攒着合并跑（见 chatMailboxes 注释）
 
   // Debug: log blocks content for image troubleshooting
   const hasImage = blocks.some(b => b.type === 'image');
