@@ -3329,7 +3329,10 @@ async function hubBroadcast(text, label = 'DSH 输出', { exclude = null } = {})
 // ---- Weixin 入口(可选,第二接入层)----
 // 若 weixin-account.json 存在则启用微信长轮询,与 Telegram 并行。
 // 微信不可用(未登录/凭据缺失/运行出错)绝不影响 Telegram 主通道。
-const wxLoaded = weixin.load();
+// ⛔ 多开规矩（2026-10-06）：微信入口只归**主实例**。多实例共用本目录，都能看到
+//    weixin-account.json；两个进程同时轮询同一个微信账号必然互踩，所以
+//    BOT_INSTANCE 一存在就不读凭据、不启微信（Telegram 不受影响）。
+const wxLoaded = INSTANCE ? null : weixin.load();
 if (wxLoaded) {
   console.log(
     `[${_ts()}][wx] 已启用微信入口 -- bot ${weixin.botId || '(待确认)'} 主人: ${weixin.ownerWxUserId || '(待确认)'}`,
@@ -3345,8 +3348,12 @@ if (wxLoaded) {
   //   3. "向 filehelper 发空消息可绕过 ret=-2" 是未经实证的假设。
   // 真正的恢复判据只有一个：用户入站消息带来新鲜 context_token。
 } else {
-  console.log(`[${_ts()}][wx] 未检测到 weixin-account.json,微信入口未启用(不影响 Telegram)。`);
-  console.log(`[${_ts()}][wx] 要启用: cd ${APP_DIR} && node weixin-login.mjs,再重启 BOT`);
+  console.log(
+    `[${_ts()}][wx] ${INSTANCE ? `实例 ${INSTANCE} 不启微信（微信只归主实例，防两进程互踩）` : '未检测到 weixin-account.json,微信入口未启用'}(不影响 Telegram)。`,
+  );
+  if (!INSTANCE) {
+    console.log(`[${_ts()}][wx] 要启用: cd ${APP_DIR} && node weixin-login.mjs,再重启 BOT`);
+  }
 }
 
 // ---- 模型清单同步（单一权威源 + 广播到各 profile）----
