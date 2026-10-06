@@ -69,6 +69,12 @@ const MERGED_ENV_RAW = { ...ENV_FILE_RAW, ...INSTANCE_RAW };
 for (const key of ['HARNESS_WORKSPACE', 'HARNESS_PROFILE']) {
   if (MERGED_ENV_RAW[key]) process.env[key] = MERGED_ENV_RAW[key];
 }
+// ─── 实例角色（2026-10-06 群协作架构，用户定）────────────────────────────
+// master（默认）= 主 bot：接活、派活、验收、发版；
+// worker = 子 bot（001bot…）：只盯任务表领活干活，群消息一律静默（不抢话），
+//          领活/交活的播报由它干活轮次的回答发回协作群。
+// 生效方式：实例文件 .env.<名字> 里写 BOT_ROLE=worker（主实例不写 = master）。
+const BOT_ROLE = (process.env.BOT_ROLE ?? '').trim() === 'worker' ? 'worker' : 'master';
 
 // ─── 流水账（用户 2026-09-16 定死的设计）─────────────────────
 //
@@ -1315,20 +1321,26 @@ function registerGroupChat(chatId) {
 function taskRulesPrefix() {
   return [
     '<协作约定（系统注入，用户看不到）>',
-    '这是与「插件版 bot」的协作群。你是主 bot：管对话、验收、git 提交推送发版；插件版管干活。',
-    '用户说的活（改代码/改文件类）：不自己做——登记进 /Users/tcm/DSH/BOT/任务表.md（编号递增、负责=插件版、状态=待领取），群里回「已派活 #N」。',
-    '插件版领活干活（不推送不发版），干完标「待验收」；系统会自动触发你验收（diff/测试 → 过了升版本号+commit+push+tag+标「已发布」，不过标「打回」写清原因）。全程动作发回本群。',
+    '这是与「插件版 bot」的协作群。你是主 bot @DSHTG_bot：管对话、接活、派活、规划、测试、验收；001bot-004bot 是子 bot 负责干活（统一听你派活，平时不说话）；插件版 @newdshbot 只负责审核（它有 TG 端审核按钮，按钮是老板的批准入口）。',
+    '用户说的活（改代码/改文件类）：不自己做——登记进 /Users/tcm/DSH/BOT/任务表.md（编号递增、负责=001bot…004bot 里挑一个、状态=待领取），群里回「已派活 #N → @aitcm00Xbot」。',
+    '子 bot 领活干活（不推送不发版），干完标「待验收」；系统会自动触发你验收（diff/测试 → 过了标「待审核」并在群里公告等审核；不过标「打回」写清原因）。',
+    '「待审核」的活：老板在群里说「通过 #N」（或插件版审核按钮出结果）→ 你才把该行标「已发布」，走升版本号+commit+push+tag 发版。全程动作发回本群。',
     '</协作约定>',
     '',
   ].join('\n');
 }
 
-/** 找第一个「负责=插件版 且 状态=期望值」的表格行 → { index, line, no, task } 或 null。 */
+/** 干活的实例名（任务表「负责」列合法值）：主 bot 验收时这些行都算它的验收对象。 */
+const WORKER_NAMES = ['001bot', '002bot', '003bot', '004bot'];
+
+/** 找第一个「负责=worker 且 状态=期望值」的表格行 → { index, line, no, task, owner } 或 null。 */
 function findTaskRow(table, statusWanted) {
   const lines = table.split('\n');
   for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*插件版\s*\|\s*([^|]+?)\s*\|/);
-    if (m && m[3] === statusWanted) return { index: i, line: lines[i], no: m[1], task: m[2].trim() };
+    const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*([^|]+?)\s*\|/);
+    if (m && WORKER_NAMES.includes(m[3]) && m[4] === statusWanted) {
+      return { index: i, line: lines[i], no: m[1], task: m[2].trim(), owner: m[3] };
+    }
   }
   return null;
 }
@@ -1340,10 +1352,54 @@ function setTaskStatus(row, nextStatus) {
   const lines = table.split('\n');
   if (lines[row.index] !== row.line) return; // 行已被别人动过：放弃本轮，防覆盖
   const cells = lines[row.index].split('|'); // ['', no, task, owner, status, note, '']
-  if (cells.length < 6 || cells[3].trim() !== '插件版') return;
+  if (cells.length < 6 || !WORKER_NAMES.includes(cells[3].trim())) return;
   cells[4] = ` ${nextStatus} `;
   lines[row.index] = cells.join('|');
   writeTaskTable(lines.join('\n'));
+}
+
+/** 任务表轮询（worker 侧）：只领「负责=本实例名 且 状态=待领取」的行 → 占位「进行中」→ 触发干活轮。
+ *  干活的播报不走「回群消息」（worker 群消息一律静默），走这轮 submitTurn 的回答发回协作群。 */
+function watchWorkerTasks() {
+  setInterval(() => {
+    try {
+      if (!INSTANCE) return; // worker 必有名（BOT_INSTANCE）；没名就当没这角色
+      const table = readTaskTable();
+      if (!table) return;
+      const lines = table.split('\n');
+      let picked = -1;
+      for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*待领取\s*\|/);
+        if (m && m[3] === INSTANCE) { picked = i; break; }
+      }
+      if (picked < 0) return;
+      const rowLine = lines[picked];
+      const cells = rowLine.split('|'); // ['', no, task, owner, status, note, '']
+      if (cells.length < 6) return;
+      const no = cells[1].trim(), task = cells[2].trim();
+      cells[4] = ' 进行中 '; // 先占位，防下轮重复领
+      lines[picked] = cells.join('|');
+      writeTaskTable(lines.join('\n'));
+      const groupId = groupChatIdFromTable();
+      const chatId = groupId ? Number(groupId) : state.ownerUserId;
+      if (!chatId) return;
+      submitTurn(chatId, [
+        {
+          type: 'text',
+          text: [
+            '<领活（系统触发，无需回复此段）>',
+            `你是子 bot ${INSTANCE}（worker，TG 身份 @aitcm${INSTANCE.replace(/bot$/, '')}bot），从任务表领到 #${no}。任务：${task}`,
+            '红线：⛔ 不 git push、⛔ 不打 tag、⛔ 不发版（发版只归主 bot 验收后做）；改动只在工作区 /Users/tcm/DSH/BOT 内。',
+            '干完：把 /Users/tcm/DSH/BOT/任务表.md 该行状态改成「待验收」（先改状态占位再干也行，防止重复领的是「进行中」），然后把做了什么、改了哪些文件总结发回协作群。',
+            '</领活>',
+          ].join('\n'),
+        },
+      ]);
+      console.log(`[${_ts()}][任务表] worker ${INSTANCE} 领 #${no} → chat ${chatId}`);
+    } catch (err) {
+      console.error(`[${_ts()}][任务表] worker 领活轮询出错: ${err.message}`);
+    }
+  }, TASK_POLL_MS);
 }
 
 /** 任务表轮询（主 bot 侧只认「待验收」→ 自动触发验收轮）。 */
@@ -1363,8 +1419,8 @@ function watchTaskTable() {
           type: 'text',
           text: [
             '<自动验收（系统触发，无需回复此段）>',
-            `任务表 #${row.no} 进入「待验收」。任务：${row.task}`,
-            '按职责验收：读改动（git diff / 相关文件）、跑测试；过了 → 升版本号、git 提交（message 带版本号）、推送、打 tag，任务表该行标「已发布」+ 填验收结论；不过 → 标「打回」，结论写清哪里不行。',
+            `任务表 #${row.no}（负责=${row.owner}）进入「待验收」。任务：${row.task}`,
+            '按职责验收：读改动（git diff / 相关文件）、跑测试；过了 → 任务表该行标「待审核」+ 填验收结论，群里公告「#N 验收通过，等审核」（⛔ 不发版——发版要等审核通过）；不过 → 标「打回」，结论写清哪里不行。',
             `结果发回${groupId ? '协作群' : '私聊'}。`,
             '</自动验收>',
           ].join('\n'),
@@ -1393,6 +1449,9 @@ async function handleMessage(message) {
   const isGroupChat = message.chat?.type === 'group' || message.chat?.type === 'supergroup';
   let groupText = null;
   if (isGroupChat) {
+    // 子实例（worker）群消息一律静默：只盯任务表领活，不抢话。
+    // 它的播报不走「回群消息」，走领活轮次里 agent 的回答（submitTurn 到群 chat id）。
+    if (BOT_ROLE === 'worker') return;
     if (state.ownerUserId !== userId) return; // 陌生人：静默
     const raw = (message.text ?? message.caption ?? '').trim();
     // @了别的 bot（TG 用户名 ≥5 位字母数字）→ 那是点别人的名，让路
@@ -3406,6 +3465,7 @@ try {
 }
 
 // ---- 协作任务表轮询（主 bot = 验收/发布；派活逻辑见 watchTaskTable 头注释）----
-watchTaskTable();
+// 角色分流：worker（001bot…）只盯领活；master 盯验收。同一个 5 秒轮询节奏，账本同一张。
+if (BOT_ROLE === 'worker') watchWorkerTasks(); else watchTaskTable();
 
 await Promise.all([pollLoop(), weixinPollLoop()]);
