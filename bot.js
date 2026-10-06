@@ -8,7 +8,7 @@
  *
  * Run with:  node bot.js
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, statSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, statSync, readdirSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { createDecipheriv } from 'node:crypto';
@@ -1236,6 +1236,112 @@ async function runPrompt(chatId, contentBlocks) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 协作任务表（2026-10-06 用户定：主 bot = 验收/发布，插件版 = 干活）
+//
+// 两个 bot 都在本机、共享这份文件；Telegram 平台不向 bot 投递别的 bot 的群
+// 消息，所以派活/交活只走文件，群只做「给人看」的播报。
+// 状态流转：待领取 →(插件版领)→ 进行中 →(干完)→ 待验收 →(主 bot 验)→ 已发布/打回。
+// ⚠️ 触发前**先改状态再干活**：状态被改掉 = 占位，轮询不会重复触发同一行。
+// ⚠️ 写入走 tmp+rename 原子替换（两个进程共写一份文件）。
+// ---------------------------------------------------------------------------
+const TASK_TABLE_PATH = join(APP_DIR, '任务表.md');
+const TASK_POLL_MS = 5000;
+
+function readTaskTable() {
+  try {
+    return readFileSync(TASK_TABLE_PATH, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function writeTaskTable(text) {
+  const tmp = `${TASK_TABLE_PATH}.tmp.${process.pid}`;
+  writeFileSync(tmp, text);
+  renameSync(tmp, TASK_TABLE_PATH);
+}
+
+/** 任务表头「协作群 chat id」：主 bot 在群里收到消息时回填，播报/派活都取它。 */
+function groupChatIdFromTable() {
+  const raw = readTaskTable()?.match(/^> 协作群 chat id:\s*(\S+)/m)?.[1] ?? null;
+  return raw && /^-?\d+$/.test(raw) ? raw : null; // 只认数字，表头占位文字不算
+}
+
+function registerGroupChat(chatId) {
+  const table = readTaskTable();
+  if (!table) return;
+  const line = table.match(/^> 协作群 chat id:.*$/m)?.[0];
+  if (!line || line.trim() === `> 协作群 chat id: ${chatId}`) return;
+  writeTaskTable(table.replace(/^> 协作群 chat id:.*$/m, `> 协作群 chat id: ${chatId}`));
+}
+
+/** 群消息前缀：让 agent 知道分工——活登记进任务表，不自己做。 */
+function taskRulesPrefix() {
+  return [
+    '<协作约定（系统注入，用户看不到）>',
+    '这是与「插件版 bot」的协作群。你是主 bot：管对话、验收、git 提交推送发版；插件版管干活。',
+    '用户说的活（改代码/改文件类）：不自己做——登记进 /Users/tcm/DSH/BOT/任务表.md（编号递增、负责=插件版、状态=待领取），群里回「已派活 #N」。',
+    '插件版领活干活（不推送不发版），干完标「待验收」；系统会自动触发你验收（diff/测试 → 过了升版本号+commit+push+tag+标「已发布」，不过标「打回」写清原因）。全程动作发回本群。',
+    '</协作约定>',
+    '',
+  ].join('\n');
+}
+
+/** 找第一个「负责=插件版 且 状态=期望值」的表格行 → { index, line, no, task } 或 null。 */
+function findTaskRow(table, statusWanted) {
+  const lines = table.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*插件版\s*\|\s*([^|]+?)\s*\|/);
+    if (m && m[3] === statusWanted) return { index: i, line: lines[i], no: m[1], task: m[2].trim() };
+  }
+  return null;
+}
+
+/** 把 findTaskRow 找到的行按列改状态（按 | 拆分重建，不受任务文本内容影响）。 */
+function setTaskStatus(row, nextStatus) {
+  const table = readTaskTable();
+  if (!table) return;
+  const lines = table.split('\n');
+  if (lines[row.index] !== row.line) return; // 行已被别人动过：放弃本轮，防覆盖
+  const cells = lines[row.index].split('|'); // ['', no, task, owner, status, note, '']
+  if (cells.length < 6 || cells[3].trim() !== '插件版') return;
+  cells[4] = ` ${nextStatus} `;
+  lines[row.index] = cells.join('|');
+  writeTaskTable(lines.join('\n'));
+}
+
+/** 任务表轮询（主 bot 侧只认「待验收」→ 自动触发验收轮）。 */
+function watchTaskTable() {
+  setInterval(() => {
+    try {
+      const table = readTaskTable();
+      if (!table) return;
+      const row = findTaskRow(table, '待验收');
+      if (!row) return;
+      setTaskStatus(row, '验收中'); // 先占位，防下轮重复触发
+      const groupId = groupChatIdFromTable();
+      const chatId = groupId ? Number(groupId) : state.ownerUserId;
+      if (!chatId) return;
+      submitTurn(chatId, [
+        {
+          type: 'text',
+          text: [
+            '<自动验收（系统触发，无需回复此段）>',
+            `任务表 #${row.no} 进入「待验收」。任务：${row.task}`,
+            '按职责验收：读改动（git diff / 相关文件）、跑测试；过了 → 升版本号、git 提交（message 带版本号）、推送、打 tag，任务表该行标「已发布」+ 填验收结论；不过 → 标「打回」，结论写清哪里不行。',
+            `结果发回${groupId ? '协作群' : '私聊'}。`,
+            '</自动验收>',
+          ].join('\n'),
+        },
+      ]);
+      console.log(`[${_ts()}][任务表] #${row.no} 触发验收 → chat ${chatId}`);
+    } catch (err) {
+      console.error(`[${_ts()}][任务表] 轮询失败: ${err.message}`);
+    }
+  }, TASK_POLL_MS);
+}
+
 async function handleMessage(message) {
   const chatId = message.chat.id;
   const userId = message.from?.id;
@@ -1245,18 +1351,23 @@ async function handleMessage(message) {
   const rawTextPre = (message.text ?? message.caption ?? '').trim();
   if (rawTextPre.startsWith(WX_MIRROR_TAG)) return;
 
-  // ---- 群模式（2026-10-06 用户定）----
-  // 群里只应点名：@我 才接活，没人点名不抢话；陌生人的消息静默忽略
-  // （⛔ 不把「已绑定别的用户」这种私聊提示发进群里刷屏）；/指令仍留在私聊。
+  // ---- 群模式（2026-10-06 用户定；同日二次修订：默认归主 bot + 自动派活）----
+  // 群里没点名 → 默认归主 bot；@了别的 bot（如插件版）→ 让路不抢话。
+  // 陌生人的消息静默忽略（⛔ 不把「已绑定别的用户」这种私聊提示发进群里刷屏）；
+  // /指令仍留在私聊。自动派活/验收的账本 = 任务表.md（见 watchTaskTable）。
   const isGroupChat = message.chat?.type === 'group' || message.chat?.type === 'supergroup';
   let groupText = null;
   if (isGroupChat) {
     if (state.ownerUserId !== userId) return; // 陌生人：静默
     const raw = (message.text ?? message.caption ?? '').trim();
-    const mention = `@${botInfo?.username ?? ''}`;
-    if (!botInfo?.username || !raw.includes(mention)) return; // 没点名 → 不接
-    groupText = raw.split(mention).join('').trim();
+    // @了别的 bot（TG 用户名 ≥5 位字母数字）→ 那是点别人的名，让路
+    const otherMention = raw.match(/@([A-Za-z0-9_]{5,})/)?.[1];
+    if (otherMention && botInfo?.username && otherMention !== botInfo.username) return;
+    const myMention = botInfo?.username ? `@${botInfo.username}` : null;
+    groupText = myMention ? raw.split(myMention).join('').trim() : raw;
     if (groupText.startsWith('/')) return; // 指令不进群，回私聊用
+    registerGroupChat(chatId); // 协作群 chat id 回填任务表头（自动播报/派活都用它）
+    groupText = taskRulesPrefix() + groupText; // 协作约定只注入群消息
   }
 
   const decision = authorize(userId);
@@ -3248,5 +3359,8 @@ try {
   hubReady = true;
   console.log(`[${_ts()}][hub] 节点已就绪，端点: [${hub.ids().join(', ')}]`);
 }
+
+// ---- 协作任务表轮询（主 bot = 验收/发布；派活逻辑见 watchTaskTable 头注释）----
+watchTaskTable();
 
 await Promise.all([pollLoop(), weixinPollLoop()]);

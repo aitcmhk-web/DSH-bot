@@ -19,7 +19,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { existsSync, openSync, appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, openSync, appendFileSync, readFileSync, readdirSync, writeFileSync, renameSync } from 'node:fs';
 import { readFile, writeFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -1450,9 +1450,10 @@ export function apply(ctx, config) {
     const chatId = message.chat.id;
     const userId = message.from?.id;
 
-    // ---- 群模式（2026-10-06 用户定）----
-    // 群里只应点名：@我 才接活，没人点名不抢话；陌生人的消息静默忽略
-    // （⛔ 不把「已绑定别的用户」这种私聊提示发进群里刷屏）；/指令仍留在私聊。
+    // ---- 群模式（2026-10-06 用户定；同日二次修订）----
+    // 默认对话归主 bot：插件版在群里只接 ①@点名 ②任务表自动派活（见 watchTaskTable）。
+    // 陌生人的消息静默忽略（⛔ 不把「已绑定别的用户」这种私聊提示发进群里刷屏）；
+    // /指令仍留在私聊。
     const isGroupChat = message.chat?.type === 'group' || message.chat?.type === 'supergroup';
     let groupText = null;
     if (isGroupChat) {
@@ -2163,10 +2164,95 @@ export function apply(ctx, config) {
   );
 
   // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // 协作任务表轮询（插件版 = 干活：认领「待领取」→ 自动开一轮活）
+  //
+  // 账本 = 任务表.md，与主 bot 共享同一份文件；Telegram 平台不向 bot 投递
+  // 别的 bot 的群消息，所以派活/交活只走文件，群只做「给人看」的播报。
+  // 状态流转：待领取 →(本插件领)→ 进行中 →(干完)→ 待验收 →(主 bot 验)→ 已发布/打回。
+  // ⚠️ 触发前先把状态改成「进行中」占位：状态被改掉，轮询就不会重复触发同一行。
+  // ⚠️ 写入走 tmp+rename 原子替换（两个进程共写一份文件）。
+  // -------------------------------------------------------------------------
+  const TASK_TABLE_PATH = process.env.DSH_TASK_TABLE ?? '/Users/tcm/DSH/BOT/任务表.md';
+  const TASK_POLL_MS = 5000;
+  let taskTimer = null;
+
+  function readTaskTable() {
+    try {
+      return readFileSync(TASK_TABLE_PATH, 'utf8');
+    } catch {
+      return null;
+    }
+  }
+
+  function writeTaskTable(text) {
+    const tmp = `${TASK_TABLE_PATH}.tmp.${process.pid}`;
+    writeFileSync(tmp, text);
+    renameSync(tmp, TASK_TABLE_PATH);
+  }
+
+  /** 任务表头「协作群 chat id」：主 bot 在群里收到消息时回填，自动派活取它发群。 */
+  function groupChatIdFromTable() {
+    const raw = readTaskTable()?.match(/^> 协作群 chat id:\s*(\S+)/m)?.[1] ?? null;
+    return raw && /^-?\d+$/.test(raw) ? raw : null; // 只认数字，表头占位文字不算
+  }
+
+  /** 找第一个「负责=插件版 且 状态=期望值」的表格行 → { index, line, no, task } 或 null。 */
+  function findTaskRow(table, statusWanted) {
+    const lines = table.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*插件版\s*\|\s*([^|]+?)\s*\|/);
+      if (m && m[3] === statusWanted) return { index: i, line: lines[i], no: m[1], task: m[2].trim() };
+    }
+    return null;
+  }
+
+  /** 把 findTaskRow 找到的行按列改状态（按 | 拆分重建，不受任务文本内容影响）。 */
+  function setTaskStatus(row, nextStatus) {
+    const table = readTaskTable();
+    if (!table) return;
+    const lines = table.split('\n');
+    if (lines[row.index] !== row.line) return; // 行已被别人动过：放弃本轮，防覆盖
+    const cells = lines[row.index].split('|'); // ['', no, task, owner, status, note, '']
+    if (cells.length < 6 || cells[3].trim() !== '插件版') return;
+    cells[4] = ` ${nextStatus} `;
+    lines[row.index] = cells.join('|');
+    writeTaskTable(lines.join('\n'));
+  }
+
+  function watchTaskTable() {
+    taskTimer = setInterval(() => {
+      try {
+        if (state.stopped) return;
+        const table = readTaskTable();
+        if (!table) return;
+        const row = findTaskRow(table, '待领取');
+        if (!row) return;
+        setTaskStatus(row, '进行中'); // 先占位，防下轮重复触发
+        const groupId = groupChatIdFromTable();
+        const chatId = groupId ? Number(groupId) : state.ownerUserId;
+        if (!chatId) return;
+        const prompt = [
+          '<自动派活（系统触发，无需回复此段）>',
+          `任务表 #${row.no} 派给你。任务：${row.task}`,
+          '规矩：只改文件 + 自测，⛔ git 提交/推送/发版由主 bot 验收后做；改完把任务表该行状态改成「待验收」；进度随时发回协作群。',
+          '</自动派活>',
+        ].join('\n');
+        const msg = { source: 'tg', chatId, text: prompt, raw: null };
+        void enqueue(`tg:${chatId}`, () => promptFromHub(msg));
+        log(`[任务表] #${row.no} 已领活 → chat ${chatId}`);
+      } catch (err) {
+        error(`[任务表] 轮询失败: ${err?.message ?? err}`);
+      }
+    }, TASK_POLL_MS);
+  }
+  watchTaskTable();
+
   // 卸载
   // -------------------------------------------------------------------------
   ctx.on('dispose', async () => {
     state.stopped = true;
+    if (taskTimer) clearInterval(taskTimer);
     approvalBridge?.dispose();
     pollAbort?.abort();
     wxAbort?.abort();
