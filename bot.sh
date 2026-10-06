@@ -368,12 +368,12 @@ cmd_run() {
 #
 # ⚠️ 绝不能在这里 nohup 成后台 —— 那样 bot.js 会脱离 launchd 看管的进程，
 #    launchd 看到 daemon 秒退会以为它崩了，于是无限重拉（Trojan 式刷屏）。
+#
+# 多开实例支持（2026-10-06 #2 修复）：
+#   · 无 -n = 主实例，行为与从前完全一致
+#   · 有 -n = 子 bot 实例，pid/log/锁自动带后缀（脚本开头已设 INST_NAME/SUFFIX）
+#     plist 调法：./bot.sh -n 00Xbot daemon
 cmd_daemon() {
-  # 多开实例不走 launchd 这个口（com.local.dsbot 只管主实例），防误配。
-  if [ -n "$INST_NAME" ]; then
-    bad "❌ daemon(launchd) 只伺候主实例；实例请用 $SELF start"
-    return 1
-  fi
   if running; then
     dim "已有实例在跑 (PID $(current_pid))，本次让位（exit 0，不会被 launchd 重拉）。"
     return 0
