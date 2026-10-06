@@ -1358,7 +1358,7 @@ function setTaskStatus(row, nextStatus) {
   writeTaskTable(lines.join('\n'));
 }
 
-/** 任务表轮询（worker 侧）：只领「负责=本实例名 且 状态=待领取」的行 → 占位「进行中」→ 触发干活轮。
+/** 任务表轮询（worker 侧）：领「负责=本实例名 且 状态=待领取 / 打回」的行 → 占位「进行中」→ 触发干活轮。
  *  干活的播报不走「回群消息」（worker 群消息一律静默），走这轮 submitTurn 的回答发回协作群。 */
 function watchWorkerTasks() {
   setInterval(() => {
@@ -1369,7 +1369,7 @@ function watchWorkerTasks() {
       const lines = table.split('\n');
       let picked = -1;
       for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*待领取\s*\|/);
+        const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*(?:待领取|打回)\s*\|/);
         if (m && m[3] === INSTANCE) { picked = i; break; }
       }
       if (picked < 0) return;
@@ -1377,22 +1377,32 @@ function watchWorkerTasks() {
       const cells = rowLine.split('|'); // ['', no, task, owner, status, note, '']
       if (cells.length < 6) return;
       const no = cells[1].trim(), task = cells[2].trim();
+      const conclusionCol = cells[5] ? cells[5].trim() : '';
       cells[4] = ' 进行中 '; // 先占位，防下轮重复领
       lines[picked] = cells.join('|');
       writeTaskTable(lines.join('\n'));
       const groupId = groupChatIdFromTable();
       const chatId = groupId ? Number(groupId) : state.ownerUserId;
       if (!chatId) return;
+      const hasProgress = conclusionCol.includes(`你是子 bot ${INSTANCE}`) || conclusionCol.includes(`bot ${INSTANCE}`);
+      const reasonBlock = conclusionCol ? [
+        '',
+        '<打回原因>',
+        conclusionCol,
+        '</打回原因>',
+        ...(hasProgress ? [`（结论列里已有你写的进度，接着干别重头）`] : []),
+      ].join('\n') : '';
       submitTurn(chatId, [
         {
           type: 'text',
           text: [
             '<领活（系统触发，无需回复此段）>',
             `你是子 bot ${INSTANCE}（worker，TG 身份 @aitcm${INSTANCE.replace(/bot$/, '')}bot），从任务表领到 #${no}。任务：${task}`,
+            reasonBlock,
             '红线：⛔ 不 git push、⛔ 不打 tag、⛔ 不发版（发版只归主 bot 验收后做）；改动只在工作区 /Users/tcm/DSH/BOT 内。',
             '干完：把 /Users/tcm/DSH/BOT/任务表.md 该行状态改成「待验收」（先改状态占位再干也行，防止重复领的是「进行中」），然后把做了什么、改了哪些文件总结发回协作群。',
             '</领活>',
-          ].join('\n'),
+          ].filter(l => l !== '').join('\n'),
         },
       ]);
       console.log(`[${_ts()}][任务表] worker ${INSTANCE} 领 #${no} → chat ${chatId}`);
