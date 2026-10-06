@@ -91,7 +91,7 @@ export const Config = Schema.object({
   // 默认走阿里 FunASR SenseVoice（本机语音引擎），路径留空会自动找 /opt/homebrew/bin 下的。
   // 没配也没有 → 收到语音时回「一条能直接粘的安装命令」，而不是 ENOENT。
   asrBackend: Schema.string().default('sensevoice')
-    .description('语音转文字后端：sensevoice（默认，阿里 FunASR，中文准）或 whisper（中文差，要用得显式填）'),
+    .description('语音转文字后端：sensevoice（默认，本地 FunASR，中文准）、ali（线上 qwen3-asr-flash ~0.6s，走模型网关，失败自动回退本地）或 whisper（中文差，要用得显式填）'),
   asrWhisperBin: Schema.string().description('whisper 可执行文件路径（只有 asrBackend=whisper 时才用到）'),
   asrPythonBin: Schema.string().description('python 解释器路径（sensevoice 用，默认 /opt/homebrew/bin/python3.11）'),
   asrKeepalive: Schema.boolean().default(false)
@@ -101,6 +101,10 @@ export const Config = Schema.object({
     .description('常驻转写服务的脚本路径（asr-server.py）。不填则不用常驻'),
   asrMemoryLimitGb: Schema.number().default(16)
     .description('内存超过这么多 GB 就不启用常驻服务（避免和本地大模型抢内存）'),
+  asrGatewayUrl: Schema.string().default('http://127.0.0.1:9310/call')
+    .description('ali 后端用的模型网关 /call 地址（只有 asrBackend=ali 时用到）'),
+  asrGatewayModel: Schema.string().default('阿里转文字')
+    .description('ali 后端在网关模型表里的条目名（只有 asrBackend=ali 时用到）'),
 
   // ---- 识图自动探测 ----
   visionAutoDetect: Schema.boolean().default(true)
@@ -758,6 +762,9 @@ export function apply(ctx, config) {
     keepalivePort: config.asrKeepalivePort,
     keepaliveEnabled: config.asrKeepalive === true,
     memoryLimitGb: config.asrMemoryLimitGb,
+    // 条件展开：schema 没给默认值的场合不能把 asr.js 里的默认口覆盖成 undefined
+    ...(config.asrGatewayUrl ? { gatewayUrl: config.asrGatewayUrl } : {}),
+    ...(config.asrGatewayModel ? { gatewayModel: config.asrGatewayModel } : {}),
   });
 
   const telegram = config.telegramToken
@@ -861,6 +868,13 @@ export function apply(ctx, config) {
       // 所有端点统一走这一条路：任何来源都不做第二入口，避免漏派发。
       // ⚠️ 队列键必须带 source 前缀。只用 chatId 的话，TG 的 12345 和微信的
       //    12345 会排进同一条队列 —— 两个不相干的人互相阻塞。
+      // 忙时合包（2026-10-06 用户定，TG 侧专用）：正在处理上一条时连发的几条
+      //    先攒进信箱，等当前轮跑完合并成一条投出；空闲立刻处理，零等待。
+      //    微信侧不动，仍走原 enqueue 串行。
+      if (msg.source === 'tg') {
+        submitTurn(msg);
+        return;
+      }
       await enqueue(`${msg.source}:${msg.chatId}`, () => promptFromHub(msg));
     },
   });
@@ -998,6 +1012,67 @@ export function apply(ctx, config) {
       if (queues.get(key) === next) queues.delete(key);
     });
     return next;
+  }
+
+  // -------------------------------------------------------------------------
+  // 忙时合包（TG 侧专用，2026-10-06 用户定）
+  //
+  // 正在处理上一条消息时又连发的几条：不再一条一条各开一轮，而是先落进信箱，
+  // 等当前这轮跑完，把积压的几条**合并成一条**投给模型（几条并作一次提问、
+  // 一次回答）。空闲时发来的消息仍然立刻处理，零等待 —— 与消息窗口「打包
+  // 间隔秒」那种固定等候是两回事。微信侧不动：那边仍走原 enqueue 串行。
+  // ⚠️ 实际执行仍全部经由 enqueue(同一个会话队列) —— 合包只决定「何时投、
+  //    投几条」，每会话串行的语义不破坏（wx 并入 tg:owner 的队列键也不变）。
+  // -------------------------------------------------------------------------
+  /** chatKey → { running, pending: Array<msg> }。 */
+  const tgMailboxes = new Map();
+
+  /** 多条消息合成一条：相邻文本块换行拼接；图片等非文本块按原顺序保留。 */
+  function mergeMsgs(msgs) {
+    if (msgs.length === 1) return msgs[0];
+    const merged = [];
+    for (const m of msgs) {
+      const blocks = Array.isArray(m.raw?.blocks)
+        ? m.raw.blocks
+        : [{ type: 'text', text: String(m.text ?? '') }];
+      for (const b of blocks) {
+        const last = merged[merged.length - 1];
+        if (b?.type === 'text' && last?.type === 'text') last.text = `${last.text}\n${b.text}`;
+        else merged.push({ ...b });
+      }
+    }
+    return makeMessage({
+      source: msgs[0].source,
+      chatId: msgs[0].chatId,
+      text: merged.map((b) => b.text ?? '[图片]').join(' '),
+      raw: { blocks: merged },
+    });
+  }
+
+  async function drainMailbox(key, box) {
+    try {
+      while (box.pending.length > 0) {
+        const batch = box.pending.splice(0);
+        log(`[tg] 忙时合包：本轮合并 ${batch.length} 条消息为一次提问`);
+        await enqueue(key, () => promptFromHub(mergeMsgs(batch)));
+      }
+    } finally {
+      if (box.pending.length === 0) tgMailboxes.delete(key);
+      else await drainMailbox(key, box).catch(() => {}); // 收尾间隙又来了新消息 → 继续清
+    }
+  }
+
+  function submitTurn(msg) {
+    const key = `${msg.source}:${msg.chatId}`;
+    let box = tgMailboxes.get(key);
+    if (!box) {
+      box = { running: false, pending: [] };
+      tgMailboxes.set(key, box);
+    }
+    box.pending.push(msg);
+    if (box.running) return; // 忙：先攒着，等当前轮跑完由 drain 合并带走
+    box.running = true;
+    drainMailbox(key, box).catch((err) => error(`合包轮次失败: ${err?.stack ?? err?.message}`));
   }
 
   // -------------------------------------------------------------------------
@@ -1459,6 +1534,11 @@ export function apply(ctx, config) {
         return;
       }
       blocks.push({ type: 'text', text });
+      // 语音回显（2026-10-06 用户定）：把听到的文字原样发回，让你核对转写对不对。
+      // 纯 sendMessage（不走富文本）：转写内容是原话，可能含 markdown/HTML 特殊字符。
+      await telegram
+        .sendMessage(chatId, `🎤 ${text}`)
+        .catch((err) => error(`语音回显发送失败: ${err.message}`));
     }
 
     if (blocks.length === 0) {

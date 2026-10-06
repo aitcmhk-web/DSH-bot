@@ -4,9 +4,11 @@
  * 可执行文件路径走 options（构造时传入）；没配就按 Homebrew 默认位置找。
  * 本机压根没装引擎时回「一条能直接粘的安装命令」，而不是 ENOENT。
  *
- * 两个后端：
- *   · sensevoice  —— 阿里 FunASR SenseVoice-Small（**默认**，中文准、自带标点）
+ * 三个后端：
+ *   · sensevoice  —— 阿里 FunASR SenseVoice-Small，中文准、自带标点
  *   · whisper     —— openai-whisper CLI（中文识别差，只在显式配置时用）
+ *   · ali         —— 阿里 qwen3-asr-flash 线上转写（走本地模型网关 /call，~0.6s；
+ *                    key 只在网关的模型表里，本进程不碰密钥。网关不在/出错自动回退本地）
  *
  * 常驻服务（可选加速）：走 TCP 本机回环问一个常驻 python 进程，
  *   省掉每次 ~7s 的模型加载。没起时静默回退冷启动，功能不受影响。
@@ -19,7 +21,7 @@ import path from 'node:path';
 import net from 'node:net';
 
 /** 后端名 → 实现。未配置时 sensevoice（阿里 FunASR —— 我们实际用的就是这个）。 */
-export const BACKENDS = ['sensevoice', 'whisper'];
+export const BACKENDS = ['sensevoice', 'whisper', 'ali'];
 
 const log = (...args) => console.log('[botplugin:asr]', ...args);
 const logErr = (...args) => console.error('[botplugin:asr]', ...args);
@@ -38,6 +40,9 @@ let opts = {
   memoryLimitGb: Infinity,
   timeoutMs: 60_000,
   sensevoiceTimeoutMs: 300_000,
+  // ali 后端（线上转写）的网关口。与主 bot 的 ASR_GATEWAY_URL / ASR_GATEWAY_MODEL 同默认值。
+  gatewayUrl: 'http://127.0.0.1:9310/call',
+  gatewayModel: '阿里转文字',
 };
 
 /**
@@ -56,7 +61,36 @@ export function asrConfig() {
 
 /** 当前后端名。 */
 export function currentBackend() {
-  return opts.backend === 'whisper' ? 'whisper' : 'sensevoice';
+  return opts.backend === 'whisper' ? 'whisper' : opts.backend === 'ali' ? 'ali' : 'sensevoice';
+}
+
+// ── 阿里 qwen3-asr-flash（2026-10-06，与消息窗口/AITCM 同一条链路）────────
+// 走本地「模型网关」/call：key 只存在网关的模型表里，插件全程不碰密钥。
+// 信封形状与主 bot asr.js / 消息窗口 convert.mjs 的「阿里」分支一致 ——
+// 同一件事只有一处定义，这里只调用、不复制第二份判断。
+async function transcribeWithAli(wavPath) {
+  // 网关老直通口透传「输入体」，所以 model/asr_options 塞进 输入 里
+  const dataUri = `data:audio/wav;base64,${fs.readFileSync(wavPath).toString('base64')}`;
+  const r = await fetch(opts.gatewayUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      模型名: opts.gatewayModel,
+      输入: {
+        model: 'qwen3-asr-flash',
+        messages: [
+          { role: 'user', content: [{ type: 'input_audio', input_audio: { data: dataUri } }] },
+        ],
+        asr_options: { language: 'zh', enable_itn: false },
+      },
+    }),
+  });
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`网关 HTTP ${r.status}${out.错误 ? `:${out.错误}` : ''}`);
+  // 网关对普通信封原样返回上游输出 → DashScope 是 choices 形状；兼容 文本/text 变体
+  const text = out.choices?.[0]?.message?.content ?? out.文本 ?? out.text ?? '';
+  if (typeof text !== 'string' || !text.trim()) throw new Error('转写结果为空');
+  return text.trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -382,7 +416,17 @@ print(res[0].get("text", ""))
  * @returns {Promise<string>} 转写文本（可能为空字符串）
  */
 export async function transcribe(wavPath) {
-  const backend = currentBackend();
+  let backend = currentBackend();
+
+  // 阿里线上转写（~0.6s）。网关不在 / 出错 → 回退本地链路，语音功能不因网关挂而瘫。
+  if (backend === 'ali') {
+    try {
+      return await transcribeWithAli(wavPath);
+    } catch (err) {
+      logErr(`阿里线上转写失败，回退本地: ${err.message}`);
+      backend = 'sensevoice'; // 本地最快链路（常驻 ~0.45s，冷启动 ~6s）
+    }
+  }
 
   if (backend === 'sensevoice' && keepaliveEnabled()) {
     if (memoryAllowsKeepalive()) {
