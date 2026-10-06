@@ -20,8 +20,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 
-/** 后端名 → 实现。未配置时 sensevoice（阿里 FunASR —— 我们实际用的就是这个）。 */
-export const BACKENDS = ['sensevoice', 'whisper', 'ali'];
+/** 后端名 → 实现。未配置时 ali（线上优先，失败自动回落本地——2026-10-07 老板定）。 */
+export const BACKENDS = ['ali', 'sensevoice', 'whisper'];
 
 const log = (...args) => console.log('[botplugin:asr]', ...args);
 const logErr = (...args) => console.error('[botplugin:asr]', ...args);
@@ -59,9 +59,9 @@ export function asrConfig() {
   return { ...opts };
 }
 
-/** 当前后端名。 */
+/** 当前后端名。未配置（schema 没给到）时 ali：线上优先、失败自动回落本地。 */
 export function currentBackend() {
-  return opts.backend === 'whisper' ? 'whisper' : opts.backend === 'ali' ? 'ali' : 'sensevoice';
+  return opts.backend === 'whisper' ? 'whisper' : opts.backend === 'sensevoice' ? 'sensevoice' : 'ali';
 }
 
 // ── 阿里 qwen3-asr-flash（2026-10-06，与消息窗口/AITCM 同一条链路）────────
@@ -181,7 +181,7 @@ function pythonHasFunasr(bin) {
 /**
  * 定这次用哪个引擎、哪个可执行文件。
  * 优先级：配置 > 环境变量 > Homebrew (macOS) > Linux 常见路径 > CLI which。
- * ⛔ 不做跨后端自动顶替：默认就是 SenseVoice，本机没装它 → 提示装，
+ * ⛔ 不做跨后端自动顶替：落到本地时默认用 SenseVoice，本机没装它 → 提示装，
  *    不悄悄退回中文识别很差的 whisper（要用 whisper 得显式配 asrBackend）。
  */
 function resolveEngine() {

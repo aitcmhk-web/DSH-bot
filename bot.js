@@ -1551,7 +1551,7 @@ async function handleMessage(message) {
         '-y', wavOut,
       ], { timeout: 30000 });
 
-      // transcription (backend 由 .env 的 ASR_BACKEND 决定：whisper | sensevoice)
+      // transcription (backend 由 .env 的 ASR_BACKEND 决定：ali 默认线上优先，失败回落本地 | sensevoice | whisper)
       // ASR_KEEPALIVE=1 时走常驻服务（~0.4s），否则冷启动（~7s）
       const result = await asrTranscribe(wavOut);
 
@@ -2841,7 +2841,7 @@ async function transcribeWeixinVoice(mediaInfo, contextToken, fromUserId) {
       wavOut,
     ], { timeout: 30000 });
 
-    // 6. 语音识别（backend 由 .env 的 ASR_BACKEND 决定：whisper | sensevoice）
+    // 6. 语音识别（backend 由 .env 的 ASR_BACKEND 决定：ali 默认线上优先，失败回落本地 | sensevoice | whisper）
     //    ASR_KEEPALIVE=1 时走常驻服务（~0.4s），否则冷启动（~7s）
     const result = await asrTranscribe(wavOut);
 

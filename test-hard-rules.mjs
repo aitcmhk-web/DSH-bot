@@ -82,4 +82,36 @@ const c3 = claim();
 const noMsgs = await dblHandler(argsFor(c3, { step: 3 }), async () => ({ kind: 'accept' }));
 assert.deepEqual(noMsgs, { kind: 'accept' }, '没有 messages 时原样返回');
 
+// ⑦ #8 回归：会话重建（/new）→ 新 agent 第 1 步必注入（计数必须按会话走）。
+// 复现路径：会话 A 先走 5 步 → 模拟 /new 换新 agent id=B → B 的第 1 步必须立刻注入。
+// 病根（进程级计数）：A 走完后全局 steps=6，6%10≠1 → B 第 1 步吃不到针（红）。
+// 判据照真实注入路径写：直驱真实 handler（宿主 waterfall 就是 handler(args, next)），
+// 不在测试里复制计数算法，只看 decision.messages 里有没有 source.kind === 'hard-rules'。
+{
+  const h2 = createHardRulesHandler({ text: BODY, everyN: HARD_RULES_EVERY_N, log: () => {} });
+  /** 照宿主形状驱动一步：每条用户消息一个 turn，取该 turn 的第 1 步。 */
+  const drive = (agentId, turn) => {
+    const claimed = claim();
+    return h2({ messages: claimed, agent: { id: agentId }, turn, step: 1 }, async () => hostDecision(claimed))
+      .then((d) => d.messages.some((m) => m?.source?.kind === 'hard-rules'));
+  };
+  // 会话 A：5 条消息（turn 1..5），只有 turn 1 注入
+  for (let t = 1; t <= 5; t += 1) {
+    assert.equal(await drive('sess-A', t), t === 1, `会话 A turn${t} 注入与否`);
+  }
+  // /new：新会话 B —— 病根复现点：新会话第 1 步必须吃到针
+  assert.equal(await drive('sess-B', 1), true, '新会话（/new 后）第 1 步必须注入 —— 进程级计数时这里红');
+  // B 的节奏照旧：之后 9 步不注、第 11 步再注
+  for (let t = 2; t <= HARD_RULES_EVERY_N; t += 1) {
+    assert.equal(await drive('sess-B', t), false, `会话 B turn${t} 不该注入`);
+  }
+  assert.equal(await drive('sess-B', HARD_RULES_EVERY_N + 1), true, `会话 B 第 ${HARD_RULES_EVERY_N + 1} 步必须注入`);
+  // 双会话并存互不串账：B 的 10 步不能把 A 的计数顶走 —— A 接着走自己的节奏
+  assert.equal(await drive('sess-A', 6), false, '会话 A 第 6 步不该注入（B 的计数不许串给 A）');
+  for (let t = 7; t <= 10; t += 1) {
+    assert.equal(await drive('sess-A', t), false, `会话 A turn${t} 不该注入`);
+  }
+  assert.equal(await drive('sess-A', 11), true, '会话 A 累计第 11 步必须注入');
+}
+
 console.log(`✅ 全绿：注入 ${injected.length} 次（everyN=${HARD_RULES_EVERY_N}）`);

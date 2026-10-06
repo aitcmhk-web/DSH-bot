@@ -88,10 +88,11 @@ export const Config = Schema.object({
   logLabel: Schema.string().default('botplugin').description('日志前缀'),
 
   // ---- 语音转文字 ----
-  // 默认走阿里 FunASR SenseVoice（本机语音引擎），路径留空会自动找 /opt/homebrew/bin 下的。
-  // 没配也没有 → 收到语音时回「一条能直接粘的安装命令」，而不是 ENOENT。
-  asrBackend: Schema.string().default('sensevoice')
-    .description('语音转文字后端：sensevoice（默认，本地 FunASR，中文准）、ali（线上 qwen3-asr-flash ~0.6s，走模型网关，失败自动回退本地）或 whisper（中文差，要用得显式填）'),
+  // 默认走 ali（线上 qwen3-asr-flash 优先，~0.6s；网关不在/出错自动回落本地 sensevoice，
+  // 2026-10-07 老板定：默认顺序线上第一、本地第二）。本地路径留空会自动找 /opt/homebrew/bin 下的。
+  // 线上不可用且本地也没装 → 收到语音时回「一条能直接粘的安装命令」，而不是 ENOENT。
+  asrBackend: Schema.string().default('ali')
+    .description('语音转文字后端：ali（默认，线上 qwen3-asr-flash ~0.6s，走模型网关，失败自动回退本地）、sensevoice（本地 FunASR，中文准）或 whisper（中文差，要用得显式填）'),
   asrWhisperBin: Schema.string().description('whisper 可执行文件路径（只有 asrBackend=whisper 时才用到）'),
   asrPythonBin: Schema.string().description('python 解释器路径（sensevoice 用，默认 /opt/homebrew/bin/python3.11）'),
   asrKeepalive: Schema.boolean().default(false)
@@ -163,6 +164,18 @@ const LOCK_STALE_MS = 90 * 1000;
  *   45 秒 = 长轮询 30 秒 + 15 秒余量。
  */
 const POLL_REQUEST_TIMEOUT_MS = 45 * 1000;
+
+/**
+ * 连续多少轮 getUpdates 失败（无成功收包）后自行 exit 非零，交外层拉起。
+ *
+ * 任务 #4（2026-10-07）：僵而不死的实例（进程活、消息全丢）只能靠人手工 TERM ——
+ *   硬超时+重试解决「单次挂死」，但「持续失败」（网络长时间断 / 上游黑洞）时进程
+ *   还会无限重试下去。连续 60 轮无成功（快速失败 ~3s/轮 ≈ 3 分钟；全部走满 45s
+ *   超时 ≈ 45 分钟）就 exit(1)：launchd KeepAlive（SuccessfulExit=false）会把
+ *   非零退出拉起来，等于自愈重启。409 冲突**不算**失败（对方在正常轮询，
+ *   我们 exit 只会造成两实例互相拉扯，见 conflictStreak 分支）。
+ */
+const POLL_FAIL_EXIT_ROUNDS = 60;
 
 /**
  * 把「关停信号」和「单次请求超时」合成一个信号。
@@ -1354,6 +1367,8 @@ export function apply(ctx, config) {
      * 上一轮遗留的计数压到第 10 次才响。
      */
     let conflictStreak = 0;
+    /** 连续失败轮数（收到包就归零；≥ POLL_FAIL_EXIT_ROUNDS 自退交外层拉起，见其注释）。 */
+    let failStreak = 0;
     while (!state.stopped) {
       let updates;
       // 单实例锁是否仍在自己手上（收得到消息的那一轮才算数，见下面 beat）。
@@ -1366,6 +1381,7 @@ export function apply(ctx, config) {
         );
         // 这一轮拿到了（哪怕是空数组）说明此刻没人和我们抢 → 冲突计数归零。
         conflictStreak = 0;
+        failStreak = 0;
         // 收得到消息 = 还活着 → 续一次单实例锁的心跳（半瘫的实例得不到这一步）。
         // 若锁已被判陈旧、被别的实例接管：先把手上这批消息处理完，再让出轮询（见循环末尾），
         // ⛔ 不能在这一步直接 return —— 那会把已经取回来的消息丢掉。
@@ -1392,6 +1408,19 @@ export function apply(ctx, config) {
           error(`getUpdates 单次请求超时（${POLL_REQUEST_TIMEOUT_MS / 1000} 秒无响应）—— 断开这次连接，3 秒后重试`);
         } else if (!/abort/i.test(err.message ?? '')) {
           error(`getUpdates 失败: ${err.message}`);
+        }
+        // 关停中的 abort 不算失败；其余每轮失败记一笔，连续到阈值就自退交外层拉起
+        //（任务 #4：僵而不死的实例不该等人工 TERM）。409 不进这个分支（上面已 continue）。
+        if (!state.stopped && !/abort/i.test(err.message ?? '')) {
+          failStreak += 1;
+          if (failStreak >= POLL_FAIL_EXIT_ROUNDS) {
+            const stillHolding = lock ? await lock.beat(false) : true;
+            if (stillHolding) {
+              error(`❌ 连续 ${failStreak} 轮 getUpdates 失败（无一次成功收包）—— 判定轮询已僵，exit(1) 交外层（launchd KeepAlive）拉起新实例`);
+              process.exit(1);
+            }
+            return; // 锁已归别人：让对方轮询，本进程不陪葬
+          }
         }
         // 这一轮没收到消息 → **不续心跳**（半瘫的判据），但顺手看看锁还是不是自己的。
         if (lock && !(await lock.beat(false))) return;
@@ -2247,6 +2276,83 @@ export function apply(ctx, config) {
     }, TASK_POLL_MS);
   }
   watchTaskTable();
+
+  // -------------------------------------------------------------------------
+  // 审核弹窗（任务 #4，2026-10-07）：插件版 = 审核实例。任务表出现「待审核」行 →
+  // 给老板 TG 私聊发审核卡片（inline_keyboard：✅通过 #N / ❌打回 #N）。
+  // 按钮回调 → 以文本「通过 #N」/「打回 #N：原因」发进协作群 —— 主 bot 监听这个
+  // 格式走发布/打回闭环；本插件只传话，⛔ 不自己改任务表、不碰 git/发布。
+  // 节流：每个 #N 自进程启动只发一次卡（行停在「待审核」也不重发；发送失败会在
+  //   下一轮重试；进程重启后会重发一次 —— 多一张卡无副作用）。
+  // -------------------------------------------------------------------------
+  const REVIEW_GROUP_FALLBACK = '-5334440553'; // 协作群兜底（表头有「协作群 chat id」时以表头为准）
+  /** 等老板回复打回原因的卡：#N → { chatId, messageId }。 */
+  const pendingRejects = new Map();
+  /** 已成功发出卡的 #N（防 5 秒轮询重复发）。 */
+  const reviewCardsSent = new Set();
+
+  /** 插件实例 = 审核实例（老板 10-06 分工）。显式 BOT_ROLE=master/worker 时才关；
+   *  现网 dshbot 实例没设 BOT_ROLE → 生效。 */
+  const REVIEWER_MODE = !['master', 'worker'].includes(String(process.env.BOT_ROLE ?? '').trim());
+
+  /** 找第一个「状态=待审核」的行（不限负责者 —— 审核覆盖所有小工的活）。 */
+  function findReviewRow(table) {
+    const lines = table.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]*)\|([^|]*)\|\s*待审核\s*\|/);
+      if (m) return { index: i, line: lines[i], no: m[1], task: m[2].trim(), owner: m[3].trim() };
+    }
+    return null;
+  }
+
+  /** 卡片处理完改文案（防重复点击）；失败静默 —— 卡片留着顶多多按一次。 */
+  async function editReviewCard(chatId, messageId, text) {
+    if (!chatId || !messageId || !telegram) return;
+    await telegram.editMessageText(chatId, messageId, text).catch(() => {});
+  }
+
+  async function sendReviewCard(row) {
+    if (!telegram || state.ownerUserId === null) return;
+    const taskBrief = row.task.length > 200 ? `${row.task.slice(0, 200)}…` : row.task;
+    await telegram.sendMessage(
+      state.ownerUserId,
+      [
+        `📋 审核请求 #${row.no}（负责：${row.owner}）`,
+        taskBrief,
+        '',
+        `✅ 通过 → 我发「通过 #${row.no}」进协作群；❌ 打回 → 请回复打回原因（一句话），我原样转「打回 #${row.no}：原因」。发 /cancel 取消。`,
+      ].join('\n'),
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: `✅ 通过 #${row.no}`, callback_data: `review:approve:${row.no}` },
+            { text: `❌ 打回 #${row.no}`, callback_data: `review:reject:${row.no}` },
+          ]],
+        },
+      },
+    );
+    log(`[审核] #${row.no} 审核卡片已发老板私聊`);
+  }
+
+  function watchReviewCards() {
+    setInterval(() => {
+      try {
+        if (state.stopped || !REVIEWER_MODE) return;
+        const table = readTaskTable();
+        if (!table) return;
+        const row = findReviewRow(table);
+        if (!row || reviewCardsSent.has(row.no)) return;
+        reviewCardsSent.add(row.no); // 先记后发：发送失败就移除，下一轮重试（成功恰好一次）
+        sendReviewCard(row).catch((err) => {
+          reviewCardsSent.delete(row.no);
+          error(`[审核] #${row.no} 卡片发送失败，下轮重试: ${err?.message ?? err}`);
+        });
+      } catch (err) {
+        error(`[审核] 轮询失败: ${err?.message ?? err}`);
+      }
+    }, TASK_POLL_MS);
+  }
+  watchReviewCards();
 
   // 卸载
   // -------------------------------------------------------------------------
