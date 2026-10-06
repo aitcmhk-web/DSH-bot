@@ -139,14 +139,18 @@ intervalFn();
 assert.equal(submitted[1].chatId, 42, '无群 id 应回退 owner 私聊');
 
 // 9) 看门狗（#9）：存活 + 进度。全部用合成 pidfile / 摸日志 mtime / 假时间戳。
+// 拉活全程打桩（默认 defaultWorkerKick 会真 spawn launchctl —— 测试环境绝不真拉）
+const kicks9 = [];
+const kickSpy9 = () => { kicks9.push(1); };
 // 9a 健康小工必须不报（防误报锁死）：pid=本测试进程（kill -0 必活）+ 日志新鲜（=心跳刚写过）
 for (const name of WORKER_NAMES) {
   __fs.writeFileSync(join(APP_DIR, \`.bot.pid-\${name}\`), String(process.pid));
   __fs.writeFileSync(join(APP_DIR, \`bot-\${name}.log\`), '[hb] 心跳正常（测试桩）\\n');
 }
 const sentBefore = telegram.sent.length;
-herdTick();
+herdTick(Date.now(), kickSpy9);
 assert.equal(telegram.sent.length, sentBefore, '四个小工全健康 → 不许公告');
+assert.equal(kicks9.length, 0, '四个小工全健康 → 不许拉活');
 
 // 9b 假活必报（004bot 实案形状）：pid 活 + 日志摸旧 20 分钟；名下进行中的行自动改派
 __fs.writeFileSync(TASK_TABLE_PATH, [
@@ -158,22 +162,26 @@ __fs.writeFileSync(TASK_TABLE_PATH, [
 ].join('\\n'));
 const stale = new Date(Date.now() - 20 * 60 * 1000);
 __fs.utimesSync(join(APP_DIR, 'bot-001bot.log'), stale, stale);
-herdTick();
+herdTick(Date.now(), kickSpy9);
 assert.equal(telegram.sent.length, sentBefore + 1, '日志停摆必须公告');
+assert.equal(kicks9.length, 1, '假活第一次必须触发拉活');
+assert.match(telegram.sent[telegram.sent.length - 1].text, /kickstart 拉活（第 1\\/3 次）/, '公告要标第几次拉活');
 assert.match(telegram.sent[telegram.sent.length - 1].text, /001bot 判假活/, '判据里要有谁+判定');
 assert.match(telegram.sent[telegram.sent.length - 1].text, /20 分钟/, '判据里要有多久没动');
 assert.match(telegram.sent[telegram.sent.length - 1].text, /#20/, '公告里要提改派哪行');
 assert.match(__fs.readFileSync(TASK_TABLE_PATH, 'utf8'), /\\| 20 \\| 假活名下的活 \\| 001bot \\| 待领取 \\|/, '进行中的行翻「待领取」');
 assert.match(__fs.readFileSync(TASK_TABLE_PATH, 'utf8'), /看门狗改派/, '结论列注明改派原因');
-herdTick();
+herdTick(Date.now(), kickSpy9);
 assert.equal(telegram.sent.length, sentBefore + 1, '同一小工连续判死不重复公告（边沿触发）');
+assert.equal(kicks9.length, 1, '冷却期内不重复拉活');
 
 // 9c pid 真死必报：pidfile 写一个已退出的 pid
 const cp = await import('node:child_process');
 const deadPid = cp.spawnSync('true').pid;
 __fs.writeFileSync(join(APP_DIR, '.bot.pid-003bot'), String(deadPid));
-herdTick();
+herdTick(Date.now(), kickSpy9);
 assert.equal(telegram.sent.length, sentBefore + 2, 'pid 死必须公告');
+assert.equal(kicks9.length, 2, '判死同样要拉活');
 assert.match(telegram.sent[telegram.sent.length - 1].text, /003bot 判死/, '判死公告');
 
 // 9d 进度停摆：进行中 30 分钟纹丝不动 → 公告+改派；刚见到的行不报（快照首见只记时）
@@ -186,13 +194,13 @@ __fs.writeFileSync(TASK_TABLE_PATH, [
   '| 22 | 待审的活 | 001bot | 待审核 | ✅ 等老板 |',
 ].join('\\n'));
 const t0 = Date.now();
-herdTick(t0); // 快照首见：不公告
+herdTick(t0, kickSpy9); // 快照首见：不公告
 assert.equal(telegram.sent.length, sentBefore + 2, '首见只记快照');
 // 拨钟 31 分钟：存活判据用同一个钟 → 日志 mtime 必须一起摸到新时刻（=心跳照写，
 // 这正是健康小工的形状），否则看门狗会先把全组判假活（测试时间旅行要自洽）
 const tA = new Date(t0 + 31 * 60 * 1000);
 for (const name of WORKER_NAMES) __fs.utimesSync(join(APP_DIR, \`bot-\${name}.log\`), tA, tA);
-herdTick(t0 + 31 * 60 * 1000); // 31 分钟后同状态 → 停
+herdTick(t0 + 31 * 60 * 1000, kickSpy9); // 31 分钟后同状态 → 停
 assert.equal(telegram.sent.length, sentBefore + 3, '30 分钟纹丝不动必须公告');
 assert.match(telegram.sent[telegram.sent.length - 1].text, /#21（002bot）停摆/, '公告点名行+人');
 assert.match(__fs.readFileSync(TASK_TABLE_PATH, 'utf8'), /\\| 21 \\| 停摆的活 \\| 002bot \\| 待领取 \\|/, '停摆行翻「待领取」');
@@ -207,13 +215,68 @@ __fs.writeFileSync(TASK_TABLE_PATH, [
   '| 23 | 没人领的活 | 003bot | 待领取 | — |',
 ].join('\\n'));
 const t1 = Date.now();
-herdTick(t1);
+herdTick(t1, kickSpy9);
 const t2 = new Date(t1 + 31 * 60 * 1000);
 for (const name of WORKER_NAMES) __fs.utimesSync(join(APP_DIR, \`bot-\${name}.log\`), t2, t2);
-herdTick(t1 + 31 * 60 * 1000);
+herdTick(t1 + 31 * 60 * 1000, kickSpy9);
 assert.equal(telegram.sent.length, sentBefore + 4, '待领取卡住要公告');
 assert.match(telegram.sent[telegram.sent.length - 1].text, /#23（003bot）卡住/, '公告点名');
 assert.match(__fs.readFileSync(TASK_TABLE_PATH, 'utf8'), /\\| 23 \\| 没人领的活 \\| 003bot \\| 待领取 \\|/, '待领取保持原状态');
+
+// 9f-9i 拉活状态机（2026-10-07 老板补令：判死/假活直接拉活+防风暴）——004bot 独立跑全套
+const kicks9f = [];
+const kickSpy9f = (name) => { kicks9f.push(name); };
+__fs.writeFileSync(TASK_TABLE_PATH, [
+  '# t',
+  '> 协作群 chat id: -100888',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 24 | 假活小工名下的活 | 004bot | 进行中 | — |',
+].join('\\n'));
+const sentBefore9f = telegram.sent.length;
+// 场景隔离：003bot 从 9c 的死 pid 复活（否则它的拉活状态机会横跨到本组继续计数）；
+// 拨假钟时把健康小工日志摸到假现在（同 9d 的「时间旅行要自洽」），只有 004bot 保持停摆
+__fs.writeFileSync(join(APP_DIR, '.bot.pid-003bot'), String(process.pid));
+const herdTick9 = (t) => {
+  const d = new Date(t);
+  for (const n of WORKER_NAMES) if (n !== '004bot') __fs.utimesSync(join(APP_DIR, \`bot-\${n}.log\`), d, d);
+  herdTick(t, kickSpy9f);
+};
+const t9 = Date.now();
+const stale9 = new Date(t9 - 20 * 60 * 1000);
+__fs.utimesSync(join(APP_DIR, 'bot-004bot.log'), stale9, stale9);
+// 9f 首判：公告 + 第 1 次拉活 + 改派，三者并行
+herdTick9(t9);
+assert.equal(kicks9f.length, 1, '假活小工第一次必须触发拉活');
+assert.equal(kicks9f[0], '004bot', '拉的是判死那个小工');
+assert.match(telegram.sent[telegram.sent.length - 1].text, /004bot 判假活/, '公告要有谁+判定');
+assert.match(telegram.sent[telegram.sent.length - 1].text, /kickstart 拉活（第 1\\/3 次）/, '公告要标第几次拉活');
+assert.match(telegram.sent[telegram.sent.length - 1].text, /#24/, '拉活同时改派名下活');
+assert.match(__fs.readFileSync(TASK_TABLE_PATH, 'utf8'), /\\| 24 \\| 假活小工名下的活 \\| 004bot \\| 待领取 \\|/, '改派与拉活并行');
+// 9g 冷却期：10 分钟内不重复拉同一个小工
+herdTick9(t9 + 5 * 60 * 1000);
+assert.equal(kicks9f.length, 1, '冷却期内第二次必须不拉');
+assert.equal(telegram.sent.length, sentBefore9f + 1, '冷却期内不刷屏');
+// 9h 冷却过后逐次拉；连拉 3 次不活 → 第 4 次判定升级给老板并停手
+herdTick9(t9 + 11 * 60 * 1000);
+assert.equal(kicks9f.length, 2, '冷却过后第二次拉活');
+herdTick9(t9 + 22 * 60 * 1000);
+assert.equal(kicks9f.length, 3, '第三次拉活');
+herdTick9(t9 + 33 * 60 * 1000);
+assert.equal(kicks9f.length, 3, '连续 3 次后不再拉');
+assert.match(telegram.sent[telegram.sent.length - 1].text, /停止自动重试/, '升级公告找老板');
+herdTick9(t9 + 44 * 60 * 1000);
+assert.equal(telegram.sent.length, sentBefore9f + 4, '放弃后静默（首判+2 次续拉+升级共 4 条）');
+// 9i 恢复清零：日志摸新 → 不拉活；再次停摆 → 重新从第 1 次开始
+const tRec = t9 + 45 * 60 * 1000;
+__fs.utimesSync(join(APP_DIR, 'bot-004bot.log'), new Date(tRec), new Date(tRec));
+herdTick9(tRec);
+assert.equal(kicks9f.length, 3, '恢复后不拉活');
+const stale9b = new Date(t9 + 46 * 60 * 1000 - 20 * 60 * 1000);
+__fs.utimesSync(join(APP_DIR, 'bot-004bot.log'), stale9b, stale9b);
+herdTick9(t9 + 46 * 60 * 1000);
+assert.equal(kicks9f.length, 4, '恢复后重新纳入看护（计数清零）');
+assert.match(telegram.sent[telegram.sent.length - 1].text, /kickstart 拉活（第 1\\/3 次）/, '重新计数');
 
 // 10) 任务纯净（#10）：①完结→重置会话→再领（新 prompt 不含上一单内容）；②打回 ≥3 次换人
 const submittedBefore10 = submitted.length;

@@ -227,7 +227,7 @@ ensure_dsh() {
 # ⚠️ 这里写死的 tag 必须是**本次发布自己的 tag**（发新版本时同步改，别漏）。
 #    走 TG 菜单那条路会先上网拉最新这份脚本再跑，所以实际生效的永远是网上最新的 tag；
 #    没网时才退回包里这份 —— 那时它也只能装这个 tag。
-SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.30}"
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.31}"
 # ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
 #    ⛔ 绝不拿日期或路径冒充版本号（2026-10-01 用户骂过）。
 plugin_version() {

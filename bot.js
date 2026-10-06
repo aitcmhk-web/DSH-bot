@@ -1505,15 +1505,23 @@ function watchTaskTable() {
 //   ② 进度：任务表行「进行中/待领取」距上次快照 ≥30 分钟纹丝不动 = 停
 //      （只盯小工的活：待审核=等老板、待验收=主 bot 自己、已发布=终态，不算小工停）。
 // 判死/判停 → 协作群公告一句（谁+判据+多久没动）→ 进行中的行自动翻「待领取」
-// + 结论列注明改派原因（沿用现规矩）。⛔ 不杀进程、⛔ 不动 launchd —— 卡死的进程
-// 交它自己的 #4 自退（60 轮失败 exit 1）+ launchd KeepAlive 兜底，看门狗只看不动手。
+// + 结论列注明改派原因（沿用现规矩）。
+// 拉活（2026-10-07 老板补令，「只看不动手」口径作废）：判死/假活的小工直接
+// `launchctl kickstart -k gui/<uid>/com.local.dshbot.<name>` 拉起来（✅ gui domain
+// 实查），与改派并行——活先改派给闲的，被拉的恢复后接新单。防风暴见 REVIVE_*：
+// 拉一次冷却 10 分钟，连拉 3 次不活 → 升级公告找老板并停手；恢复后重新看护。
+// 卡死进程自身的 #4 自退（60 轮失败 exit 1）+ launchd KeepAlive 依旧兜底。
 const WORKER_HEARTBEAT_MS = 5 * 60 * 1000;
 const HERD_CHECK_MS = 5 * 60 * 1000;
 const HERD_LOG_STALE_MS = 15 * 60 * 1000; // 3 次心跳缺席 = 假活
 const HERD_STALL_MS = 30 * 60 * 1000;
 const HERD_GROUP_FALLBACK = '-5334440553';
+// 拉活防风暴（#9 小工 / #11 对端共用同一对常量，别再各写一份）：
+const REVIVE_COOLDOWN_MS = 10 * 60 * 1000; // 拉活后 10 分钟内不重复拉同一个小工
+const REVIVE_MAX_REVIVES = 3;              // 连拉 3 次不活 → 升级公告找老板并停止重试
 const herdAlarmed = new Set(); // 边沿触发记忆：alive:<name> / stall:<no>:<status>
 const herdProgress = new Map(); // 任务表进度快照：no → { status, since }
+const herdRevive = new Map(); // 小工拉活状态：name → { badSince, attempts, gaveUp, lastKickAt }
 
 // 心跳（#9+#11）：活体信号。worker 和 master 都要写 —— master 的 bot.log 是
 // 插件版反查主 bot 的 mtime 判据（#11 对等互查），空闲期没心跳会误报假活。
@@ -1568,6 +1576,47 @@ function checkWorkerAlive(name, now) {
   return livenessVerdict(name, workerPidPath(name), workerLogPath(name), now);
 }
 
+/** 小工的 launchd 服务标签（✅ 2026-10-07 launchctl print gui/$UID 实查：
+ *  四小工 plist 同前缀 com.local.dshbot.<name>，002bot state=running）。 */
+function workerLaunchdLabel(name) {
+  return `com.local.dshbot.${name}`;
+}
+
+function defaultWorkerKick(name) {
+  const args = ['kickstart', '-k', `gui/${process.getuid()}/${workerLaunchdLabel(name)}`];
+  const child = spawn('launchctl', args, { stdio: 'ignore' });
+  child.on('error', (err) => console.error(`[${_ts()}][herd] kickstart ${name} 失败: ${err.message}`));
+}
+
+/** 拉活状态机（#9 小工 / #11 对端共用同一份，⛔ 别复制第二份冷却/升级判定）。
+ *  就地更新 state，返回一步决策：
+ *  - isBad=true：'kick'（attempts 已 +1，调方负责真拉）/ 'cooldown'（期内静默）/
+ *    'giveup'（连拉 MAX 次不活，已置 gaveUp，调方发升级公告）/ 'idle'（已放弃，静默）
+ *  - isBad=false：'recovered'（曾放弃后恢复，重新纳入看护）/ 'reset'（普通清零）。 */
+function reviveDecide(state, isBad, now) {
+  if (!isBad) {
+    const wasGaveUp = state.gaveUp;
+    state.badSince = null;
+    state.attempts = 0;
+    state.gaveUp = false;
+    state.lastKickAt = 0;
+    return { action: wasGaveUp ? 'recovered' : 'reset' };
+  }
+  if (!state.badSince) {
+    state.badSince = now;
+    state.attempts = 0;
+  }
+  if (state.gaveUp) return { action: 'idle' };
+  if (state.attempts > 0 && now - state.lastKickAt < REVIVE_COOLDOWN_MS) return { action: 'cooldown' };
+  if (state.attempts >= REVIVE_MAX_REVIVES) {
+    state.gaveUp = true;
+    return { action: 'giveup', attempts: state.attempts };
+  }
+  state.attempts += 1;
+  state.lastKickAt = now;
+  return { action: 'kick', attempts: state.attempts };
+}
+
 /** 把一行翻「待领取」并在结论列追加改派原因（行被别人动过/不是进行中 → 放弃）。 */
 function reassignTaskRow(no, reason, now = Date.now()) {
   const table = readTaskTable();
@@ -1587,26 +1636,46 @@ function reassignTaskRow(no, reason, now = Date.now()) {
   return true;
 }
 
-/** 一次巡检：存活 + 进度。公告合并成一条发协作群（群 id 表头优先，兜底协作群）。 */
-function herdTick(now = Date.now()) {
+/** 一次巡检：存活 + 进度。公告合并成一条发协作群（群 id 表头优先，兜底协作群）。
+ *  kick 可注入（测试打桩用，绝不真跑 launchctl）；默认真 kick 对应小工 launchd 服务。 */
+function herdTick(now = Date.now(), kick = defaultWorkerKick) {
   const verdicts = [];
-  // ① 存活（边沿触发：健康→判死才公告并改派，恢复后清除记忆）
+  // ① 存活（判死/假活 → 公告 + 拉活 + 改派，三者并行；边沿触发：恢复清记忆）
   for (const name of WORKER_NAMES) {
     const v = checkWorkerAlive(name, now);
     if (v) {
-      if (!herdAlarmed.has(`alive:${name}`)) {
-        herdAlarmed.add(`alive:${name}`);
-        verdicts.push(v);
-        for (const line of (readTaskTable() ?? '').split('\n')) {
-          const m = line.match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*([^|]+?)\s*\|/);
-          if (m && m[3] === name && m[4] === '进行中') {
-            verdicts.push(`#${m[1]}（${name}）→ 翻「待领取」改派`);
-            reassignTaskRow(m[1], `看门狗：${v}`, now);
-          }
+      if (!herdRevive.has(name)) {
+        herdRevive.set(name, { badSince: null, attempts: 0, gaveUp: false, lastKickAt: 0 });
+      }
+      const d = reviveDecide(herdRevive.get(name), true, now);
+      const firstAlarm = !herdAlarmed.has(`alive:${name}`);
+      if (firstAlarm) herdAlarmed.add(`alive:${name}`);
+      if (d.action === 'kick') {
+        verdicts.push(`${v} → 已 launchctl kickstart 拉活（第 ${d.attempts}/${REVIVE_MAX_REVIVES} 次）`);
+        if (kick) kick(name);
+      } else if (d.action === 'giveup') {
+        verdicts.push(
+          `🐕 看门狗升级：${v}；已连续拉活 ${d.attempts} 次无效 → 停止自动重试，请老板人工处理`,
+        );
+      } else if (firstAlarm) {
+        verdicts.push(v); // 兜底：状态机本步没动作时首判也要报（防漏公告）
+      }
+      // 改派与拉活并行：名下「进行中」翻「待领取」（reassignTaskRow 只翻进行中行，天然幂等）
+      for (const line of (readTaskTable() ?? '').split('\n')) {
+        const m = line.match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*([^|]+?)\s*\|/);
+        if (m && m[3] === name && m[4] === '进行中') {
+          verdicts.push(`#${m[1]}（${name}）→ 翻「待领取」改派`);
+          reassignTaskRow(m[1], `看门狗：${v}`, now);
         }
       }
     } else {
       herdAlarmed.delete(`alive:${name}`);
+      const st = herdRevive.get(name);
+      if (st) {
+        const d = reviveDecide(st, false, now);
+        if (d.action === 'recovered') console.log(`[${_ts()}][herd] ${name} 恢复 —— 重新纳入看护`);
+        herdRevive.delete(name);
+      }
     }
   }
   // ② 进度：同状态 ≥30 分钟 = 停（快照首见只记时，不判）
@@ -1664,9 +1733,7 @@ function watchWorkerHerd() {
 // ⛔ 自杀禁令：master 只拉 dshbot 标签，绝不碰自己（com.local.dsbot）。
 const PEER_ROOT = process.env.DSH_PEER_ROOT ?? '/Users/tcm/DSH/dshbot';
 const PEER_LAUNCHD_LABEL = process.env.DSH_PEER_LAUNCHD_LABEL ?? 'com.local.dshbot.dshbot';
-const PEER_COOLDOWN_MS = 10 * 60 * 1000;
-const PEER_MAX_REVIVES = 3;
-const peerState = { badSince: null, attempts: 0, gaveUp: false, lastKickAt: 0 };
+const peerState = { badSince: null, attempts: 0, gaveUp: false, lastKickAt: 0 }; // 防风暴状态用公共 reviveDecide
 
 /** 对端（插件版）存活检查：同一份 livenessVerdict，换路径。 */
 function checkPeerAlive(now, root = PEER_ROOT) {
@@ -1679,34 +1746,24 @@ function defaultPeerKick() {
   child.on('error', (err) => console.error(`[${_ts()}][peer] kickstart 失败: ${err.message}`));
 }
 
-/** 对端巡检一步：判定 → 公告 → 拉活（冷却/升淹没在状态里）。kick 可注入（测试用）。 */
+/** 对端巡检一步：判定 → 公告 → 拉活（冷却/升级在公共 reviveDecide 里）。kick 可注入（测试用）。
+ *  ⚠️ v 非空 = 判死/假活（健康时 livenessVerdict 返回 null），拉活/升级挂在这侧。 */
 function peerTick(now = Date.now(), kick = defaultPeerKick) {
   const v = checkPeerAlive(now);
-  if (!v) {
-    if (peerState.gaveUp) console.log(`[${_ts()}][peer] 对端恢复 —— 重新纳入看护`);
-    peerState.badSince = null;
-    peerState.attempts = 0;
-    peerState.gaveUp = false;
-    peerState.lastKickAt = 0;
-    return;
+  const d = reviveDecide(peerState, Boolean(v), now);
+  if (v) {
+    if (d.action === 'kick') {
+      console.error(`[${_ts()}][peer] ${v} → kickstart 拉活（第 ${d.attempts}/${REVIVE_MAX_REVIVES} 次）`);
+      announcePeer(`🐕 看门狗：${v} → 已 launchctl kickstart 拉活（第 ${d.attempts}/${REVIVE_MAX_REVIVES} 次）`);
+      kick();
+    } else if (d.action === 'giveup') {
+      console.error(`[${_ts()}][peer] 连续 ${d.attempts} 次拉活无效 —— 停止重试，升级给老板人工处理`);
+      announcePeer(`🐕 看门狗升级：${v}；已连续拉活 ${d.attempts} 次无效 → 停止自动重试，请老板人工处理`);
+    }
+    // cooldown / idle：期内静默，不刷屏
+  } else if (d.action === 'recovered') {
+    console.log(`[${_ts()}][peer] 对端恢复 —— 重新纳入看护`);
   }
-  if (!peerState.badSince) {
-    peerState.badSince = now;
-    peerState.attempts = 0;
-  }
-  if (peerState.gaveUp) return;
-  if (peerState.attempts > 0 && now - peerState.lastKickAt < PEER_COOLDOWN_MS) return; // 冷却期
-  if (peerState.attempts >= PEER_MAX_REVIVES) {
-    peerState.gaveUp = true;
-    console.error(`[${_ts()}][peer] 连续 ${peerState.attempts} 次拉活无效 —— 停止重试，升级给老板人工处理`);
-    announcePeer(`🐕 看门狗升级：${v}；已连续拉活 ${peerState.attempts} 次无效 → 停止自动重试，请老板人工处理`);
-    return;
-  }
-  peerState.attempts += 1;
-  peerState.lastKickAt = now;
-  console.error(`[${_ts()}][peer] ${v} → kickstart 拉活（第 ${peerState.attempts}/${PEER_MAX_REVIVES} 次）`);
-  announcePeer(`🐕 看门狗：${v} → 已 launchctl kickstart 拉活（第 ${peerState.attempts}/${PEER_MAX_REVIVES} 次）`);
-  kick();
 }
 
 function announcePeer(text) {

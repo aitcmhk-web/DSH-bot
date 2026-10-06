@@ -118,21 +118,90 @@ running() {
 #    「本机 pgrep 漏报运行中 bot」）。凡以 pgrep 为唯一判据必然翻车。
 #    ✅ 改为**从 lsof 反查**：直接问「哪些 node 进程的 cwd 是本目录」，
 #       这是唯一既准确又不依赖 pgrep 的办法（实测能稳定拿到 32288）。
+#
+# 🚨 2026-10-07 #5 打回重修（实例归属）：旧法两处翻车——
+#    ① -n 校验查 `ps -o command=`（argv）里含 BOT_INSTANCE=<名字>：**死代码**，
+#       BOT_INSTANCE 是环境变量（bot.sh:51 export）、spawn 是纯 `node bot.js`，
+#       argv 里永远没有 → -n 的残骸让位分支永不生效，双开全靠 bot.js 锁兜底；
+#    ② 主模式按 cwd 认回的第一个候选可能是**小工** —— 主 bot 死、小工活时，
+#       主 daemon 错误让位、launchd 永不重拉 → 主 bot 躺死（同款 bug 反方向）。
+#    ✅ 新法 = **纯文件判据**（不依赖 argv/环境变量读取）：
+#       每个实例的「活记录」都落盘 —— bot.sh 侧 bot[SUFFIX].pid + .bot.lock[SUFFIX]/pid，
+#       bot.js 侧 .bot.pid[SUFFIX]。候选 pid 出现在**别人**的活记录里 → 是别人的
+#       实例，跳过（双向防误认）；-n 模式还要求候选在**自己**的活记录里
+#       （pidfile 残骸时锁 pid 仍是活的 —— current_pid() 的回落顺序同款依据）；
+#       主模式接受「无任何记录」的裸候选（= 没登记过的主实例，同旧版行为）。
+#       副作用顺带修好：cmd_status 主模式从此不会把小工认成主 bot。
+
+# 候选 pid 是否出现在给定文件里（$@ 可含 glob，无匹配自动跳过）
+_pid_in_record_files() {
+  local pid="$1"; shift
+  local pat f p
+  for pat in "$@"; do
+    for f in $pat; do
+      [ -f "$f" ] || continue
+      p="$(cat "$f" 2>/dev/null || true)"
+      if [ "$p" = "$pid" ]; then return 0; fi
+    done
+  done
+  return 1
+}
+
+# 候选 pid 是否属于**别的**实例（主↔小工互斥的关键）：
+#   小工记录 = bot-*.pid / .bot.lock-*/pid / .bot.pid-*（剔除自己的三件）
+#   主实例记录 = bot.pid / .bot.lock/pid / .bot.pid（仅 -n 模式需要排除主）
+_pid_claimed_by_other_instance() {
+  local pid="$1" pat f p
+  local my1="$APP/bot${SUFFIX}.pid" my2="$LOCK_DIR/pid" my3="$APP/.bot.pid${SUFFIX}"
+  for pat in "$APP"/bot-*.pid "$APP"/.bot.lock-*/pid "$APP"/.bot.pid-*; do
+    for f in $pat; do
+      [ -f "$f" ] || continue
+      [ "$f" = "$my1" ] && continue
+      [ "$f" = "$my2" ] && continue
+      [ "$f" = "$my3" ] && continue
+      p="$(cat "$f" 2>/dev/null || true)"
+      if [ "$p" = "$pid" ]; then return 0; fi
+    done
+  done
+  if [ -n "$INST_NAME" ]; then
+    for f in "$APP/bot.pid" "$APP/.bot.lock/pid" "$APP/.bot.pid"; do
+      [ -f "$f" ] || continue
+      p="$(cat "$f" 2>/dev/null || true)"
+      if [ "$p" = "$pid" ]; then return 0; fi
+    done
+  fi
+  return 1
+}
+
 find_live_bot_pid() {
-  local line p cwd
+  local line p cwd tmp ret
+  tmp="$(mktemp "${TMPDIR:-/tmp}/botsh-find.XXXXXX")" || return 1
+  lsof -a -d cwd -c node -Fn >"$tmp" 2>/dev/null || true
+  ret=1
   while IFS= read -r line; do
     case "$line" in
       p*) p="${line#p}" ;;
       n*)
         cwd="${line#n}"
-        # cwd 命中本目录 → 它就是在跑的本项目 bot.js
+        # cwd 命中本目录 → 它是在跑的本项目 bot.js
         if [ "$cwd" = "$APP" ] && [ -n "$p" ] && [ "$p" != "$$" ]; then
-          printf '%s' "$p"; return 0
+          # 别人的实例 → 跳过（-n 不认主/兄弟，主不认小工）
+          if _pid_claimed_by_other_instance "$p"; then continue; fi
+          if [ -n "$INST_NAME" ]; then
+            # -n 模式：只认自己名下的活记录（锁/pidfile）
+            if _pid_in_record_files "$p" "$APP/bot${SUFFIX}.pid" "$LOCK_DIR/pid" "$APP/.bot.pid${SUFFIX}"; then
+              printf '%s' "$p"; ret=0; break
+            fi
+          else
+            # 主模式：不是任何命名实例、又是本目录 node → 当主实例兜底（同旧版）
+            printf '%s' "$p"; ret=0; break
+          fi
         fi
         ;;
     esac
-  done < <(lsof -a -d cwd -c node -Fn 2>/dev/null || true)
-  return 1
+  done <"$tmp"
+  rm -f "$tmp"
+  return $ret
 }
 
 # --- 工具解析（借鉴 tg.sh:199-221 的经验） ---------------------------------
