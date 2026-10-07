@@ -15,6 +15,7 @@ models-authority.json
 !.env.example
 !.env.instance.example
 AGENTS.md
+/AGENTS.worker.md
 AGENTS-plugin.md
 memory/
 .githooks/

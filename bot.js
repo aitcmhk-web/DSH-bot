@@ -24,7 +24,10 @@ import { transcribe as asrTranscribe } from './asr.js';
 // ⚠️ 指向**共享**记忆模块 `DSH/memory/`（不是 BOT 自己的副本）——
 //    两份内容虽相同，但各存一份迟早改一份忘另一份，且 import 路径要与
 //    MEMORY_DIR（handoff / 流水账）保持一致，否则"记忆"概念被劈成两半。
-import { classifyUserText } from '../memory/conversation-cache/summarizer.mjs';
+// handoff 内容构建的纯函数（#35 从本文件抽出，测试可直接驱动真代码）+
+// 小工精简切片生成器（worker 启动时裁 AGENTS.md「# 门五、」之前 → AGENTS.worker.md）。
+import { activeTaskSnapshot, readRecentLedgerEntries } from './handoff-build.mjs';
+import { syncWorkerInstructions } from './worker-instructions.mjs';
 import {
   ROUTES,
   DEFAULT_ROUTE_KEY,
@@ -75,6 +78,12 @@ for (const key of ['HARNESS_WORKSPACE', 'HARNESS_PROFILE']) {
 //          领活/交活的播报由它干活轮次的回答发回协作群。
 // 生效方式：实例文件 .env.<名字> 里写 BOT_ROLE=worker（主实例不写 = master）。
 const BOT_ROLE = (process.env.BOT_ROLE ?? '').trim() === 'worker' ? 'worker' : 'master';
+
+// ─── 小工注入瘦身（#35，2026-10-08 老板定）──────────────────────────────
+// worker 启动即从权威源 AGENTS.md 现裁「# 门五、」之前的部分 → AGENTS.worker.md，
+// 并设 DSH_WORKER_INSTRUCTIONS=1 供 profile 的 agent-instructions !!js 门控切换挂载
+// （门控部署车 = 启用小工精简指令.command，由总控执行；主 bot/失败态零动作、全量回退）。
+syncWorkerInstructions({ root: ROOT, role: BOT_ROLE, log: console.log, logErr: console.error });
 
 // ─── 流水账（用户 2026-09-16 定死的设计）─────────────────────
 //
@@ -2175,96 +2184,9 @@ async function handleSetupdshCommand(chatId) {
   }
 }
 
-/**
- * 判定一条 👤 用户原文是否「无信息量」（语气词/寒暄/重复）。
- * 复用摘要链路的 classifyUserText()，保证口径一致。
- * @param {string} body 用户原文
- * @param {Set<string>} seen 去重集合（筛掉的条目不入集合）
- */
-function isFillerEntry(body, seen) {
-  try {
-    return classifyUserText(body, seen).action === 'drop';
-  } catch {
-    return false; // 判不了就保留，宁可多留不可误杀
-  }
-}
-
-/**
- * 读流水账，从**最末尾往回倒数 20 条**对话原文（👤 用户 + 🤖 助手 都留）。
- *
- * 用户 2026-09-16 定死（原话）：「重启前的文件是聊天记录最新开始倒数取 20 条」。
- * 即：起点 = 流水账最新那条（不管是谁发的），往回数满 40 个条目就停。
- *
- * ⚠️ 别自作聪明加条件（我 2026-09-16 连错两版，记在这里防复发）：
- *   - ❌ 不要按「轮」配对成 20 轮 —— 就是字面的 40 个条目
- *   - ❌ 不要按摘要生成时间切边界 —— 摘要不参与这个切分
- * 就一句：`entries.slice(-40)`。
- *
- * @param {string|null} ledgerRaw 流水账**正文**（由 readLedgerText() 读好传入；
- *   2026-09-17 起账本按月分文件，不再传路径，避免这里再拼一次文件名）
- * @param {number} maxEntries 取末尾多少条（默认 20）
- * @returns {string} 可直接嵌入 markdown 的正文；读不到时返回提示串
- */
-function readRecentLedgerEntries(ledgerRaw, maxEntries = 20) {
-  try {
-    if (ledgerRaw === null || ledgerRaw === undefined) return '（流水账文件不存在，无法提取）';
-    const raw = String(ledgerRaw);
-
-    // 条目分隔：`## 2026-09-16 04:40:40  👤 用户` / `  🤖 助手`
-    const parts = raw.split(/^## /m).slice(1); // 丢掉文件头
-    /** @type {{ts:string, icon:string, who:string, body:string}[]} */
-    const entries = [];
-    for (const p of parts) {
-      const nl = p.indexOf('\n');
-      if (nl < 0) continue;
-      const head = p.slice(0, nl).trim();          // 2026-09-16 04:40:40  👤 用户
-      const body = p.slice(nl + 1).trim();
-      const m = head.match(/^(\S+ \S+)\s+(👤|🤖)\s*(\S*)/);
-      if (!m) continue;
-      entries.push({ ts: m[1], icon: m[2], who: m[3] || (m[2] === '👤' ? '用户' : '助手'), body });
-    }
-    if (entries.length === 0) return '（流水账里没有可提取的对话条目）';
-
-    // ⭐ 用户 2026-09-16 改定：取「**有用的**末尾 20 条」，不是机械数 20 条。
-    // 旧版 `entries.slice(-maxEntries)` 会把「嗯」「好」「对」这类语气词也算进名额，
-    // 20 条里常有一半是废话。现改为：先用语气词表筛掉无信息量的 👤，
-    // 其所属那轮的 🤖 回复一并丢弃（整轮无信息量），再取末尾 20 条。
-    // 复用摘要链路的 classifyUserText()（summarizer.mjs），口径与摘要一致。
-    //
-    // 实现：按时序把条目切成「轮」——每遇到一条 👤 就开新轮，
-    // 其后的 🤖 归属该轮。轮内 👤 无信息量 → 整轮丢弃；否则整轮保留。
-    // ⚠️ 不截断 🤖 正文（我的回复里的结论不能砍）。
-    const seen = new Set();
-    const turns = [];
-    for (const e of entries) {
-      if (e.icon === '👤') {
-        turns.push({ keep: !isFillerEntry(e.body, seen), items: [e] });
-      } else {
-        // 没有前置 👤 的孤儿助手消息，挂到当前轮；都没有就自己开一轮
-        if (turns.length === 0) turns.push({ keep: true, items: [] });
-        turns[turns.length - 1].items.push(e);
-      }
-    }
-    const kept = turns.filter((t) => t.keep).flatMap((t) => t.items);
-    const picked = (kept.length ? kept : entries).slice(-maxEntries);
-
-    const out = picked.map((e) => {
-      // 正文可能是多行（我以前的回答里有缩进代码块），统一压成引用块
-      const quoted = e.body
-        .split('\n')
-        .map((l) => `> ${l}`.trimEnd())
-        .join('\n');
-      return `### ${e.icon} ${e.who} · ${e.ts}\n${quoted}`;
-    }).join('\n\n');
-
-    const userCount = picked.filter((e) => e.icon === '👤').length;
-    const asstCount = picked.filter((e) => e.icon === '🤖').length;
-    return `（共 ${picked.length} 条：👤 用户 ${userCount} / 🤖 助手 ${asstCount}）\n\n${out}`;
-  } catch (err) {
-    return `（读取流水账失败：${err.message}）`;
-  }
-}
-
+// ⛔ isFillerEntry / readRecentLedgerEntries 已抽到 ./handoff-build.mjs（#35 小工注入瘦身：
+//    把纯函数挪出巨型入口文件，测试才能直接驱动真实代码，而不是复制一份算法来测）。
+//    这里只 import 使用（见文件头）；要改口径去 handoff-build.mjs，别在原处重写实现。
 /** handoff 触发原因的人话描述（写进正文，让新会话知道"上次是怎么断的"）。 */
 const REASON_TEXT = {
   restart: {
@@ -2285,6 +2207,9 @@ const REASON_TEXT = {
       + '本文件是启动时**事后补写**的：内容取自流水账，正确；但时间戳是启动时刻，晚于真实断开时刻。',
   },
 };
+
+/** handoff 收录的流水账条数（条数 20 = 老板 2026-09-16 定死，#35 只加单条封顶；2026-10-08 打回修正，口径见 handoff-build.mjs）。 */
+const HANDOFF_RECENT_ENTRIES = 20;
 
 /** 会话内不足这么多条 = 在频繁调试，不覆盖 handoff（用户 2026-09-16 定）。 */
 const HANDOFF_MIN_TURNS = 20;
@@ -2358,31 +2283,28 @@ function writeHandoff({ chatId, reason = 'restart' }) {
     // 旧代码这里写死了 3 条 9/15 的常量 → 每次重启都写同一份旧事，
     // 新会话接不上真正进度（这就是"重启后忘光"的根因）。现改为读流水账。
     // 按月账本：正文整份取出（本月没有则回看历史月），再从中取末尾 20 条
+    // （条数 20 = 老板 2026-09-16 定死；#35 只加单条封顶截断，全文流水账里都在，见 handoff-build.mjs）。
     const ledgerText = readLedgerText();
-    const recent = readRecentLedgerEntries(ledgerText, 20); // 末尾往回 20 条
-    const ledgerRel = `memory/conversation-cache/raw/ledger/${ledgerMonthFile()}`;
+    const recent = readRecentLedgerEntries(ledgerText, HANDOFF_RECENT_ENTRIES);
 
     // 摘要覆盖到哪（只读，用于说明"下面这段是摘要之后的"）
     // ⛔ 2026-09-16 删除：摘要已退役（不再生成、不再注入），这行只会写出一个
     //    永远停在退役那天的陈旧时间戳，是自相矛盾的死信息。别再读 summary.md。
 
+    // #35 瘦身（2026-10-08）：handoff 只留「最近 20 条(单条封顶) + 活跃任务」，条数维持 2026-09-16 定的 20。
+    // 删掉的样板段：取法表（get-context 打印流水账一节本就带路径）、本次触发原因
+    // （首行「由 X 自动生成」已承载）、owner/模型两行快照、重启试法两行。
     const lines = [
       `# Handoff · 重启前记录（${now.toISOString()}）`,
       ``,
       `> 由 ${REASON_TEXT[reason]?.by ?? '系统'} 自动生成。用途:会话断了之后续不上(SDK 硬限制),`,
       `> 新会话先读本文件接续记忆。会话 id: \`${sessionId}\`(chat ${chatId})。`,
       ``,
-      `## 本文件记的是什么`,
+      `## 活跃任务（任务表快照，终态行不进 handoff）`,
       ``,
-      `| 项 | 值 |`,
-      `|---|---|`,
-      `| 取法 | 流水账**最新一条**开始，往回**倒数 20 条**（👤/🤖 都留，不配对） |`,
-      `| 流水账全集 | \`${ledgerRel}\`（按月分文件，旧月份为同目录下的 YYYY-MM.md） |`,
+      activeTaskSnapshot(join(ROOT, '任务表.md')),
       ``,
-      `## 本次触发的原因`,
-      REASON_TEXT[reason]?.why ?? `会话断开（${reason}）。`,
-      ``,
-      `## 上次进展（聊天记录最新开始，往回倒数 20 条原文；👤 用户 / 🤖 助手 都留）`,
+      `## 上次进展（最近 ${HANDOFF_RECENT_ENTRIES} 条 · 单条超长已截断，全文见流水账）`,
       ``,
       recent,
       ``,
@@ -2391,13 +2313,7 @@ function writeHandoff({ chatId, reason = 'restart' }) {
       `|---|---|`,
       `| 触发时间 | ${now.toISOString()} |`,
       `| 触发会话 | ${sessionId} |`,
-      `| 归属 owner | ${state.ownerUserId ?? '?'} |`,
-      `| 当前模型 | ${activeRoute.key} (${activeRoute.provider}/${activeRoute.model}) |`,
       `| 工作目录 | ${config.workspace} |`,
-      ``,
-      `## 重启后最简单试法`,
-      `直接给 bot 发一句正常消息 → 恢复回应,即说明重启成功。`,
-      `然后发一条带 \`**\` 的长消息验证富文本。`,
       ``,
     ].join('\n');
 
