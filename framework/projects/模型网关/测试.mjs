@@ -1,6 +1,7 @@
 // 测试.mjs · #19 模型网关改造验收测试（跑法：node 测试.mjs）
 // 四段：
 //   ① 新旧对拍 —— 旧版（#19 改造前备份）与新版（注册表分发）双实例，同一组请求逐字段比响应+假上游收到的请求体
+//      （#22 扩：转写/视觉条目入对拍——响应+上游请求体逐字节一致；另有新版单侧「未知类型 400 指名」回归）
 //   ② 演示链 —— 加假模型条目（假 key 走 env）→ POST /reload → /call 可达；删条目 → reload → 不可达（验收硬判据）
 //   ③ reload fail-closed —— key 引用的 env 变量缺失 → reload 500 指名
 //   ④ 类型注册「加同类项不改核心」—— 注册一个假类型处理器走通（D11）
@@ -96,6 +97,10 @@ const 共享表 = [
   { 名字: '假上游·envkey', 地址: `http://127.0.0.1:${假上游端口}/up`, key: '${GW_TEST_KEY}', 参数: {} },
   { 名字: 'AITCM·测试', 地址: `http://127.0.0.1:${假上游端口}/up`, key: 假key, 参数: { model: '测试模型', enable_thinking: false } },
   { 名字: 'AITCM·缺model', 地址: `http://127.0.0.1:${假上游端口}/up`, key: 假key, 参数: {} },
+  // #22 回归：转写/视觉条目（#19 漏注册曾全 400）+ 坏类型条目（验未知类型仍 fail-closed 指名）
+  { 名字: '假上游·转写', 地址: `http://127.0.0.1:${假上游端口}/up`, key: 假key, 类型: '转写' },
+  { 名字: '假上游·视觉', 地址: `http://127.0.0.1:${假上游端口}/up`, key: 假key, 类型: '视觉' },
+  { 名字: '假上游·坏类型', 地址: `http://127.0.0.1:${假上游端口}/up`, key: 假key, 类型: '坏类型' },
 ];
 const env表 = 共享表;
 
@@ -116,6 +121,11 @@ const 对拍用例 = [
   ['直通口 坏key 502 上游401', { 模型名: '假上游·明文坏key', 输入: {} },
     (r) => r.status === 502 && JSON.parse(r.body).错误 === '模型不可达' && JSON.parse(r.body).上游状态 === 401 && JSON.parse(r.body).上游返回.includes('InvalidKey')],
   ['直通口 输入缺省 {}', { 模型名: '假上游' },
+    (r) => r.status === 200 && JSON.parse(r.body).choices[0].message.content === '假上游应答'],
+  // #22 回归：转写/视觉条目 /call 必 200（旧版对类型字段无感知 → 旧版同样 200，逐字段对拍仍须全等）
+  ['转写条目 /call 200（#22 回归）', { 模型名: '假上游·转写', 输入: { 文件: '/tmp/x.mp3' } },
+    (r) => r.status === 200 && JSON.parse(r.body).choices[0].message.content === '假上游应答'],
+  ['视觉条目 /call 200（#22 回归）', { 模型名: '假上游·视觉', 输入: { model: 'vl-test', messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,aGk=' } }] }] } },
     (r) => r.status === 200 && JSON.parse(r.body).choices[0].message.content === '假上游应答'],
 ];
 
@@ -194,9 +204,10 @@ try {
   for (const [名, 请求体, 判定] of 对拍用例) {
     const ro = await post(旧端口, '/call', 请求体);
     断言(`${名} · 旧版基准成立`, 判定(ro), ro);
-    // AITCM 用例：先读走旧版的上游请求体记录，再打新版、读新版记录（假上游 /record 读了即清）
+    // AITCM / 转写 / 视觉 用例：先读走旧版的上游请求体记录，再打新版、读新版记录（假上游 /record 读了即清）
+    const 对拍上游体 = 请求体.项目 === 'AITCM' || 请求体.模型名 === '假上游·转写' || 请求体.模型名 === '假上游·视觉';
     let bo = null, bn = null;
-    if (请求体.项目 === 'AITCM' && ro.status === 200) {
+    if (对拍上游体 && ro.status === 200) {
       bo = await 假上游收到的(旧端口, 'Bearer sk-test-fake');
     }
     const rn = await post(新端口, '/call', 请求体);
@@ -235,6 +246,10 @@ try {
   const env旧 = await post(旧端口, '/call', { 模型名: '假上游·envkey', 输入: {} });
   const env新 = await post(新端口, '/call', { 模型名: '假上游·envkey', 输入: {} });
   断言('env key：新版解析 ${GW_TEST_KEY} 可达（旧版字面量 401 属预期新能力差异）', env新.status === 200 && env旧.status === 502, { 旧: env旧.status, 新: env新.status });
+  // #22 回归：未知类型仍 fail-closed 指名（旧版无类型校验会 200，属预期新能力差异，只对新版断言）
+  const 坏类型新 = await post(新端口, '/call', { 模型名: '假上游·坏类型', 输入: {} });
+  断言('未知类型 400 指名+可用类型名单（#22 回归防再犯）',
+    坏类型新.status === 400 && 坏类型新.body === JSON.stringify({ 错误: '模型「假上游·坏类型」登记了未知类型：坏类型（可用类型：chat、视觉、转写）' }), 坏类型新);
 
   console.log('② 演示链（验收硬判据）：加假模型条目（假 key 走 env）→ reload → 可达；删 → reload → 不可达');
   const 演示表路径 = join(工作区, '演示表.json');
@@ -249,7 +264,7 @@ try {
   表现值.push({ 名字: '演示假模型', 地址: `http://127.0.0.1:${假上游端口}/up`, key: '${GW_DEMO_KEY}', 类型: 'chat', 参数: { model: '演示模型' } });
   writeFileSync(演示表路径, JSON.stringify(表现值, null, 2));
   const rl = await post(9413, '/reload', {});
-  断言('演示：POST /reload 200 + 条数=6（5 条基础 + 新加 1 条）', rl.status === 200 && JSON.parse(rl.body).重读完成 === true && JSON.parse(rl.body).条数 === 6, rl);
+  断言('演示：POST /reload 200 + 条数=9（8 条基础 + 新加 1 条）', rl.status === 200 && JSON.parse(rl.body).重读完成 === true && JSON.parse(rl.body).条数 === 9, rl);
   const 可达 = await post(9413, '/call', { 模型名: '演示假模型', 输入: {} });
   断言('演示：加条目 → reload → /call 可达（假 key 经 env 解析）', 可达.status === 200 && JSON.parse(可达.body).choices[0].message.content === '假上游应答', 可达);
   // 删条目
@@ -271,7 +286,7 @@ try {
 
   console.log('⑤ 零硬编码 grep（代码零写死上游端点/key）');
   let 硬编码命中 = [];
-  for (const f of ['modules/api/api.mjs', 'modules/api/types/chat.mjs', 'modules/api/types/aitcm.mjs', 'modules/api/types/直通.mjs', 'modules/api/types/注册表.mjs', 'modules/registry/registry.mjs', 'modules/registry/env文件.mjs', 'scripts/key抽env.mjs']) {
+  for (const f of ['modules/api/api.mjs', 'modules/api/types/chat.mjs', 'modules/api/types/视觉.mjs', 'modules/api/types/转写.mjs', 'modules/api/types/aitcm.mjs', 'modules/api/types/直通.mjs', 'modules/api/types/注册表.mjs', 'modules/registry/registry.mjs', 'modules/registry/env文件.mjs', 'scripts/key抽env.mjs']) {
     const 文 = readFileSync(join(项目根, f), 'utf8');
     if (/dashscope|aliyuncs|sk-[A-Za-z0-9]{8,}|Bearer [A-Za-z0-9_\-]{8,}/i.test(文)) 硬编码命中.push(f);
   }
@@ -283,7 +298,9 @@ try {
 
   console.log('⑥ 迁移脚本实测（假旧表，项目副本内跑，不碰真表）');
   const 副本根 = join(工作区, '项目副本');
-  cpSync(项目根, join(工作区, '项目副本'), { recursive: true, filter: (s) => !s.includes('logs') && !s.includes('临时文件') && !s.includes('.git') });
+  // #22 补：项目根现已有真 models.json/.env —— 副本不得带真表/真 env（真表会让迁移脚本「已存在」拒跑；
+  // 真 env 抢占会让断言比到真 key，且旧断言失败时会把 .env 内容打进输出=真 key 外流路径）
+  cpSync(项目根, join(工作区, '项目副本'), { recursive: true, filter: (s) => !s.includes('logs') && !s.includes('临时文件') && !s.includes('.git') && !s.endsWith('/models.json') && !s.endsWith('/.env') });
   writeFileSync(join(副本根, '模型表.json'), JSON.stringify([
     { 名字: 'A', 地址: 'https://例/compatible-mode/v1/chat/completions', key: 'sk-test-aaa', 参数: { model: 'qwen3.7-flash' } },
     { 名字: 'B', 地址: 'https://例/compatible-mode/v1/chat/completions', key: 'sk-test-aaa', 参数: { model: 'qwen-vl-max' } },
