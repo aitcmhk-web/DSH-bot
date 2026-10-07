@@ -14,3 +14,6 @@ models-authority.json
 .env.*
 !.env.example
 !.env.instance.example
+AGENTS.md
+AGENTS-plugin.md
+memory/
