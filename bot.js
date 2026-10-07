@@ -1352,7 +1352,10 @@ function setTaskStatus(row, nextStatus) {
   const lines = table.split('\n');
   if (lines[row.index] !== row.line) return; // 行已被别人动过：放弃本轮，防覆盖
   const cells = lines[row.index].split('|'); // ['', no, task, owner, status, note, '']
-  if (cells.length < 6 || !WORKER_NAMES.includes(cells[3].trim())) return;
+  // 任务 #25（2026-10-07）：不再限 worker 名下 —— 插件版/主bot直做的行也有审核按钮，
+  // 审核按钮接力（见 watchTaskTable）要能占位它们；现有调用方 findTaskRow 本就只回
+  // worker 行，验收占位行为不变。
+  if (cells.length < 6) return;
   cells[4] = ` ${nextStatus} `;
   lines[row.index] = cells.join('|');
   writeTaskTable(lines.join('\n'));
@@ -1464,31 +1467,73 @@ function watchWorkerTasks() {
   }, TASK_POLL_MS);
 }
 
-/** 任务表轮询（主 bot 侧只认「待验收」→ 自动触发验收轮）。 */
+/** 审核按钮接力（任务 #25，2026-10-07）：找「状态=待审核 且 结论列带插件写的通过标记」的行。
+ *  为什么走任务表不走群消息：TG 平台不向 bot 投递别的 bot 的发言（官方 Bots FAQ，
+ *  插件 src/index.js 任务表块头注释同款结论）—— 插件群发的「通过 #N」主 bot 天生收不到
+ *  （handleMessage 的老板过滤只是第二道墙，平台层根本不投）。任务表是两边都在 5 秒轮询
+ *  的共享账本（派活/交活走的就是它），审批接力也走它。标记由插件在老板点 ✅ 时写入
+ *  （recordBossApproval），本侧只认标记文本；owner 不限（插件版/主bot直做的行也有按钮）。 */
+const APPROVE_MARKER = '✅ 老板已通过（审核按钮';
+function findApprovedRow(table) {
+  const lines = table.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*([^|]+?)\s*\|/);
+    if (m && m[4] === '待审核' && lines[i].includes(APPROVE_MARKER)) {
+      return { index: i, line: lines[i], no: m[1], task: m[2].trim(), owner: m[3] };
+    }
+  }
+  return null;
+}
+
+/** 任务表轮询（主 bot 侧）：「待验收」→ 自动触发验收轮；「待审核+通过标记」→ 触发发版轮。 */
 function watchTaskTable() {
   setInterval(() => {
     try {
       const table = readTaskTable();
       if (!table) return;
       const row = findTaskRow(table, '待验收');
-      if (!row) return;
-      setTaskStatus(row, '验收中'); // 先占位，防下轮重复触发
-      const groupId = groupChatIdFromTable();
-      const chatId = groupId ? Number(groupId) : state.ownerUserId;
-      if (!chatId) return;
-      submitTurn(chatId, [
-        {
-          type: 'text',
-          text: [
-            '<自动验收（系统触发，无需回复此段）>',
-            `任务表 #${row.no}（负责=${row.owner}）进入「待验收」。任务：${row.task}`,
-            '按职责验收：读改动（git diff / 相关文件）、跑测试；过了 → 任务表该行标「待审核」+ 填验收结论，群里公告「#N 验收通过，等审核」（⛔ 不发版——发版要等审核通过）；不过 → 标「打回」，结论写清哪里不行。',
-            `结果发回${groupId ? '协作群' : '私聊'}。`,
-            '</自动验收>',
-          ].join('\n'),
-        },
-      ]);
-      console.log(`[${_ts()}][任务表] #${row.no} 触发验收 → chat ${chatId}`);
+      if (row) {
+        setTaskStatus(row, '验收中'); // 先占位，防下轮重复触发
+        const groupId = groupChatIdFromTable();
+        const chatId = groupId ? Number(groupId) : state.ownerUserId;
+        if (chatId) {
+          submitTurn(chatId, [
+            {
+              type: 'text',
+              text: [
+                '<自动验收（系统触发，无需回复此段）>',
+                `任务表 #${row.no}（负责=${row.owner}）进入「待验收」。任务：${row.task}`,
+                '按职责验收：读改动（git diff / 相关文件）、跑测试；过了 → 任务表该行标「待审核」+ 填验收结论，群里公告「#N 验收通过，等审核」（⛔ 不发版——发版要等审核通过）；不过 → 标「打回」，结论写清哪里不行。',
+                `结果发回${groupId ? '协作群' : '私聊'}。`,
+                '</自动验收>',
+              ].join('\n'),
+            },
+          ]);
+          console.log(`[${_ts()}][任务表] #${row.no} 触发验收 → chat ${chatId}`);
+        }
+      }
+      // 审核按钮接力（#25）：置「发布中」占位防重 → 发版回合（与老板群里打「通过 #N」同一条路，
+      // 都走 agent 轮次；本行日志就是「主 bot 侧出现接收」的证据）。
+      const approved = findApprovedRow(table);
+      if (approved) {
+        setTaskStatus(approved, '发布中');
+        const groupId = groupChatIdFromTable();
+        const chatId = groupId ? Number(groupId) : state.ownerUserId;
+        if (chatId) {
+          submitTurn(chatId, [
+            {
+              type: 'text',
+              text: [
+                '<审核通过（系统触发，无需回复此段）>',
+                `任务表 #${approved.no}（负责=${approved.owner}）老板已在插件版审核按钮上点「✅通过」（群发那条 TG 平台不投递给 bot，本轮由任务表通过标记接力）。任务：${approved.task}`,
+                '按协作约定发版：升版本号 → commit（message 带版本号）→ push → 打 tag → push --tags；任务表该行标「已发布」，结论列记发版版本与 tag；全程动作发回协作群。',
+                '</审核通过（系统触发，无需回复此段）>',
+              ].join('\n'),
+            },
+          ]);
+          console.log(`[${_ts()}][任务表] #${approved.no} 收到审核通过（审核按钮 → 任务表接力）→ 触发发版 → chat ${chatId}`);
+        }
+      }
     } catch (err) {
       console.error(`[${_ts()}][任务表] 轮询失败: ${err.message}`);
     }

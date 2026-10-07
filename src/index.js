@@ -1642,9 +1642,35 @@ export function apply(ctx, config) {
       const cardMsgId = query.message?.message_id;
       const groupId = groupChatIdFromTable() ?? REVIEW_GROUP_FALLBACK;
       if (data.startsWith('review:approve:')) {
-        await telegram.sendMessage(groupId, `通过 #${no}`);
-        await editReviewCard(cardChat, cardMsgId, `✅ #${no} 已通过 —— 「通过 #${no}」已发协作群，等主 bot 发布。`);
-        log(`[审核] #${no} 老板点通过 → 已发协作群`);
+        // ① 群发「通过 #N」：纯给人看的公告。TG 平台不向 bot 投递别的 bot 的发言
+        //   （官方 Bots FAQ；下方任务表块头注释同款结论）—— 主 bot 天生收不到这条，
+        //   #15 把它当「主 bot 监听闭环」的输入，设计时踩了平台规则的坑（#25 实锤）。
+        //   第 16 条：成功唯一判据 = 返回带 message_id；没有或发送失败都显式报错，⛔ 不装成功。
+        let approveMsgId = null;
+        try {
+          const res = await telegram.sendMessage(groupId, `通过 #${no}`);
+          approveMsgId = res?.result?.message_id ?? null;
+          if (approveMsgId) log(`[审核] #${no} 群发「通过 #${no}」成功（message_id=${approveMsgId}）`);
+          else error(`[审核] #${no} 群发「通过 #${no}」返回里没有 message_id —— 按第 16 条不算成功，消息可能被丢弃`);
+        } catch (err) {
+          error(`[审核] #${no} 群发「通过 #${no}」失败: ${err?.message ?? err}`);
+        }
+        // ② 任务表通过标记（任务 #25 可靠腿）：主 bot 轮询到它 → 置「发布中」→ 走发版回合。
+        //   派活/交活早就是这条路（见任务表块头注释），审批接力补上同一条腿。
+        const recorded = recordBossApproval(no, approveMsgId);
+        await editReviewCard(
+          cardChat,
+          cardMsgId,
+          [
+            approveMsgId
+              ? `✅ #${no} 已通过 —— 「通过 #${no}」已发协作群（message_id=${approveMsgId}）。`
+              : `✅ #${no} 已通过 —— ⚠️ 群发「通过 #${no}」没拿到送达回执（发送失败或 message_id 缺失），群里可能看不到那条。`,
+            recorded
+              ? '已写任务表通过标记，等主 bot 发版。'
+              : '⚠️ 任务表通过标记没写成（表不在/行不是「待审核」）—— 主 bot 没动静时，请在群里直接发「通过 #N」。',
+          ].join('\n'),
+        );
+        log(`[审核] #${no} 老板点通过 → 群发${approveMsgId ? `（message_id=${approveMsgId}）` : '（⚠️ 无送达回执）'}；任务表标记${recorded ? '已写' : '未写成'}`);
       } else {
         await editReviewCard(cardChat, cardMsgId, `❌ #${no} 已选打回 —— 请直接在群里发「打回 #${no}：原因」（主 bot 监听这个格式回流小工）。`);
         await sendRejectPrompt(no, groupId, cardChat, cardMsgId);
@@ -2432,6 +2458,36 @@ export function apply(ctx, config) {
   async function editReviewCard(chatId, messageId, text) {
     if (!chatId || !messageId || !telegram) return;
     await telegram.editMessageText(chatId, messageId, text).catch(() => {});
+  }
+
+  /** 本地时间戳（结论列标记用）：MM-DD HH:MM，跟任务表既有留痕口径一致。 */
+  function reviewClockTs() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getMonth() + 1}-${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  /** 把「✅ 老板已通过（审核按钮 …）」写进任务表 #no 行结论列（任务 #25，2026-10-07）。
+   *  为什么必须写表：TG 平台不向 bot 投递别的 bot 的发言 —— 群发那条「通过 #N」主 bot
+   *  天生收不到（官方 Bots FAQ，任务表块头注释同款结论）；任务表是两边都在 5 秒轮询的
+   *  共享账本（派活/交活同款通路）。行不在「待审核」→ 不写（防把已发布/打回的行翻旧账）；
+   *  写入走 tmp+rename 原子替换。⛔ 只写事实标记，状态流转归主 bot。返回 true=写成功。 */
+  function recordBossApproval(no, messageId) {
+    const noStr = String(no);
+    if (!/^\d+$/.test(noStr)) return false; // 回调数据只认数字行号，防注入正则
+    const table = readTaskTable();
+    if (!table) return false;
+    const lines = table.split('\n');
+    const i = lines.findIndex((l) => new RegExp(`^\\|\\s*${noStr}\\s*\\|`).test(l));
+    if (i < 0) return false;
+    const cells = lines[i].split('|');
+    if (cells.length < 6 || cells[4].trim() !== '待审核') return false;
+    const prev = cells[5].trim();
+    const marker = `✅ 老板已通过（审核按钮 ${reviewClockTs()}，message_id=${messageId ?? '无回执'}）`;
+    cells[5] = ` ${(prev && prev !== '—' ? `${prev}；` : '') + marker} `;
+    lines[i] = cells.join('|');
+    writeTaskTable(lines.join('\n'));
+    return true;
   }
 
   async function sendReviewCard(row) {

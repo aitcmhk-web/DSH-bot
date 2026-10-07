@@ -351,7 +351,51 @@ assert.equal(submitted.length, submittedBeforeHandoff + 1, '打回 <3 照常回�
 assert.match(submitted[submitted.length - 1].blocks[0].text, /#33/, '领的是本行');
 
 // （#11 互为看门狗测试组已随功能整体删除，2026-10-07 老板令。）
-console2.log('bot.js 侧 10 组断言全过');
+
+// 11) 审核按钮接力（#25）：待审核行结论列出现插件写的「✅ 老板已通过（审核按钮 …）」→
+//     置「发布中」占位防重 + 触发发版回合。TG 平台不投递 bot 间发言（官方 Bots FAQ），
+//     插件群发的「通过 #N」主 bot 天生收不到 —— 接力只能走两边都在 5 秒轮询的任务表。
+watchTaskTable(); // 第 10 组把 intervalFn 换成了 worker tick，这里换回主 bot tick
+// 11a 命中并触发（worker 名下）
+__fs.writeFileSync(TASK_TABLE_PATH, [
+  '# t',
+  '> 协作群 chat id: -100888',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 40 | 按钮通过的活 | 002bot | 待审核 | ✅ 验收通过（测试桩）；✅ 老板已通过（审核按钮 10-07 17:33，message_id=777） |',
+].join('\\n'));
+const submittedBefore11 = submitted.length;
+intervalFn();
+assert.equal(submitted.length, submittedBefore11 + 1, '通过标记必须触发发版回合（主 bot 侧接收证据）');
+assert.match(submitted[submitted.length - 1].blocks[0].text, /#40/, '发版回合要带行号');
+assert.match(submitted[submitted.length - 1].blocks[0].text, /发版/, '回合必须是发版指令');
+assert.match(readTaskTable(), /\\| 40 \\| 按钮通过的活 \\| 002bot \\| 发布中 \\|/, '触发前先置「发布中」占位防重');
+intervalFn();
+assert.equal(submitted.length, submittedBefore11 + 1, '占位后不得重复触发');
+// 11b 插件版名下的待审核行也要能接力（#21 形状 —— 占位与触发都不许被 worker 门挡住）
+__fs.writeFileSync(TASK_TABLE_PATH, [
+  '# t',
+  '> 协作群 chat id: -100888',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 41 | 插件版名下的活 | 插件版 | 待审核 | ✅ 老板已通过（审核按钮 10-07 18:00，message_id=778） |',
+].join('\\n'));
+intervalFn();
+assert.equal(submitted.length, submittedBefore11 + 2, '插件版名下的通过标记也要触发');
+assert.match(readTaskTable(), /\\| 41 \\| 插件版名下的活 \\| 插件版 \\| 发布中 \\|/, '非 worker 名下也要能占位');
+// 11c 无标记的待审核行 → 不触发（老板还没点按钮，等审核就是等审核，状态一个字不许动）
+__fs.writeFileSync(TASK_TABLE_PATH, [
+  '# t',
+  '> 协作群 chat id: -100888',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 42 | 还在等审核的活 | 003bot | 待审核 | ✅ 验收通过（测试桩） |',
+].join('\\n'));
+intervalFn();
+assert.equal(submitted.length, submittedBefore11 + 2, '无标记不许触发');
+assert.match(readTaskTable(), /\\| 42 \\| 还在等审核的活 \\| 003bot \\| 待审核 \\|/, '没触发不许动状态');
+
+console2.log('bot.js 侧 11 组断言全过');
 `;
 
 // ---------- index.js 侧测试 ----------
@@ -362,8 +406,11 @@ let enqueued = [];
 const enqueue = (key, task) => { enqueued.push({ key, task }); };
 let prompted = [];
 const promptFromHub = async (msg) => { prompted.push(msg); return { ok: true }; };
-const log = () => {};
-const error = (...a) => console2.error(...a);
+// #25：log/error 记账 —— 群发的 message_id 证据、失败显式报错都要能在桩里断言
+const logCalls = [];
+const errorCalls = [];
+const log = (...a) => { logCalls.push(a.map(String).join(' ')); };
+const error = (...a) => { errorCalls.push(a.map(String).join(' ')); };
 let intervalFn = null;
 const setInterval = (fn) => { intervalFn = fn; return 8; };
 // 审核卡（#15）需要：REVIEWER_MODE 吃 process.env.BOT_ROLE（测试环境必须没有）；
@@ -376,7 +423,10 @@ const telegram = {
   answers: 0,
   lastMsgId: 0,
   async sendMessage(chatId, text, extra = {}) {
+    // #25 用例钩子：failNextSend=下一次真 throw；noMsgIdOnce=下一次返回不带 message_id（第 16 条假成功）
+    if (this.failNextSend) { this.failNextSend = false; throw new Error('测试桩：发送失败'); }
     this.sent.push({ chatId, text, extra });
+    if (this.noMsgIdOnce) { this.noMsgIdOnce = false; return { ok: true }; }
     // #20：真实 TG 会回 result.message_id（原因条登记待回复要用它当 key）
     this.lastMsgId = 900 + this.sent.length;
     return { ok: true, result: { message_id: this.lastMsgId } };
@@ -607,7 +657,80 @@ assert.ok(__hookAt > 0, '钩子要接在 handleTelegramMessage 里');
 assert.ok(__hookAt < __groupAt, '钩子必须在群模式过滤之前');
 
 // （#11 互为看门狗测试组已随功能整体删除，2026-10-07 老板令。）
-console2.log('index.js 侧 5 组断言全过');
+
+// 6)（#25）✅ 通过 = 两条腿：① 群发「通过 #N」落 message_id 证据（第 16 条；失败显式报错不静默）；
+//    ② 任务表通过标记（主 bot 靠它接力发版 —— TG 平台不投递 bot 间发言，群发那条主 bot 天生收不到）。
+// 6a 群发成功：日志落 message_id + 卡片 edit 带回执 + 结论列写入标记（状态仍待审核=插件不越权改状态）
+__fs.writeFileSync(TASK_TABLE, [
+  '# t',
+  '> 协作群 chat id: -100777',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 13 | 按钮通过的活 | 002bot | 待审核 | ✅ 验收通过（测试桩） |',
+].join('\\n'));
+logCalls.length = 0;
+errorCalls.length = 0;
+await press(7, 'review:approve:13');
+assert.equal(telegram.sent[telegram.sent.length - 1].text, '通过 #13', '「通过 #N」格式一字不改（群发只给人看）');
+assert.ok(logCalls.some((l) => /群发「通过 #13」成功（message_id=\\d+）/.test(l)), '群发成功必须落 message_id 证据（第 16 条）');
+assert.match(telegram.edits[telegram.edits.length - 1].text, /message_id=/, '卡片回执带 message_id');
+assert.match(telegram.edits[telegram.edits.length - 1].text, /等主 bot 发版/, '卡片告知已写标记接力');
+const row13 = __fs.readFileSync(TASK_TABLE, 'utf8').split('\\n').find((l) => /^\\|\\s*13\\s*\\|/.test(l));
+assert.ok(row13, '行还在');
+assert.match(row13, /✅ 老板已通过（审核按钮/, '结论列必须写入通过标记（主 bot 接力腿）');
+assert.match(row13, /message_id=\\d+/, '标记里带 message_id');
+assert.match(row13, /\\| 待审核 \\|/, '插件只写事实标记，状态流转归主 bot（不得翻状态）');
+// 6b 行不在「待审核」（已发布）→ 不写标记防翻旧账，卡片/日志如实说没写成
+__fs.writeFileSync(TASK_TABLE, [
+  '# t',
+  '> 协作群 chat id: -100777',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 14 | 已经发布的活 | 002bot | 已发布 | 🚀 已发布（测试桩） |',
+].join('\\n'));
+logCalls.length = 0;
+await press(7, 'review:approve:14');
+const row14 = __fs.readFileSync(TASK_TABLE, 'utf8').split('\\n').find((l) => /^\\|\\s*14\\s*\\|/.test(l));
+assert.doesNotMatch(row14, /老板已通过/, '非待审核行不许写标记（防翻旧账）');
+assert.match(row14, /\\| 已发布 \\|/, '状态不许动');
+assert.ok(logCalls.some((l) => /任务表标记未写成/.test(l)), '没写成要显式记账');
+assert.match(telegram.edits[telegram.edits.length - 1].text, /没写成/, '卡片要如实说标记没写成');
+// 6c 发送失败（throw）→ 显式报错不静默 + 卡片如实说没回执 + 标记仍写（通过事实不受群发失败影响）
+__fs.writeFileSync(TASK_TABLE, [
+  '# t',
+  '> 协作群 chat id: -100777',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 15 | 群发会失败的活 | 003bot | 待审核 | ✅ 验收通过（测试桩） |',
+].join('\\n'));
+logCalls.length = 0;
+errorCalls.length = 0;
+telegram.failNextSend = true;
+await press(7, 'review:approve:15');
+assert.ok(errorCalls.some((l) => /群发「通过 #15」失败/.test(l)), '发送失败必须显式报错不静默');
+assert.match(telegram.edits[telegram.edits.length - 1].text, /没拿到送达回执/, '卡片如实说没回执，不装成功');
+const row15 = __fs.readFileSync(TASK_TABLE, 'utf8').split('\\n').find((l) => /^\\|\\s*15\\s*\\|/.test(l));
+assert.match(row15, /✅ 老板已通过（审核按钮/, '通过事实不受群发失败影响，标记照写');
+assert.match(row15, /message_id=无回执/, '没回执就明说无回执');
+assert.match(row15, /\\| 待审核 \\|/, '状态仍不许动');
+// 6d 返回没带 message_id（第 16 条：ret/ok 都不算数）→ 显式报错 + 标记仍写
+__fs.writeFileSync(TASK_TABLE, [
+  '# t',
+  '> 协作群 chat id: -100777',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 16 | 假成功也要留痕的活 | 004bot | 待审核 | ✅ 验收通过（测试桩） |',
+].join('\\n'));
+logCalls.length = 0;
+errorCalls.length = 0;
+telegram.noMsgIdOnce = true;
+await press(7, 'review:approve:16');
+assert.ok(errorCalls.some((l) => /没有 message_id/.test(l)), '假成功必须显式报错（第 16 条）');
+assert.ok(logCalls.some((l) => /无送达回执/.test(l)), '汇总日志也要标无回执');
+const row16 = __fs.readFileSync(TASK_TABLE, 'utf8').split('\\n').find((l) => /^\\|\\s*16\\s*\\|/.test(l));
+assert.match(row16, /message_id=无回执/, '假成功的标记明说无回执');
+
+console2.log('index.js 侧 6 组断言全过');
 `;
 
 const script = `${pathImport}${fsStub}\nconst __run = async () => {\n{\n${bTest}\n}\n{\n${iTest}\n}\n};\nawait __run();\n`;
