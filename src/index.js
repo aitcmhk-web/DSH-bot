@@ -2394,119 +2394,17 @@ export function apply(ctx, config) {
   }
   watchTaskTable();
 
-  // ── 互为看门狗（任务 #11，2026-10-07 老板令）：插件版 ↔ 主 bot 对等互查 + 拉活 ──
-  // 每 5 分钟查主 bot（BOT/.bot.pid kill -0 + BOT/bot.log mtime——主 bot #11 起心跳
-  // 保鲜，空闲期不再静默）；判死/假活 → 协作群公告 → `launchctl kickstart -k`
-  // 拉**对方**（com.local.dsbot，launchctl print 实查可达）的 launchd 服务——
-  // 锁持有者=被监管进程（#4 孤儿教训）。防风暴：拉活冷却 10 分钟；连续 3 次拉不活
-  // → 升级公告请老板人工处理并停止重试，对端恢复后自动重新纳入看护。
-  // ⛔ 自杀禁令：插件版只拉主 bot 标签，绝不碰自己（com.local.dshbot.dshbot）。
-  const PEER_ROOT = process.env.DSH_PEER_ROOT ?? '/Users/tcm/DSH/BOT';
-  const PEER_LAUNCHD_LABEL = process.env.DSH_PEER_LAUNCHD_LABEL ?? 'com.local.dsbot';
-  const PEER_COOLDOWN_MS = 10 * 60 * 1000;
-  const PEER_LOG_STALE_MS = 15 * 60 * 1000;
-  const PEER_MAX_REVIVES = 3;
-  const peerState = { badSince: null, attempts: 0, gaveUp: false, lastKickAt: 0 };
-
-  function peerPidAlive(pid) {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (err) {
-      return err?.code === 'EPERM';
-    }
-  }
-
-  /** 对端（主 bot）存活检查：判定与主 bot bot.js 的 livenessVerdict 同款
-   *  （跨运行时各一份，改判定两边同步）。健康返回 null。 */
-  function checkPeerAlive(now, root = PEER_ROOT) {
-    let pid = NaN;
-    try {
-      pid = parseInt(readFileSync(join(root, '.bot.pid'), 'utf8').trim(), 10);
-    } catch {
-      /* 无 pidfile */
-    }
-    if (!Number.isInteger(pid) || !peerPidAlive(pid)) {
-      return `主 bot 判死：pidfile 缺失或 pid ${pid || '?'} 已不在（kill -0 失败）`;
-    }
-    let mtimeMs = 0;
-    try {
-      mtimeMs = statSync(join(root, 'bot.log')).mtimeMs;
-    } catch {
-      return `主 bot 判假活：pid ${pid} 活着但日志 bot.log 不存在`;
-    }
-    const staleMin = Math.round((now - mtimeMs) / 60000);
-    if (now - mtimeMs > PEER_LOG_STALE_MS) {
-      return `主 bot 判假活：pid ${pid} 活着，但日志已 ${staleMin} 分钟没动（心跳 ≥3 次缺席）`;
-    }
-    return null;
-  }
-
-  function announcePeer(text) {
-    const chatId = Number(groupChatIdFromTable() ?? PEER_GROUP_FALLBACK);
-    if (!telegram || !Number.isInteger(chatId)) return;
-    void telegram.sendRich(chatId, text).catch((err) => error(`[peer] 公告发送失败: ${err.message}`));
-  }
-
-  function defaultPeerKick() {
-    const child = spawn('launchctl', ['kickstart', '-k', `gui/${process.getuid()}/${PEER_LAUNCHD_LABEL}`], { stdio: 'ignore' });
-    child.on('error', (err) => error(`[peer] kickstart 失败: ${err.message}`));
-  }
-
-  /** 对端巡检一步：判定 → 公告 → 拉活（冷却/升级在状态里）。kick 可注入（测试用）。 */
-  function peerTick(now = Date.now(), kick = defaultPeerKick) {
-    const v = checkPeerAlive(now);
-    if (!v) {
-      if (peerState.gaveUp) log('[peer] 对端恢复 —— 重新纳入看护');
-      peerState.badSince = null;
-      peerState.attempts = 0;
-      peerState.gaveUp = false;
-      peerState.lastKickAt = 0;
-      return;
-    }
-    if (!peerState.badSince) {
-      peerState.badSince = now;
-      peerState.attempts = 0;
-    }
-    if (peerState.gaveUp) return;
-    if (peerState.attempts > 0 && now - peerState.lastKickAt < PEER_COOLDOWN_MS) return; // 冷却期
-    if (peerState.attempts >= PEER_MAX_REVIVES) {
-      peerState.gaveUp = true;
-      error(`[peer] 连续 ${peerState.attempts} 次拉活无效 —— 停止重试，升级给老板人工处理`);
-      announcePeer(`🐕 看门狗升级：${v}；已连续拉活 ${peerState.attempts} 次无效 → 停止自动重试，请老板人工处理`);
-      return;
-    }
-    peerState.attempts += 1;
-    peerState.lastKickAt = now;
-    error(`[peer] ${v} → kickstart 拉活（第 ${peerState.attempts}/${PEER_MAX_REVIVES} 次）`);
-    announcePeer(`🐕 看门狗：${v} → 已 launchctl kickstart 拉活（第 ${peerState.attempts}/${PEER_MAX_REVIVES} 次）`);
-    kick();
-  }
-
-  function watchPeerHerd() {
-    return setInterval(() => {
-      try {
-        if (!state.stopped) peerTick();
-      } catch (err) {
-        error(`[peer] 巡检失败: ${err?.stack ?? err?.message}`);
-      }
-    }, 5 * 60 * 1000);
-  }
+  // （互为看门狗 #11 已按老板令于 2026-10-07 整体删除：互相保活=互相误杀，把健康的
+  //   主 bot 反复 kickstart 勒死——任务表 #12/#13 有案。当时为它加的 [hb] 心跳保留，
+  //   日志活性对人工排查有用，已无人拿它当判死依据。）
 
   // 卸载
   // -------------------------------------------------------------------------
-  // #11 对等看门狗 + 心跳的定时器：注册在任务表切片之外（测试桩只捕获任务表轮询）。
-  // 心跳两边都要发：本插件侧 bot.log 是 master 反查我的 mtime 判据；master 的
-  // bot.log 由它自己的心跳保鲜。对端巡检只在审核实例开（REVIEWER_MODE 且配了
-  // telegram —— 有嗓子的实例才有权拉活：没 token 的插件实例拉了主 bot 也没人通报）。
-  let peerTimer = null;
-  if (REVIEWER_MODE && telegram) peerTimer = watchPeerHerd();
   const hbTimer = setInterval(() => log('[hb] 心跳正常（插件活、事件循环通）'), 5 * 60 * 1000);
 
   ctx.on('dispose', async () => {
     state.stopped = true;
     if (taskTimer) clearInterval(taskTimer);
-    if (peerTimer) clearInterval(peerTimer);
     if (hbTimer) clearInterval(hbTimer);
     approvalBridge?.dispose();
     pollAbort?.abort();

@@ -42,7 +42,6 @@ const bTest = `
 const APP_DIR = ${JSON.stringify(TMP)};
 const BOT_ROLE = 'master'; // 看门狗块顶层引用（worker 才开心跳）；测试按 master 走
 const INSTANCE = '002bot'; // worker 领活身份（#10 任务纯净测试用）
-process.env.DSH_PEER_ROOT = APP_DIR; // #11 对端路径指向测试目录（防碰真 dshbot）
 const state = { ownerUserId: 42 };
 let submitted = [];
 const events = []; // 顺序账（#10）：reset / turn 谁先谁后
@@ -342,43 +341,8 @@ intervalFn();
 assert.equal(submitted.length, submittedBeforeHandoff + 1, '打回 <3 照常回流自领');
 assert.match(submitted[submitted.length - 1].blocks[0].text, /#33/, '领的是本行');
 
-// 11) 互为看门狗（#11）：master 查插件版——健康不报；假活必报+拉活；冷却；升级；恢复
-const kicks = [];
-const kickSpy = () => { kicks.push(1); };
-__fs.writeFileSync(join(APP_DIR, '.bot.pid'), String(process.pid)); // 对端 pid=本测试进程（必活）
-__fs.writeFileSync(join(APP_DIR, 'bot.log'), '[hb] 心跳正常（对端测试桩）\\n');
-const sentBeforePeer = telegram.sent.length;
-peerTick(Date.now(), kickSpy);
-assert.equal(kicks.length, 0, '对端健康不许拉活');
-assert.equal(telegram.sent.length, sentBeforePeer, '对端健康不许公告');
-const staleT = new Date(Date.now() - 20 * 60 * 1000);
-__fs.utimesSync(join(APP_DIR, 'bot.log'), staleT, staleT); // 对端日志停摆 20 分钟
-peerTick(Date.now(), kickSpy);
-assert.equal(kicks.length, 1, '对端假活第一次必须拉活');
-assert.match(telegram.sent[telegram.sent.length - 1].text, /插件版 判假活/, '公告要有谁+判定');
-assert.match(telegram.sent[telegram.sent.length - 1].text, /第 1\\/3 次/, '公告要标第几次拉活');
-peerTick(Date.now() + 5 * 60 * 1000, kickSpy);
-assert.equal(kicks.length, 1, '冷却期内不重复拉活');
-peerTick(Date.now() + 11 * 60 * 1000, kickSpy);
-assert.equal(kicks.length, 2, '冷却过后第二次拉活');
-peerTick(Date.now() + 22 * 60 * 1000, kickSpy);
-assert.equal(kicks.length, 3, '第三次拉活');
-peerTick(Date.now() + 33 * 60 * 1000, kickSpy);
-assert.equal(kicks.length, 3, '连续 3 次后不再拉');
-assert.match(telegram.sent[telegram.sent.length - 1].text, /停止自动重试/, '升级公告找老板');
-peerTick(Date.now() + 44 * 60 * 1000, kickSpy);
-assert.equal(telegram.sent.length, sentBeforePeer + 4, '放弃后静默（不再刷屏）');
-const recovT = new Date(t0 + 45 * 60 * 1000); // 对端恢复：心跳把日志写到「当前（假）时刻」
-__fs.utimesSync(join(APP_DIR, 'bot.log'), recovT, recovT);
-peerTick(t0 + 45 * 60 * 1000, kickSpy);
-assert.equal(kicks.length, 3, '恢复后不拉活');
-const staleT2 = new Date(t0 + 26 * 60 * 1000); // 再次停摆（相对假时钟 20 分钟前）
-__fs.utimesSync(join(APP_DIR, 'bot.log'), staleT2, staleT2); // 再次停摆 → 重新从第 1 次开始
-peerTick(t0 + 46 * 60 * 1000, kickSpy);
-assert.equal(kicks.length, 4, '恢复后重新纳入看护（计数清零）');
-assert.match(telegram.sent[telegram.sent.length - 1].text, /第 1\\/3 次/, '重新计数');
-
-console2.log('bot.js 侧 11 组断言全过');
+// （#11 互为看门狗测试组已随功能整体删除，2026-10-07 老板令。）
+console2.log('bot.js 侧 10 组断言全过');
 `;
 
 // ---------- index.js 侧测试 ----------
@@ -404,7 +368,6 @@ const telegram = {
 };
 
 process.env.DSH_TASK_TABLE = __path.join(${JSON.stringify(TMP)}, '插件侧任务表.md');
-process.env.DSH_PEER_ROOT = __path.join(${JSON.stringify(TMP)}, 'peer-root'); // #11 对端指向测试目录（防读真主 bot）
 const TASK_TABLE = process.env.DSH_TASK_TABLE;
 
 ${iChunk}
@@ -474,32 +437,8 @@ intervalFn();
 await new Promise((r) => setTimeout(r, 5));
 assert.equal(telegram.sent.length, 1, '同一行改任务文本也不重发（按 #N 去重）');
 assert.equal(__fs.readFileSync(TASK_TABLE, 'utf8'), tableAfterCard.replace('修轮询僵死', '审核弹窗'), '发卡不改任务表状态');
-// 5) 互为看门狗（#11）：插件版查主 bot——独立 peer-root（防与 bTest 的对端路径碰撞）
-const peerRoot5 = __path.join(${JSON.stringify(TMP)}, 'peer-root');
-__fs.mkdirSync(peerRoot5, { recursive: true });
-__fs.writeFileSync(join(peerRoot5, '.bot.pid'), String(process.pid));
-__fs.writeFileSync(join(peerRoot5, 'bot.log'), '[hb] 心跳正常（主 bot 测试桩）\\n');
-const kicks5 = [];
-const kickSpy5 = () => { kicks5.push(1); };
-const sentBeforePeer5 = telegram.sent.length;
-peerTick(Date.now(), kickSpy5);
-assert.equal(kicks5.length, 0, '主 bot 健康不许拉活');
-assert.equal(telegram.sent.length, sentBeforePeer5, '主 bot 健康不许公告');
-const stale5 = new Date(Date.now() - 20 * 60 * 1000);
-__fs.utimesSync(join(peerRoot5, 'bot.log'), stale5, stale5);
-peerTick(Date.now(), kickSpy5);
-assert.equal(kicks5.length, 1, '主 bot 假活必须拉活');
-assert.match(telegram.sent[telegram.sent.length - 1].text, /主 bot 判假活/, '公告要有谁+判定');
-assert.match(telegram.sent[telegram.sent.length - 1].text, /第 1\\/3 次/, '公告要标第几次拉活');
-peerTick(Date.now() + 11 * 60 * 1000, kickSpy5);
-assert.equal(kicks5.length, 2, '冷却过后第二次拉活');
-peerTick(Date.now() + 22 * 60 * 1000, kickSpy5);
-peerTick(Date.now() + 33 * 60 * 1000, kickSpy5);
-assert.equal(kicks5.length, 3, '连续 3 次后停止');
-assert.match(telegram.sent[telegram.sent.length - 1].text, /停止自动重试/, '升级公告');
-peerTick(Date.now() + 44 * 60 * 1000, kickSpy5);
-assert.equal(kicks5.length, 3, '放弃后静默');
-console2.log('index.js 侧 5 组断言全过');
+// （#11 互为看门狗测试组已随功能整体删除，2026-10-07 老板令。）
+console2.log('index.js 侧 4 组断言全过');
 `;
 
 const script = `${pathImport}${fsStub}\nconst __run = async () => {\n{\n${bTest}\n}\n{\n${iTest}\n}\n};\nawait __run();\n`;

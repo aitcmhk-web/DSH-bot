@@ -1724,66 +1724,9 @@ function watchWorkerHerd() {
   }, HERD_CHECK_MS).unref();
 }
 
-// ── 互为看门狗（任务 #11，2026-10-07 老板令）：master ↔ 插件版 对等互查 + 拉活 ──
-// master 每 5 分钟查插件版（dshbot/.bot.pid kill -0 + dshbot/bot.log mtime——
-// 插件侧 #11 起有心跳写 stdout→plist 重定向进 bot.log，空闲期不再静默）；
-// 判死/假活 → 协作群公告 → `launchctl kickstart -k` 拉**对方**的 launchd 服务
-//（锁持有者=被监管进程，#4 孤儿教训）。防风暴：拉活后冷却 10 分钟；连续 3 次
-// 拉不活 → 升级公告请老板人工处理并停止重试，对端恢复后自动重新纳入看护。
-// ⛔ 自杀禁令：master 只拉 dshbot 标签，绝不碰自己（com.local.dsbot）。
-const PEER_ROOT = process.env.DSH_PEER_ROOT ?? '/Users/tcm/DSH/dshbot';
-const PEER_LAUNCHD_LABEL = process.env.DSH_PEER_LAUNCHD_LABEL ?? 'com.local.dshbot.dshbot';
-const peerState = { badSince: null, attempts: 0, gaveUp: false, lastKickAt: 0 }; // 防风暴状态用公共 reviveDecide
-
-/** 对端（插件版）存活检查：同一份 livenessVerdict，换路径。 */
-function checkPeerAlive(now, root = PEER_ROOT) {
-  return livenessVerdict('插件版', join(root, '.bot.pid'), join(root, 'bot.log'), now);
-}
-
-function defaultPeerKick() {
-  const args = ['kickstart', '-k', `gui/${process.getuid()}/${PEER_LAUNCHD_LABEL}`];
-  const child = spawn('launchctl', args, { stdio: 'ignore' });
-  child.on('error', (err) => console.error(`[${_ts()}][peer] kickstart 失败: ${err.message}`));
-}
-
-/** 对端巡检一步：判定 → 公告 → 拉活（冷却/升级在公共 reviveDecide 里）。kick 可注入（测试用）。
- *  ⚠️ v 非空 = 判死/假活（健康时 livenessVerdict 返回 null），拉活/升级挂在这侧。 */
-function peerTick(now = Date.now(), kick = defaultPeerKick) {
-  const v = checkPeerAlive(now);
-  const d = reviveDecide(peerState, Boolean(v), now);
-  if (v) {
-    if (d.action === 'kick') {
-      console.error(`[${_ts()}][peer] ${v} → kickstart 拉活（第 ${d.attempts}/${REVIVE_MAX_REVIVES} 次）`);
-      announcePeer(`🐕 看门狗：${v} → 已 launchctl kickstart 拉活（第 ${d.attempts}/${REVIVE_MAX_REVIVES} 次）`);
-      kick();
-    } else if (d.action === 'giveup') {
-      console.error(`[${_ts()}][peer] 连续 ${d.attempts} 次拉活无效 —— 停止重试，升级给老板人工处理`);
-      announcePeer(`🐕 看门狗升级：${v}；已连续拉活 ${d.attempts} 次无效 → 停止自动重试，请老板人工处理`);
-    }
-    // cooldown / idle：期内静默，不刷屏
-  } else if (d.action === 'recovered') {
-    console.log(`[${_ts()}][peer] 对端恢复 —— 重新纳入看护`);
-  }
-}
-
-function announcePeer(text) {
-  const chatId = Number(groupChatIdFromTable() ?? HERD_GROUP_FALLBACK);
-  if (!telegram || !Number.isInteger(chatId)) return;
-  void telegram
-    .sendRich(chatId, text)
-    .catch((err) => console.error(`[${_ts()}][peer] 公告发送失败: ${err.message}`));
-}
-
-function watchPeerHerd() {
-  setInterval(() => {
-    try {
-      if (!shuttingDown) peerTick();
-    } catch (err) {
-      console.error(`[${_ts()}][peer] 巡检失败: ${err?.stack ?? err?.message}`);
-    }
-  }, HERD_CHECK_MS).unref();
-}
-
+// ── 互为看门狗（#11）已按老板令于 2026-10-07 整体删除：互相保活=互相误杀，
+// 把健康的插件版反复 kickstart 勒死（任务表 #12/#13 有案）。存活的定时守护
+// 只留 #9 小工看门狗（单向 master→四个小工），对端互查/拉活不再存在。
 async function handleMessage(message) {
   const chatId = message.chat.id;
   const userId = message.from?.id;
@@ -3842,6 +3785,6 @@ try {
 
 // ---- 协作任务表轮询（主 bot = 验收/发布；派活逻辑见 watchTaskTable 头注释）----
 // 角色分流：worker（001bot…）只盯领活；master 盯验收。同一个 5 秒轮询节奏，账本同一张。
-if (BOT_ROLE === 'worker') { watchWorkerTasks(); startHeartbeat(); } else { watchTaskTable(); watchWorkerHerd(); watchPeerHerd(); startHeartbeat(); }
+if (BOT_ROLE === 'worker') { watchWorkerTasks(); startHeartbeat(); } else { watchTaskTable(); watchWorkerHerd(); startHeartbeat(); }
 
 await Promise.all([pollLoop(), weixinPollLoop()]);

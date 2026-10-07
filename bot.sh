@@ -174,7 +174,7 @@ _pid_claimed_by_other_instance() {
 }
 
 find_live_bot_pid() {
-  local line p cwd tmp ret
+  local line p cwd tmp ret argv
   tmp="$(mktemp "${TMPDIR:-/tmp}/botsh-find.XXXXXX")" || return 1
   lsof -a -d cwd -c node -Fn >"$tmp" 2>/dev/null || true
   ret=1
@@ -183,17 +183,42 @@ find_live_bot_pid() {
       p*) p="${line#p}" ;;
       n*)
         cwd="${line#n}"
-        # cwd 命中本目录 → 它是在跑的本项目 bot.js
+        # cwd 命中本目录 → 疑似在跑的本项目进程
         if [ "$cwd" = "$APP" ] && [ -n "$p" ] && [ "$p" != "$$" ]; then
           # 别人的实例 → 跳过（-n 不认主/兄弟，主不认小工）
           if _pid_claimed_by_other_instance "$p"; then continue; fi
+          # 🚨 2026-10-07 修（小工占位主 bot）：
+          #   小工 bot.js 会 spawn 出 `dsh --profile bot-00Xbot` 子进程，
+          #   它的 cwd 同样是 BOT、又不在任何记录档里 → 被主模式当"裸候选"认领，
+          #   主 daemon 于是错误让位、launchd 永不重拉 → 主 bot 躺死。
+          #   ✅ 判据：主实例真身 argv 必为 `node .../bot.js`，
+          #      argv 含 --profile（= dsh 进程，无论主/小工）一律不是 bot 本体，跳过。
+          argv="$(ps -o command= -p "$p" 2>/dev/null || true)"
+          case "$argv" in
+            *--profile*) continue ;;
+          esac
+          case "$argv" in
+            *bot.js*) ;;
+            *) continue ;;
+          esac
+          # 🚨 第二道鎖（2026-10-07，macOS `ps eww` 实测可读别的进程 env）：
+          #   小工 bot.js 带 BOT_INSTANCE=<名字>；主 bot 该变量为空。
+          #   主模式：必须无 BOT_INSTANCE；-n 模式：必须等于自己名字。
+          #   两道锁互补（argv 看形态，env 看身份），任一条不符就跳过。
+          local be
+          be="$(ps eww -p "$p" 2>/dev/null | tail -1 | tr ' ' '\n' | sed -n 's/^BOT_INSTANCE=//p' | head -1)"
+          if [ -n "$INST_NAME" ]; then
+            [ "$be" = "$INST_NAME" ] || continue
+          else
+            [ -z "$be" ] || continue
+          fi
           if [ -n "$INST_NAME" ]; then
             # -n 模式：只认自己名下的活记录（锁/pidfile）
             if _pid_in_record_files "$p" "$APP/bot${SUFFIX}.pid" "$LOCK_DIR/pid" "$APP/.bot.pid${SUFFIX}"; then
               printf '%s' "$p"; ret=0; break
             fi
           else
-            # 主模式：不是任何命名实例、又是本目录 node → 当主实例兜底（同旧版）
+            # 主模式：确认是 bot.js 本体、又不是任何命名实例 → 当主实例兜底
             printf '%s' "$p"; ret=0; break
           fi
         fi
