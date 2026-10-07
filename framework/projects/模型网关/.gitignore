@@ -1,0 +1,8 @@
+本地数据/
+.DS_Store
+*.bak.*
+模型表.json
+.env
+模型文件/
+临时文件/
+logs/

@@ -1,0 +1,19 @@
+[
+  {
+    "名字": "本地转文字",
+    "地址": "http://127.0.0.1:9911/v1/audio/transcriptions",
+    "key": "",
+    "类型": "转写",
+    "参数": {}
+  },
+  {
+    "名字": "示例对话模型",
+    "地址": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    "key": "${DASHSCOPE_API_KEY}",
+    "类型": "chat",
+    "参数": {
+      "model": "qwen3.7-flash",
+      "enable_thinking": false
+    }
+  }
+]

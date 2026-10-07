@@ -1,0 +1,8 @@
+本地数据/
+.DS_Store
+*.bak.*
+config.json
+临时文件/
+weixin-account.json
+logs/
+node_modules/

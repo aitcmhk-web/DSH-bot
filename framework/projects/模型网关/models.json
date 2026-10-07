@@ -1,0 +1,52 @@
+[
+  {
+    "名字": "本地转文字",
+    "地址": "http://127.0.0.1:9911/v1/audio/transcriptions",
+    "key": "",
+    "类型": "转写"
+  },
+  {
+    "名字": "阿里转文字",
+    "地址": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    "key": "${GW_KEY_1}",
+    "类型": "转写"
+  },
+  {
+    "名字": "AITCM·咨询",
+    "地址": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    "key": "${GW_KEY_1}",
+    "类型": "chat",
+    "参数": {
+      "model": "qwen3.7-flash",
+      "enable_thinking": false
+    }
+  },
+  {
+    "名字": "AITCM·舌象",
+    "地址": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    "key": "${GW_KEY_1}",
+    "类型": "视觉",
+    "参数": {
+      "model": "qwen-vl-max"
+    }
+  },
+  {
+    "名字": "AITCM·医师",
+    "地址": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    "key": "${GW_KEY_1}",
+    "类型": "chat",
+    "参数": {
+      "model": "qwen3.7-plus"
+    }
+  },
+  {
+    "名字": "AITCM·客服",
+    "地址": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    "key": "${GW_KEY_1}",
+    "类型": "chat",
+    "参数": {
+      "model": "qwen3.7-flash",
+      "enable_thinking": false
+    }
+  }
+]

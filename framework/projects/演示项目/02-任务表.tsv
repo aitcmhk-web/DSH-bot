@@ -1,0 +1,3 @@
+任务ID	模块	干什么	状态	产出/位置	备注
+T001	data	建表结构 + read/write 接口，存 本地数据/db.json	完成	modules/data/	总控跑过两遍，验收过
+T002	hello	跑通 node modules/hello/hello.mjs：写入一条留言并读出	完成	modules/hello/hello.mjs	总控跑过两遍，验收过

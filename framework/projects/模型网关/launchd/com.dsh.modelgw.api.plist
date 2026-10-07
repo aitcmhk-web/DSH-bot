@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.dsh.modelgw.api</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>modules/api/api.mjs</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/tcm/DSH/BOT/framework/projects/模型网关</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/tcm/DSH/BOT/framework/projects/模型网关/logs/api.log</string>
+  <key>StandardErrorPath</key><string>/Users/tcm/DSH/BOT/framework/projects/模型网关/logs/api.err.log</string>
+</dict>
+</plist>

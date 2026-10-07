@@ -1,0 +1,8 @@
+任务ID	模块	干什么	状态	产出/位置	备注
+T001	access	TG 文字收发跑通（token 从配置读）	完成	modules/access/access.mjs	@AiTCM_bot 真机实测：4条收+回全过；还排掉一个坑（bot 上残留 webhook 致 409，摘掉即好）
+T002	convert	文字/图片归一成标准消息（图片落临时文件）	完成	modules/convert/convert.mjs	实测过（文件下载用本地假服务器）
+T003	route	按 config.json 把消息推给归属项目	完成	modules/route/route.mjs	resolve+dispatch+未登记抛错全实测
+T004	api	HTTP 发送口 POST /send + GET /health	完成	modules/api/api.mjs	/health 实测；/send 成功路径等真 token
+T005	convert	语音/视频归一（ffmpeg）+ 转文字开关	完成	modules/convert/convert.mjs	真语音 ogg→mp3 两条实测（ffprobe 验证）；视频走同一路径未真机测
+T006	access	微信接入（iLink 移植）	完成	modules/access/weixin.js	真机实测：3条收+3条回显全带 message_id，用户肉眼收到；修 UIN 头编码 bug（真凶）
+T007	总装	run.mjs：轮询全部通道→归一→转文字→推给项目	完成	run.mjs	真机全链路过（文字2条+语音2条，含修 URL 拼反和坏消息卡通道两个 bug）

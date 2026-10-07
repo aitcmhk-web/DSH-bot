@@ -1,0 +1,5 @@
+任务ID	模块	干什么	状态	产出/位置	备注
+T001	registry	模型表格式定稿 + 增删改查（模型表.json）	完成	modules/registry/registry.mjs	增改查删回环实测过
+T002	api	GET /models 列表口（不含 key）	完成	modules/api/api.mjs	实测过
+T003	api	POST /call 按名字转发，跑通一个本地模型	完成	modules/api/api.mjs	转发/502/400 三条路径实测（假上游）；真模型填表即用
+T004	api	消息窗口转文字对接（跨项目客户）	完成	modules/api/api.mjs	窗口 toText 走 /call 信封实测过；真转写服务部署后填模型表即用
