@@ -49,6 +49,7 @@
     "test-sticky-pick-child.mjs",
     "HARD-RULES.md",
     "!src/*.bak.*",
+    "!src/*.bak-*",
     "!*.bak.*"
   ],
   "engines": {
