@@ -22,6 +22,15 @@ const iEnd = idx.indexOf('  // 卸载', iStart);
 assert.ok(iStart > 0 && iEnd > iStart, 'index.js 切片失败');
 // 去掉两空格缩进，转成顶层可执行文本
 const iChunk = idx.slice(iStart, iEnd).split('\n').map((l) => l.replace(/^  /, '')).join('\n');
+// 审核卡回调（#15）：连同真实的 authorize / handleCallbackQuery 一起抽出来直驱
+const aStart = idx.indexOf('function authorize(userId)');
+const aEnd = idx.indexOf('  // ---', aStart);
+assert.ok(aStart > 0 && aEnd > aStart, 'authorize 切片失败');
+const aChunk = idx.slice(aStart, aEnd).split('\n').map((l) => l.replace(/^  /, '')).join('\n');
+const cbStart = idx.indexOf('async function handleCallbackQuery(query)');
+const cbEnd = idx.lastIndexOf('/**', idx.indexOf('* 斜杠命令', cbStart));
+assert.ok(cbStart > 0 && cbEnd > cbStart, 'handleCallbackQuery 切片失败');
+const cbChunk = idx.slice(cbStart, cbEnd).split('\n').map((l) => l.replace(/^  /, '')).join('\n');
 
 // ---------- 公共 stub ----------
 const fsStub = `
@@ -348,7 +357,7 @@ console2.log('bot.js 侧 10 组断言全过');
 // ---------- index.js 侧测试 ----------
 const iTest = `
 // ---- src/index.js 侧：领活 watcher ----
-const state = { stopped: false, ownerUserId: 7 };
+const state = { stopped: false, ownerUserId: 7, claimed: false };
 let enqueued = [];
 const enqueue = (key, task) => { enqueued.push({ key, task }); };
 let prompted = [];
@@ -357,20 +366,32 @@ const log = () => {};
 const error = (...a) => console2.error(...a);
 let intervalFn = null;
 const setInterval = (fn) => { intervalFn = fn; return 8; };
-// 审核卡（#4）需要：REVIEWER_MODE 吃 process.env.BOT_ROLE（测试环境必须没有）；
-// telegram 桩记录 sendMessage/editMessageText 调用（卡片文本、私聊目标、按钮数据）。
+// 审核卡（#15）需要：REVIEWER_MODE 吃 process.env.BOT_ROLE（测试环境必须没有）；
+// telegram 桩记录 sendMessage/editMessageText/answerCallbackQuery 调用
+// （卡片文本、群目标、按钮数据、卡片 edit、按钮应答）。
 delete process.env.BOT_ROLE;
 const telegram = {
   sent: [],
+  edits: [],
+  answers: 0,
   async sendMessage(chatId, text, extra = {}) { this.sent.push({ chatId, text, extra }); return { ok: true }; },
   async sendRich(chatId, text, extra = {}) { this.sent.push({ chatId, text, extra }); return { ok: true }; },
-  async editMessageText() { return { ok: true }; },
+  async editMessageText(chatId, messageId, text) { this.edits.push({ chatId, messageId, text }); return { ok: true }; },
+  async answerCallbackQuery() { this.answers += 1; return { ok: true }; },
 };
+// 真实 authorize 切片消费 config.telegramAllowedUsers：白名单 = [老板 7, 第二名 8]。
+// 8 过 authorize 是真实生产场景（多白名单人）——非老板点击零动作只能靠身份门挡住，
+// 测试判据才成立（打桩若把 authorize 写成全员拒绝，身份门被删测试照样绿=假测试）。
+const config = { telegramAllowedUsers: [7, 8] };
+// handleCallbackQuery 里 approvalBridge?.… 需要标识符存在（本测试不触发审批桥）。
+const approvalBridge = null;
 
 process.env.DSH_TASK_TABLE = __path.join(${JSON.stringify(TMP)}, '插件侧任务表.md');
 const TASK_TABLE = process.env.DSH_TASK_TABLE;
 
 ${iChunk}
+${aChunk}
+${cbChunk}
 
 // 1) 无表 → 静默
 intervalFn();
@@ -410,7 +431,7 @@ intervalFn();
 await enqueued[1].task();
 assert.equal(prompted[1].chatId, 7);
 
-// 4) 审核卡（#4）：待审核行 → 老板私聊卡片恰发一次（带 inline_keyboard 回调数据）；
+// 4) 审核卡（#15）：待审核行 → 协作群卡片恰发一次（群 id=表头优先；带 inline_keyboard 回调数据）；
 //    占位重复轮询不重发；换一行再发。发卡不动任务表（本插件只传话）。
 const snapBeforeCard = __fs.readFileSync(TASK_TABLE, 'utf8');
 __fs.writeFileSync(TASK_TABLE, [
@@ -423,7 +444,7 @@ __fs.writeFileSync(TASK_TABLE, [
 intervalFn();
 await new Promise((r) => setTimeout(r, 5)); // 发卡是异步的，让微任务跑完
 assert.equal(telegram.sent.length, 1, '待审核行应发一张卡');
-assert.equal(telegram.sent[0].chatId, 7, '卡片发老板私聊（owner）');
+assert.equal(telegram.sent[0].chatId, '-100777', '卡片发协作群（表头群 id 优先，不发私聊）');
 assert.match(telegram.sent[0].text, /#11/);
 assert.match(telegram.sent[0].text, /修轮询僵死/);
 const buttons = telegram.sent[0].extra?.reply_markup?.inline_keyboard?.[0] ?? [];
@@ -437,8 +458,65 @@ intervalFn();
 await new Promise((r) => setTimeout(r, 5));
 assert.equal(telegram.sent.length, 1, '同一行改任务文本也不重发（按 #N 去重）');
 assert.equal(__fs.readFileSync(TASK_TABLE, 'utf8'), tableAfterCard.replace('修轮询僵死', '审核弹窗'), '发卡不改任务表状态');
+
+// 4b) 表头无群 id → 兜底协作群 -5334440553（#15：不再兜底老板私聊）
+__fs.writeFileSync(TASK_TABLE, [
+  '# t',
+  '> 协作群 chat id:（占位）',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 12 | 表头占位时的活 | 003bot | 待审核 | ✅ 验收通过（测试桩） |',
+].join('\\n'));
+intervalFn();
+await new Promise((r) => setTimeout(r, 5));
+assert.equal(telegram.sent.length, 2, '新行再发一张卡');
+assert.equal(telegram.sent[1].chatId, '-5334440553', '无表头群 id → 兜底 -5334440553（不发私聊）');
+
+// 5) 审核卡回调（#15）：真实 authorize + 真实 handleCallbackQuery 直驱。
+const press = (fromId, data, messageId = 55) =>
+  handleCallbackQuery({ id: 'q', from: { id: fromId }, data, message: { chat: { id: -100777 }, message_id: messageId } });
+// 5a) 老板点 ✅ → 群发「通过 #11」（一字不改）+ 卡片 edit（卡片在群里，edit 也落群里）
+__fs.writeFileSync(TASK_TABLE, [
+  '# t',
+  '> 协作群 chat id: -100777',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 11 | 修轮询僵死 | 002bot | 待审核 | ✅ 验收通过（测试桩） |',
+].join('\\n'));
+const sentBeforeBossApprove = telegram.sent.length;
+await press(7, 'review:approve:11');
+assert.equal(telegram.answers, 1, '老板点击要应答按钮');
+assert.equal(telegram.sent.length, sentBeforeBossApprove + 1, '✅ 应群发一条');
+assert.equal(telegram.sent[telegram.sent.length - 1].chatId, '-100777', '「通过 #N」发协作群');
+assert.equal(telegram.sent[telegram.sent.length - 1].text, '通过 #11', '「通过 #N」格式一字不改（主 bot 监听依赖）');
+assert.equal(telegram.edits.length, 1, '卡片要 edit 防重按');
+assert.equal(telegram.edits[0].chatId, -100777, '卡片在协作群，edit 也落协作群');
+// 5b) 老板点 ❌ → 只 edit 卡片提示群里发「打回 #N：原因」；⛔ 不代发任何群文本（原因必须老板原话）
+const sentBeforeBossReject = telegram.sent.length;
+await press(7, 'review:reject:11', 56);
+assert.equal(telegram.answers, 2);
+assert.equal(telegram.sent.length, sentBeforeBossReject, '❌ 不得代发「打回 #N：…」进群（原因必须是老板原话）');
+assert.equal(telegram.edits.length, 2, '❌ 要 edit 卡片追问');
+assert.match(telegram.edits[1].text, /打回 #11：原因/, '卡片提示里给出固定格式');
+// 5c) 非老板（白名单第二名 8）点击 → 零动作（authorize 放行他，零动作只能靠身份门）
+const sentBeforeStranger = telegram.sent.length;
+const editsBeforeStranger = telegram.edits.length;
+await press(8, 'review:approve:11');
+await press(8, 'review:reject:11');
+assert.equal(telegram.sent.length, sentBeforeStranger, '非老板点击零群发');
+assert.equal(telegram.edits.length, editsBeforeStranger, '非老板点击零 edit');
+assert.equal(telegram.answers, 2, '非老板点击连按钮应答都不发（零动作）');
+assert.equal(state.ownerUserId, 7, '非老板点击不得抢认领/改锚点');
+// 5d) 未认领实例（ownerUserId=null）+ 群里陌生人按旧卡 → 零动作且不得被认领成主人
+state.ownerUserId = null;
+await press(99, 'review:approve:11');
+assert.equal(state.ownerUserId, null, 'authorize 的认领分支不得被群里点击触发');
+assert.equal(telegram.sent.length, sentBeforeStranger, '未认领时点击零群发');
+assert.equal(telegram.edits.length, editsBeforeStranger, '未认领时点击零 edit');
+state.ownerUserId = 7;
+
 // （#11 互为看门狗测试组已随功能整体删除，2026-10-07 老板令。）
-console2.log('index.js 侧 4 组断言全过');
+console2.log('index.js 侧 5 组断言全过');
 `;
 
 const script = `${pathImport}${fsStub}\nconst __run = async () => {\n{\n${bTest}\n}\n{\n${iTest}\n}\n};\nawait __run();\n`;

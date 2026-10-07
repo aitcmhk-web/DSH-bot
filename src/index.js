@@ -1504,25 +1504,6 @@ export function apply(ctx, config) {
       return;
     }
 
-    // ---- 审核打回原因（任务 #4）：老板对卡片点了 ❌ 之后，下一句私聊文本 = 原因 ----
-    if (!isGroupChat && pendingRejects.size > 0) {
-      const hit = [...pendingRejects.entries()].find(([, info]) => info.chatId === chatId);
-      if (hit) {
-        const [no, info] = hit;
-        pendingRejects.delete(no);
-        const reasonText = String(message.text ?? '').trim();
-        if (!reasonText || reasonText.startsWith('/')) {
-          await telegram.sendMessage(chatId, `已取消 #${no} 的打回，卡片保持原样可重按。`);
-        } else {
-          const groupId = groupChatIdFromTable() ?? REVIEW_GROUP_FALLBACK;
-          await telegram.sendMessage(groupId, `打回 #${no}：${reasonText}`);
-          await editReviewCard(info.chatId, info.messageId, `❌ #${no} 已打回 —— 原因已发协作群，等小工返工。`);
-          log(`[审核] #${no} 打回原因已发协作群`);
-        }
-        return;
-      }
-    }
-
     const rawText = isGroupChat ? groupText : (message.text ?? message.caption ?? '').trim();
 
     if (rawText.startsWith('/')) {
@@ -1632,14 +1613,22 @@ export function apply(ctx, config) {
    * Telegram 按钮回调（/model 的选模型按钮）。
    */
   async function handleCallbackQuery(query) {
+    const userId = query.from?.id;
+    const data = String(query.data ?? '');
+    // 审核卡身份门（任务 #15，2026-10-07）：卡片发在协作群，群里谁都可能按 → 只认老板。
+    // 老板 id 与发卡同一个来源（state.ownerUserId，⛔ 不新增第二处判定）；非老板点击一律
+    // 静默忽略（连按钮应答都不发 = 零动作）。必须放在 authorize 之前：authorize 对未认领
+    // 实例会把第一个点击者认领成主人，群里不能让陌生人抢锚点。
+    if (data.startsWith('review:approve:') || data.startsWith('review:reject:')) {
+      if (state.ownerUserId === null || userId !== state.ownerUserId) return;
+    }
     // Telegram 要求每次按钮按下都必须应答，哪怕后续动作失败。
     await telegram.answerCallbackQuery(query.id).catch(() => {});
-    const userId = query.from?.id;
     if (!authorize(userId).ok) return;
-    const data = String(query.data ?? '');
     // 审批按钮（appr:ok:/appr:no:）优先于模型菜单处理。
     if (approvalBridge?.handleApprovalCallback(data, query)) return;
-    // 审核卡（任务 #4）：✅ → 群发「通过 #N」（主 bot 接力发版）；❌ → 等老板回复原因再群发。
+    // 审核卡（任务 #15）：✅ → 群发「通过 #N」（主 bot 接力发版）；❌ → 只 edit 卡片，
+    //   提示老板直接在群里发「打回 #N：原因」——原因必须是老板原话，本插件不代发。
     if (data.startsWith('review:approve:') || data.startsWith('review:reject:')) {
       const no = data.split(':')[2];
       const cardChat = query.message?.chat?.id;
@@ -1650,9 +1639,8 @@ export function apply(ctx, config) {
         await editReviewCard(cardChat, cardMsgId, `✅ #${no} 已通过 —— 「通过 #${no}」已发协作群，等主 bot 发布。`);
         log(`[审核] #${no} 老板点通过 → 已发协作群`);
       } else {
-        pendingRejects.set(no, { chatId: cardChat, messageId: cardMsgId });
-        await telegram.sendMessage(cardChat, `❌ #${no} 打回 —— 请直接回复打回原因（一句话），我原样转进协作群；发 /cancel 取消。`);
-        log(`[审核] #${no} 老板点打回 → 等原因`);
+        await editReviewCard(cardChat, cardMsgId, `❌ #${no} 已选打回 —— 请直接在群里发「打回 #${no}：原因」（主 bot 监听这个格式回流小工）。`);
+        log(`[审核] #${no} 老板点打回 → 已在卡片提示群里发原因`);
       }
       return;
     }
@@ -2317,7 +2305,7 @@ export function apply(ctx, config) {
             log(`[任务表] #${row.no} 已领活 → chat ${chatId}`);
           }
         }
-        // 审核卡（任务 #4）：同一轮询顺带扫「待审核」行 → 老板私聊卡片（REVIEWER_MODE 才开）
+        // 审核卡（任务 #15）：同一轮询顺带扫「待审核」行 → 协作群卡片（REVIEWER_MODE 才开）
         reviewTick(table);
       } catch (err) {
         error(`[任务表] 轮询失败: ${err?.message ?? err}`);
@@ -2325,16 +2313,17 @@ export function apply(ctx, config) {
     }, TASK_POLL_MS);
   }
   // -------------------------------------------------------------------------
-  // 审核弹窗（任务 #4，2026-10-07）：插件版 = 审核实例。任务表出现「待审核」行 →
-  // 给老板 TG 私聊发审核卡片（inline_keyboard：✅通过 #N / ❌打回 #N）。
-  // 按钮回调 → 以文本「通过 #N」/「打回 #N：原因」发进协作群 —— 主 bot 监听这个
-  // 格式走发布/打回闭环；本插件只传话，⛔ 不自己改任务表、不碰 git/发布。
+  // 审核弹窗（任务 #4 建、任务 #15 改，2026-10-07）：插件版 = 审核实例。任务表出现
+  // 「待审核」行 → 协作群发审核卡片（inline_keyboard：✅通过 #N / ❌打回 #N）；
+  // 群 id 沿用现有群发逻辑：表头「协作群 chat id」优先，兜底 REVIEW_GROUP_FALLBACK。
+  // ✅ 回调 → 以文本「通过 #N」发进协作群 —— 主 bot 监听这个格式走发布闭环；
+  // ❌ 回调 → 只 edit 卡片提示老板直接在群里发「打回 #N：原因」（原因必须是老板原话，
+  //   本插件不代发）。回调有身份门：只认老板（ownerUserId，见 handleCallbackQuery）。
+  // 本插件只传话，⛔ 不自己改任务表、不碰 git/发布。
   // 节流：每个 #N 自进程启动只发一次卡（行停在「待审核」也不重发；发送失败会在
   //   下一轮重试；进程重启后会重发一次 —— 多一张卡无副作用）。
   // -------------------------------------------------------------------------
   const REVIEW_GROUP_FALLBACK = '-5334440553'; // 协作群兜底（表头有「协作群 chat id」时以表头为准）
-  /** 等老板回复打回原因的卡：#N → { chatId, messageId }。 */
-  const pendingRejects = new Map();
   /** 已成功发出卡的 #N（防 5 秒轮询重复发）。 */
   const reviewCardsSent = new Set();
 
@@ -2359,15 +2348,18 @@ export function apply(ctx, config) {
   }
 
   async function sendReviewCard(row) {
+    // 老板 id 必须已知：回调身份门（handleCallbackQuery）只用 state.ownerUserId 认老板，
+    // 没认领就发卡 = 发一张谁都点不动的死卡。老板 id 唯一来源就是它，⛔ 不另立判定。
     if (!telegram || state.ownerUserId === null) return;
+    const groupId = groupChatIdFromTable() ?? REVIEW_GROUP_FALLBACK;
     const taskBrief = row.task.length > 200 ? `${row.task.slice(0, 200)}…` : row.task;
     await telegram.sendMessage(
-      state.ownerUserId,
+      groupId,
       [
         `📋 审核请求 #${row.no}（负责：${row.owner}）`,
         taskBrief,
         '',
-        `✅ 通过 → 我发「通过 #${row.no}」进协作群；❌ 打回 → 请回复打回原因（一句话），我原样转「打回 #${row.no}：原因」。发 /cancel 取消。`,
+        `✅ 通过 → 点按钮，我发「通过 #${row.no}」进协作群；❌ 打回 → 点 ❌ 后直接在群里发「打回 #${row.no}：原因」。`,
       ].join('\n'),
       {
         reply_markup: {
@@ -2378,7 +2370,7 @@ export function apply(ctx, config) {
         },
       },
     );
-    log(`[审核] #${row.no} 审核卡片已发老板私聊`);
+    log(`[审核] #${row.no} 审核卡片已发协作群`);
   }
 
   /** 审核轮：发现「待审核」行就发卡（挂在 watchTaskTable 的同一个 5s 轮询里）。 */
