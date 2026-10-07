@@ -17,3 +17,4 @@ models-authority.json
 AGENTS.md
 AGENTS-plugin.md
 memory/
+.githooks/
