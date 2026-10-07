@@ -9,8 +9,11 @@ const HERE = dirname(fileURLToPath(import.meta.url)); // modules/convert
 const ROOT = join(HERE, '..', '..');                  // 项目根
 const TMP = join(ROOT, '临时文件');
 
-// ffmpeg 用绝对路径：launchd 拉起时 PATH 很窄（不含 homebrew），裸名字会 ENOENT（2026-10-06 语音失败真因）
-const FFMPEG = '/opt/homebrew/bin/ffmpeg';
+// ffmpeg 路径跨平台（#24，D15）：launchd/systemd 拉起时 PATH 很窄，裸名字会 ENOENT（2026-10-06 语音失败真因）。
+// 取法：env「FFMPEG路径」显式指定 → 常见安装点探测（mac homebrew arm / mac intel+源码装 / Ubuntu apt）→ 全 miss 回退裸名字兜底。
+const FFMPEG = process.env.FFMPEG路径
+  || ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg'].find(existsSync)
+  || 'ffmpeg';
 
 // toMp3：语音归一 → mp3 16k 单声道（ffmpeg 为系统依赖，契约写明）
 export function toMp3(输入路径) {
@@ -83,7 +86,8 @@ export function 扫尾临时文件(目录 = TMP) {
 }
 
 // toJpgPng：图片归一 → jpg/png（2026-10-05 契约默认：视觉模型通吃格式）。
-// 已是 jpg/png 原样返回；其它（gif/webp/heic…）用系统 sips 转 jpg；转换失败保留原件——宁缺格式不丢图。
+// 已是 jpg/png 原样返回；其它（gif/webp/heic…）用 ffmpeg 转 jpg（#24 跨平台：mac/Ubuntu 都有 ffmpeg；
+// heic 能否解视 ffmpeg 构建而定，解不动走失败分支）。转换失败保留原件——宁缺格式不丢图。
 const 图片魔数 = (buf) =>
   buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 ? 'jpg'
   : buf.length > 4 && buf[0] === 0x89 && buf[1] === 0x50 ? 'png'
@@ -93,9 +97,9 @@ export function toJpgPng(路径) {
   const kind = 图片魔数(readFileSync(路径));
   if (kind) return 路径;
   const out = 路径.replace(/\.[^.]+$/, '') + '.jpg';
-  const r = spawnSync('sips', ['-s', 'format', 'jpeg', 路径, '--out', out]);
+  const r = spawnSync(FFMPEG, ['-y', '-loglevel', 'error', '-i', 路径, '-frames:v', '1', out]);
   if (r.status !== 0 || !existsSync(out)) {
-    console.error(`[convert] sips 归一失败（保留原件 ${路径}）: ${String(r.stderr).slice(0, 200)}`);
+    console.error(`[convert] ffmpeg 归一失败（保留原件 ${路径}）: ${String(r.stderr).slice(0, 200)}`);
     return 路径;
   }
   登记(out);
