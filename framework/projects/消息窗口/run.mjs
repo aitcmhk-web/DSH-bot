@@ -78,6 +78,7 @@ function makeBatcher(item, cfg, 发送文字, 注册放行) {
     b.忙 = true; // 先占闸门再投递，防两包并发
     clearTimeout(b.保底);
     b.保底 = setTimeout(() => 放行(key), 忙超时ms);
+    b.保底.unref?.(); // 保底是安全网不是心跳：runner 有轮询循环常驻不差它吊场；unref 后测试进程不被 120s 计时器吊住（#23）
     flush(parts, item, cfg, 发送文字).then((全成) => {
       if (!全成) 放行(key); // 项目没接住 → 不会有回复，立刻放行
     }).catch((e) => {
@@ -301,10 +302,17 @@ async function 通道循环(适配器, cfg, batch, 发送文字) {
 }
 
 // 每个适配器一套打包器+发送文字；闸门 key = token:通道（/send 送达后按此放行）
-function 建通道上下文(适配器, cfg, 闸门们) {
+export function 建通道上下文(适配器, cfg, 闸门们) {
   const 发送文字 = (chatId, 文字) => 安全发送(适配器, chatId, { 类型: '文字', 文字 });
   const batch = makeBatcher(适配器.item, cfg, 发送文字, (放行) => 闸门们.set(`${适配器.token}:${适配器.通道}`, 放行));
   return { batch, 发送文字 };
+}
+
+// —— 送达放行（忙闸门的 /send 端，#23 回归锁定）：项目回复送达 → 按 token:通道 找闸门 → 按 通道:chatId 放行 ——
+// 抽成导出：main 装配与 tests/fake-channel 闸门回归用同一份（测试测真接线，不复制算法）；
+// 参数序 (token,通道,chatId) 与 api.mjs 送达调用对齐（#18 修过的存量错序 bug，此处再错忙闸门就瘫）。
+export function 造送达放行(闸门们) {
+  return (token, 通道, chatId) => 闸门们.get(`${token}:${通道}`)?.(`${通道}:${chatId}`);
 }
 
 // —— 总装：可测试（tests/fake-channel.mjs 注入假通道/假配置走通），isMain 才真起 ——
@@ -314,7 +322,7 @@ export async function main(cfg = loadConfig()) {
   const registry = 装配通道们(cfg);
   const 闸门们 = new Map(); // token:通道 → 放行(key)
   起api(
-    (token, 通道, chatId) => 闸门们.get(`${token}:${通道}`)?.(`${通道}:${chatId}`), // 项目回复送达 → 放行该顾客的忙闸门
+    造送达放行(闸门们), // 项目回复送达 → 放行该顾客的忙闸门
     (token, 通道) => registry.查找(token, 通道), // /send → 注册表查适配器，零通道分叉
   );
   const 上下文们 = new Map(); // 适配器 → { batch, 发送文字 }（测试注入时按适配器取）

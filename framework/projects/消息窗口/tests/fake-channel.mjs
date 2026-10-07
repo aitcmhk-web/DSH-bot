@@ -128,6 +128,42 @@ console.log('—— ⑦ 装配冒烟：无 token 无微信 → 注册表为空�
 const 空registry = 装配通道们({ 项目们: [{ 项目: '空项目' }] });
 断言('空配置装配不炸、注册表为空', 空registry.全部().length === 0);
 
+// —— ⑧ 忙闸门端到端（#23）：攒住的第二条消息必须由 /send 送达放行，且在 120 秒保底之前 ——
+// 走生产真接线：建通道上下文（真 makeBatcher/放行/投）+ 造送达放行（真闸门 key 拼法）+ 真 api /send。
+console.log('—— ⑧ 忙闸门端到端：/send 送达 → 攒住的消息放行（≤2 秒，保底之前）——');
+{
+  const { 造送达放行, 建通道上下文 } = await import('../run.mjs');
+  const 等待 = async (条件, 上限ms = 3000) => {
+    const 止 = Date.now() + 上限ms;
+    while (!条件()) { if (Date.now() > 止) return false; await new Promise((r) => setTimeout(r, 20)); }
+    return true;
+  };
+  const 闸门们 = new Map();
+  const 闸门registry = createRegistry();
+  闸门registry.注册(假通道);
+  const 上下文 = 建通道上下文(假通道, cfg, 闸门们);
+  const 闸门api = 起api(造送达放行(闸门们), (t, c) => 闸门registry.查找(t, c));
+  await new Promise((ok) => 闸门api.once('listening', ok));
+  const 闸门端口 = 闸门api.address().port;
+  项目收到的.length = 0; 发出的.length = 0; 已回发 = true;
+  上下文.batch({ 类型: '文字', 文字: '第一句', 通道: '假通道', chatId: 'c9', 项目: '假项目', 段数: 1 });
+  断言('第一包投出、闸门进忙（项目已收到）', await 等待(() => 项目收到的.length === 1) && 项目收到的[0]?.文字 === '第一句');
+  上下文.batch({ 类型: '文字', 文字: '第二句', 通道: '假通道', chatId: 'c9', 项目: '假项目', 段数: 1 });
+  await new Promise((r) => setTimeout(r, 150));
+  断言('忙闸门把第二条攒住（未到项目）', 项目收到的.length === 1);
+  const t0 = Date.now();
+  const rr = await fetch(`http://127.0.0.1:${闸门端口}/send`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'fake-token', 通道: '假通道', chatId: 'c9', 类型: '文字', 文字: '项目回复' }),
+  });
+  const 送达ok = rr.status === 200 && 'message_id' in (await rr.json());
+  const 放行了 = await 等待(() => 项目收到的.length === 2, 2000);
+  const 放行耗时 = Date.now() - t0;
+  断言('/send 成功送达（判据 message_id）', 送达ok);
+  断言('回复送达 → 攒住的第二条 ≤2 秒放行投递（120 秒保底之前）', 放行了 && 项目收到的[1]?.文字 === '第二句' && 放行耗时 < 2000, `实际 ${放行耗时}ms，收到 ${项目收到的.length} 条`);
+  闸门api.close();
+}
+
 api服务.close(); 假项目服务.close();
 console.log(`\n结果：${过} 过 / ${失败们.length} 败${失败们.length ? ` → ${失败们.join('；')}` : ''}`);
 if (失败们.length) process.exit(1);
