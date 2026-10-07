@@ -1479,6 +1479,11 @@ export function apply(ctx, config) {
     const chatId = message.chat.id;
     const userId = message.from?.id;
 
+    // 打回原因条回复（任务 #20，2026-10-07）：老板对 ForceReply 原因条的回复必须在
+    // 群模式过滤**之前**接住 —— 群里回复不带 @点名，走正常路径会被静默丢。
+    // 返回 false = 不是这条线（或非老板），照旧往下走。函数体在审核块（#20）。
+    if (await handleRejectReasonReply(message)) return;
+
     // ---- 群模式（2026-10-06 用户定；同日二次修订）----
     // 默认对话归主 bot：插件版在群里只接 ①@点名 ②任务表自动派活（见 watchTaskTable）。
     // 陌生人的消息静默忽略（⛔ 不把「已绑定别的用户」这种私聊提示发进群里刷屏）；
@@ -1627,8 +1632,10 @@ export function apply(ctx, config) {
     if (!authorize(userId).ok) return;
     // 审批按钮（appr:ok:/appr:no:）优先于模型菜单处理。
     if (approvalBridge?.handleApprovalCallback(data, query)) return;
-    // 审核卡（任务 #15）：✅ → 群发「通过 #N」（主 bot 接力发版）；❌ → 只 edit 卡片，
-    //   提示老板直接在群里发「打回 #N：原因」——原因必须是老板原话，本插件不代发。
+    // 审核卡（任务 #15 建、#20 改）：✅ → 群发「通过 #N」（主 bot 接力发版）；❌ → edit
+    //   卡片提示 + 另发一条 ForceReply 原因条（#20：老板 tap 引用即弹键盘直输原因，不用
+    //   手打格式），老板回复原因条 → 拼成「打回 #N：原因」群发（格式一字不改，主 bot 闭环
+    //   依赖）。回调有身份门：只认老板（ownerUserId，见 handleCallbackQuery）。
     if (data.startsWith('review:approve:') || data.startsWith('review:reject:')) {
       const no = data.split(':')[2];
       const cardChat = query.message?.chat?.id;
@@ -1640,7 +1647,8 @@ export function apply(ctx, config) {
         log(`[审核] #${no} 老板点通过 → 已发协作群`);
       } else {
         await editReviewCard(cardChat, cardMsgId, `❌ #${no} 已选打回 —— 请直接在群里发「打回 #${no}：原因」（主 bot 监听这个格式回流小工）。`);
-        log(`[审核] #${no} 老板点打回 → 已在卡片提示群里发原因`);
+        await sendRejectPrompt(no, groupId, cardChat, cardMsgId);
+        log(`[审核] #${no} 老板点打回 → 卡片已提示 + 打回原因条（ForceReply）已发`);
       }
       return;
     }
@@ -2317,8 +2325,10 @@ export function apply(ctx, config) {
   // 「待审核」行 → 协作群发审核卡片（inline_keyboard：✅通过 #N / ❌打回 #N）；
   // 群 id 沿用现有群发逻辑：表头「协作群 chat id」优先，兜底 REVIEW_GROUP_FALLBACK。
   // ✅ 回调 → 以文本「通过 #N」发进协作群 —— 主 bot 监听这个格式走发布闭环；
-  // ❌ 回调 → 只 edit 卡片提示老板直接在群里发「打回 #N：原因」（原因必须是老板原话，
-  //   本插件不代发）。回调有身份门：只认老板（ownerUserId，见 handleCallbackQuery）。
+  // ❌ 回调 → edit 卡片提示 + 另发一条 ForceReply「原因条」（#20：老板 tap 引用即弹键盘
+  //   直输原因），老板回复原因条 → 拼成「打回 #N：原因」群发（格式一字不改，主 bot 闭环
+  //   依赖）；5 分钟不回复 → 原因条改写成兜底文案，维持「群里发打回 #N：原因」老路；
+  //   回复 /cancel → 取消。回调与原因条都有身份门：只认老板（ownerUserId，⛔ 不新增判定）。
   // 本插件只传话，⛔ 不自己改任务表、不碰 git/发布。
   // 节流：每个 #N 自进程启动只发一次卡（行停在「待审核」也不重发；发送失败会在
   //   下一轮重试；进程重启后会重发一次 —— 多一张卡无副作用）。
@@ -2326,6 +2336,83 @@ export function apply(ctx, config) {
   const REVIEW_GROUP_FALLBACK = '-5334440553'; // 协作群兜底（表头有「协作群 chat id」时以表头为准）
   /** 已成功发出卡的 #N（防 5 秒轮询重复发）。 */
   const reviewCardsSent = new Set();
+
+  // -------------------------------------------------------------------------
+  // 打回原因 ForceReply（任务 #20，2026-10-07）：点 ❌ 后除卡片提示外，另发一条
+  // reply_markup=ForceReply 的「原因条」—— 老板 tap 引用即弹键盘直输原因。
+  // 老板回复原因条 → 拼成「打回 #N：原因」群发；回复 /cancel → 取消；5 分钟不回复 →
+  // 原因条改写成兜底文案（与卡片提示同款，维持 #15 的群里手打老路）。
+  // -------------------------------------------------------------------------
+  const REJECT_REPLY_WAIT_MS = 5 * 60 * 1000;
+  /** 待回复的原因条：原因条 message_id → { no, groupId, cardChat, cardMsgId, timer }。 */
+  const pendingRejects = new Map();
+
+  /** 发「打回原因」原因条（ForceReply）并登记等回复；拿不到 message_id 就只发不登记
+   *  （听不到回复 → 老板走卡片提示的群里手打兜底，行为不劣于 #15）。 */
+  async function sendRejectPrompt(no, groupId, cardChat, cardMsgId) {
+    if (!telegram) return;
+    const res = await telegram.sendMessage(
+      groupId,
+      [
+        `❌ 打回 #${no} —— 请回复本条直接输入打回原因，我会转成「打回 #${no}：原因」发进协作群。`,
+        `回复 /cancel 取消；${REJECT_REPLY_WAIT_MS / 60000} 分钟内不回复，就直接在群里发「打回 #${no}：原因」。`,
+      ].join('\n'),
+      { reply_markup: { force_reply: { force_reply: true, input_field_placeholder: '打回原因…' } } },
+    );
+    const promptMsgId = res?.result?.message_id;
+    if (!promptMsgId) return;
+    pendingRejects.set(promptMsgId, {
+      no, groupId, cardChat, cardMsgId,
+      timer: setTimeout(() => expireRejectPrompt(promptMsgId), REJECT_REPLY_WAIT_MS),
+    });
+    log(`[审核] #${no} 打回原因条已发（等老板回复，${REJECT_REPLY_WAIT_MS / 60000} 分钟）`);
+  }
+
+  /** 老板对原因条的回复（#20）。返回 true = 本条已消费，调用方不要再当普通消息走。
+   *  ⚠️ 必须挂在 handleTelegramMessage 群模式过滤之前：群里回复不带 @点名，晚了会被静默丢。 */
+  async function handleRejectReasonReply(message) {
+    const promptMsgId = message?.reply_to_message?.message_id;
+    if (!promptMsgId || !pendingRejects.has(promptMsgId)) return false;
+    // 身份门：只有老板的回复算数（老板 id 唯一来源 state.ownerUserId，与卡片回调同源）。
+    // 非老板零动作（不消费、不 edit）—— 沉回正常路径由群模式过滤自然处理。
+    if (state.ownerUserId === null || message.from?.id !== state.ownerUserId) return false;
+    const entry = pendingRejects.get(promptMsgId);
+    if (String(message.chat?.id ?? '') !== String(entry.groupId)) return false;
+    const raw = String(message.text ?? '').trim();
+    if (raw.startsWith('/')) {
+      if (/^\/cancel\b/.test(raw)) {
+        clearTimeout(entry.timer);
+        pendingRejects.delete(promptMsgId);
+        await telegram.editMessageText(entry.groupId, promptMsgId, `❌ #${entry.no} 打回原因条已取消 —— 请直接在群里发「打回 #${entry.no}：原因」。`).catch(() => {});
+        log(`[审核] #${entry.no} 老板 /cancel → 打回原因条已取消`);
+      }
+      return false; // 其它指令不当原因，交回正常路径（群模式下没点名自然被忽略）
+    }
+    if (!raw) return false; // 空文本（贴图/表情等）不当原因
+    // 消费：拼「打回 #N：原因」群发 —— 格式一字不改；先撤待回复再发（防重入重发）。
+    clearTimeout(entry.timer);
+    pendingRejects.delete(promptMsgId);
+    await telegram.sendMessage(entry.groupId, `打回 #${entry.no}：${raw}`);
+    await telegram.editMessageText(entry.groupId, promptMsgId, `✅ 已代发「打回 #${entry.no}：${raw}」进协作群。`).catch(() => {});
+    // 卡面提示必须跟着改口：不 edit 的话卡片还停在「请直接在群里发…」，老板照做就重复打回了。
+    await editReviewCard(entry.cardChat, entry.cardMsgId, `❌ #${entry.no} 已打回 —— 「打回 #${entry.no}：${raw}」已发协作群，等主 bot 回流小工。`);
+    log(`[审核] #${entry.no} 老板回复原因条 → 已群发「打回 #${entry.no}：…」`);
+    return true;
+  }
+
+  /** 超时没等到老板回复 → 原因条改写成兜底文案（维持 #15 的「群里发打回 #N：原因」老路）。
+   *  幂等：条已回复/已取消/被删时空转返回。 */
+  async function expireRejectPrompt(promptMsgId) {
+    const entry = pendingRejects.get(promptMsgId);
+    if (!entry) return;
+    pendingRejects.delete(promptMsgId);
+    await telegram.editMessageText(
+      entry.groupId,
+      promptMsgId,
+      `⏳ #${entry.no} 打回原因没等到 —— 请直接在群里发「打回 #${entry.no}：原因」（主 bot 监听这个格式回流小工）。`,
+    ).catch(() => {});
+    log(`[审核] #${entry.no} 打回原因条超时 → 已退回群里手打兜底`);
+  }
 
   /** 插件实例 = 审核实例（老板 10-06 分工）。显式 BOT_ROLE=master/worker 时才关；
    *  现网 dshbot 实例没设 BOT_ROLE → 生效。 */

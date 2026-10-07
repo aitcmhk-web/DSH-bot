@@ -374,11 +374,24 @@ const telegram = {
   sent: [],
   edits: [],
   answers: 0,
-  async sendMessage(chatId, text, extra = {}) { this.sent.push({ chatId, text, extra }); return { ok: true }; },
+  lastMsgId: 0,
+  async sendMessage(chatId, text, extra = {}) {
+    this.sent.push({ chatId, text, extra });
+    // #20：真实 TG 会回 result.message_id（原因条登记待回复要用它当 key）
+    this.lastMsgId = 900 + this.sent.length;
+    return { ok: true, result: { message_id: this.lastMsgId } };
+  },
   async sendRich(chatId, text, extra = {}) { this.sent.push({ chatId, text, extra }); return { ok: true }; },
   async editMessageText(chatId, messageId, text) { this.edits.push({ chatId, messageId, text }); return { ok: true }; },
   async answerCallbackQuery() { this.answers += 1; return { ok: true }; },
 };
+// #20 用例要驱动「5 分钟超时」：遮蔽 setTimeout/clearTimeout（真实 5 分钟定时器会把
+// 测试挂住 5 分钟）；超时回调用 rejectTimers 手动拨。测试自己的等待一律走 sleep。
+const __realSetTimeout = globalThis.setTimeout;
+const sleep = (ms) => new Promise((r) => __realSetTimeout(r, ms));
+const rejectTimers = [];
+const setTimeout = (fn, ms) => { rejectTimers.push({ fn, ms }); return rejectTimers.length; };
+const clearTimeout = () => {};
 // 真实 authorize 切片消费 config.telegramAllowedUsers：白名单 = [老板 7, 第二名 8]。
 // 8 过 authorize 是真实生产场景（多白名单人）——非老板点击零动作只能靠身份门挡住，
 // 测试判据才成立（打桩若把 authorize 写成全员拒绝，身份门被删测试照样绿=假测试）。
@@ -442,7 +455,7 @@ __fs.writeFileSync(TASK_TABLE, [
   '| 11 | 修轮询僵死 | 002bot | 待审核 | ✅ 验收通过（测试桩） |',
 ].join('\\n'));
 intervalFn();
-await new Promise((r) => setTimeout(r, 5)); // 发卡是异步的，让微任务跑完
+await sleep(5); // 发卡是异步的，让微任务跑完
 assert.equal(telegram.sent.length, 1, '待审核行应发一张卡');
 assert.equal(telegram.sent[0].chatId, '-100777', '卡片发协作群（表头群 id 优先，不发私聊）');
 assert.match(telegram.sent[0].text, /#11/);
@@ -450,12 +463,12 @@ assert.match(telegram.sent[0].text, /修轮询僵死/);
 const buttons = telegram.sent[0].extra?.reply_markup?.inline_keyboard?.[0] ?? [];
 assert.deepEqual(buttons.map((b) => b.callback_data), ['review:approve:11', 'review:reject:11'], '按钮回调数据形状');
 intervalFn();
-await new Promise((r) => setTimeout(r, 5));
+await sleep(5);
 assert.equal(telegram.sent.length, 1, '同一行不重发卡');
 const tableAfterCard = __fs.readFileSync(TASK_TABLE, 'utf8');
 __fs.writeFileSync(TASK_TABLE, tableAfterCard.replace('修轮询僵死', '审核弹窗'));
 intervalFn();
-await new Promise((r) => setTimeout(r, 5));
+await sleep(5);
 assert.equal(telegram.sent.length, 1, '同一行改任务文本也不重发（按 #N 去重）');
 assert.equal(__fs.readFileSync(TASK_TABLE, 'utf8'), tableAfterCard.replace('修轮询僵死', '审核弹窗'), '发卡不改任务表状态');
 
@@ -468,7 +481,7 @@ __fs.writeFileSync(TASK_TABLE, [
   '| 12 | 表头占位时的活 | 003bot | 待审核 | ✅ 验收通过（测试桩） |',
 ].join('\\n'));
 intervalFn();
-await new Promise((r) => setTimeout(r, 5));
+await sleep(5);
 assert.equal(telegram.sent.length, 2, '新行再发一张卡');
 assert.equal(telegram.sent[1].chatId, '-5334440553', '无表头群 id → 兜底 -5334440553（不发私聊）');
 
@@ -491,11 +504,14 @@ assert.equal(telegram.sent[telegram.sent.length - 1].chatId, '-100777', '「通�
 assert.equal(telegram.sent[telegram.sent.length - 1].text, '通过 #11', '「通过 #N」格式一字不改（主 bot 监听依赖）');
 assert.equal(telegram.edits.length, 1, '卡片要 edit 防重按');
 assert.equal(telegram.edits[0].chatId, -100777, '卡片在协作群，edit 也落协作群');
-// 5b) 老板点 ❌ → 只 edit 卡片提示群里发「打回 #N：原因」；⛔ 不代发任何群文本（原因必须老板原话）
+// 5b) 老板点 ❌ → edit 卡片追问 +（#20）另发一条 ForceReply 原因条；⛔ 不代发「打回 #N：…」
+//     正文（原因必须是老板原话，插件只转成固定格式）
 const sentBeforeBossReject = telegram.sent.length;
 await press(7, 'review:reject:11', 56);
 assert.equal(telegram.answers, 2);
-assert.equal(telegram.sent.length, sentBeforeBossReject, '❌ 不得代发「打回 #N：…」进群（原因必须是老板原话）');
+assert.equal(telegram.sent.length, sentBeforeBossReject + 1, '❌ 后只另发一条原因条');
+assert.doesNotMatch(telegram.sent[telegram.sent.length - 1].text, /^打回 #11：/, '⛔ 不得代发「打回 #N：…」正文（原因必须是老板原话）');
+assert.equal(telegram.sent[telegram.sent.length - 1].extra?.reply_markup?.force_reply?.force_reply, true, '另发那条必须带 ForceReply 键盘（tap 引用直输）');
 assert.equal(telegram.edits.length, 2, '❌ 要 edit 卡片追问');
 assert.match(telegram.edits[1].text, /打回 #11：原因/, '卡片提示里给出固定格式');
 // 5c) 非老板（白名单第二名 8）点击 → 零动作（authorize 放行他，零动作只能靠身份门）
@@ -514,6 +530,81 @@ assert.equal(state.ownerUserId, null, 'authorize 的认领分支不得被群里�
 assert.equal(telegram.sent.length, sentBeforeStranger, '未认领时点击零群发');
 assert.equal(telegram.edits.length, editsBeforeStranger, '未认领时点击零 edit');
 state.ownerUserId = 7;
+
+// 5e)（#20）老板回复原因条 → 拼成「打回 #N：原因」群发，格式一字不改；消费后重复回复不重发
+const sentBefore5e = telegram.sent.length;
+await press(7, 'review:reject:11', 56);
+assert.equal(telegram.sent.length, sentBefore5e + 1, '❌ 后应另发原因条');
+const promptMsgId5e = telegram.lastMsgId;
+const ok5e = await handleRejectReasonReply({ chat: { id: -100777 }, from: { id: 7 }, text: '测试打回原因甲', reply_to_message: { message_id: promptMsgId5e } });
+assert.equal(ok5e, true, '老板回复原因条应被消费');
+assert.equal(telegram.sent[telegram.sent.length - 1].chatId, '-100777', '代发进协作群');
+assert.equal(telegram.sent[telegram.sent.length - 1].text, '打回 #11：测试打回原因甲', '群发文本全等（格式一字不改，主 bot 闭环依赖）');
+const sentAfter5e = telegram.sent.length;
+const ok5e2 = await handleRejectReasonReply({ chat: { id: -100777 }, from: { id: 7 }, text: '再发一次', reply_to_message: { message_id: promptMsgId5e } });
+assert.equal(ok5e2, false, '已消费的原因条不再触发');
+assert.equal(telegram.sent.length, sentAfter5e, '重复回复零群发（防重复打回）');
+
+// 5f)（#20）不 reply → 5 分钟超时：原因条 edit 成兜底文案（维持群里手打老路），不群发；迟到回复不触发
+await press(7, 'review:reject:11', 56);
+const promptMsgId5f = telegram.lastMsgId;
+const timer5f = rejectTimers[rejectTimers.length - 1];
+assert.equal(timer5f.ms, 5 * 60 * 1000, '超时必须是 5 分钟');
+const sentBefore5f = telegram.sent.length;
+await timer5f.fn();
+await sleep(5);
+assert.equal(telegram.sent.length, sentBefore5f, '超时不群发（兜底=群里手打，插件不代发）');
+assert.match(telegram.edits[telegram.edits.length - 1].text, /打回 #11：原因/, '超时兜底文案给出固定格式');
+assert.match(telegram.edits[telegram.edits.length - 1].text, /请直接在群里发/, '超时兜底文案指向群里手打');
+const ok5f = await handleRejectReasonReply({ chat: { id: -100777 }, from: { id: 7 }, text: '迟到的原因', reply_to_message: { message_id: promptMsgId5f } });
+assert.equal(ok5f, false, '超时后的迟到回复不再触发');
+const sentAfter5f = telegram.sent.length;
+await timer5f.fn(); // 幂等：已过期的回调再拨一次必须空转
+assert.equal(telegram.sent.length, sentAfter5f, '超时回调幂等（不群发）');
+
+// 5g)（#20 反向）非老板回复原因条 → 零动作；老板随后回复仍恰好生效一次
+await press(7, 'review:reject:11', 56);
+const promptMsgId5g = telegram.lastMsgId;
+const sentBefore5g = telegram.sent.length;
+const editsBefore5g = telegram.edits.length;
+const ok5g = await handleRejectReasonReply({ chat: { id: -100777 }, from: { id: 8 }, text: '我替老板打回', reply_to_message: { message_id: promptMsgId5g } });
+assert.equal(ok5g, false, '非老板回复不消费');
+assert.equal(telegram.sent.length, sentBefore5g, '非老板回复零群发');
+assert.equal(telegram.edits.length, editsBefore5g, '非老板回复零 edit');
+const ok5g2 = await handleRejectReasonReply({ chat: { id: -100777 }, from: { id: 7 }, text: '老板的原因乙', reply_to_message: { message_id: promptMsgId5g } });
+assert.equal(ok5g2, true, '非老板回复不得挤掉条目，老板回复仍生效');
+assert.equal(telegram.sent[telegram.sent.length - 1].text, '打回 #11：老板的原因乙', '只有老板的回复会代发');
+// 5g-2) 未认领实例（ownerUserId=null）→ 任何人回复都零动作
+await press(7, 'review:reject:11', 56);
+const promptMsgId5g2 = telegram.lastMsgId;
+state.ownerUserId = null;
+const sentBefore5g2 = telegram.sent.length;
+const ok5g3 = await handleRejectReasonReply({ chat: { id: -100777 }, from: { id: 7 }, text: '未认领时的回复', reply_to_message: { message_id: promptMsgId5g2 } });
+assert.equal(ok5g3, false, '未认领实例不代发');
+assert.equal(telegram.sent.length, sentBefore5g2, '未认领实例零群发');
+state.ownerUserId = 7;
+
+// 5h)（#20）/cancel 取消沿用：零群发、条目标记已取消、取消后回复不再触发
+await press(7, 'review:reject:11', 56);
+const promptMsgId5h = telegram.lastMsgId;
+const sentBefore5h = telegram.sent.length;
+const ok5h = await handleRejectReasonReply({ chat: { id: -100777 }, from: { id: 7 }, text: '/cancel', reply_to_message: { message_id: promptMsgId5h } });
+assert.equal(telegram.sent.length, sentBefore5h, '/cancel 零群发');
+assert.match(telegram.edits[telegram.edits.length - 1].text, /已取消/, '原因条标记已取消');
+const ok5h2 = await handleRejectReasonReply({ chat: { id: -100777 }, from: { id: 7 }, text: '取消后还回复', reply_to_message: { message_id: promptMsgId5h } });
+assert.equal(ok5h, false, '/cancel 走取消分支不当原因');
+assert.equal(ok5h2, false, '取消后的回复不再触发');
+assert.equal(telegram.sent.length, sentBefore5h, '取消路径全程零群发');
+
+// 5i)（#20 静态接线锁）钩子必须接在 handleTelegramMessage 群模式过滤**之前**
+//    （群里回复不带 @点名，挂晚了会被静默丢 —— 这条锁防「函数写了没接线」）
+const __idxSrc = __fs.readFileSync('${BOT}/src/index.js', 'utf8');
+const __htStart = __idxSrc.indexOf('async function handleTelegramMessage');
+assert.ok(__htStart > 0, 'handleTelegramMessage 应存在');
+const __hookAt = __idxSrc.indexOf('await handleRejectReasonReply(message)', __htStart);
+const __groupAt = __idxSrc.indexOf('const isGroupChat', __htStart);
+assert.ok(__hookAt > 0, '钩子要接在 handleTelegramMessage 里');
+assert.ok(__hookAt < __groupAt, '钩子必须在群模式过滤之前');
 
 // （#11 互为看门狗测试组已随功能整体删除，2026-10-07 老板令。）
 console2.log('index.js 侧 5 组断言全过');
