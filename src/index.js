@@ -36,6 +36,9 @@ import { LiveStatus, describeTool } from './status.js';
 import { transcribe, configure as configureAsr, currentBackend } from './asr.js';
 import { installApprovalBridge } from './approval-bridge.js';
 import { createHardRulesHandler, HARD_RULES_EVERY_N } from './hard-rules.js';
+import { createHerdWatchdog, HERD_GROUP_FALLBACK } from './herd.js';
+import { makeMgmtState, mgmtRoundTick, fireMgmtRound, MGMT_CHAT_KEY } from './mgmt-round.js';
+import { createTaskTriggers } from './triggers.js';
 
 /** Cordis 插件名。 */
 export const name = 'botplugin';
@@ -950,12 +953,20 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------------------
   // 审批桥：DSH 的 approval/request → Telegram 内联按钮
   // -------------------------------------------------------------------------
-  // 主人所在会话：私聊里 chat id == user id（与 tgEndpoint 同款约定）。
-  // 主人还没认领（ownerUserId 为 null）时返回 null → 桥不接管，走失败关闭。
+  // 卡片目标会话（#39，2026-10-08 老板定「提权申请也放在群里，和审核一样」）：
+  // 协作群优先（任务表头「协作群 chat id」，审核卡 sendReviewCard / #33 triggers
+  // chatId 同款先例），表头没写群 id 时回退 ownerUserId 私聊兜底（群 id 缺失不失联）。
+  // ⚠️ ownerUserId 为 null（老板还没认领）时仍返回 null → 桥不接管，走失败关闭：
+  //    群卡按钮回调不做身份门，未认领就发卡 = 群里一张谁点都生效的死卡，⛔ 不许兜。
   approvalBridge = installApprovalBridge({
     ctx,
     telegram,
-    getChatId: () => (telegram && state.ownerUserId !== null ? state.ownerUserId : null),
+    getChatId: () => {
+      if (!telegram) return null;
+      const group = groupChatIdFromTable();
+      if (group) return Number(group);
+      return state.ownerUserId !== null ? state.ownerUserId : null;
+    },
     log,
     error,
   });
@@ -1646,10 +1657,14 @@ export function apply(ctx, config) {
         //   （官方 Bots FAQ；下方任务表块头注释同款结论）—— 主 bot 天生收不到这条，
         //   #15 把它当「主 bot 监听闭环」的输入，设计时踩了平台规则的坑（#25 实锤）。
         //   第 16 条：成功唯一判据 = 返回带 message_id；没有或发送失败都显式报错，⛔ 不装成功。
+        //   ⚠️ #38：宿主 telegram.sendMessage 返回的是【已解包】的消息对象（顶层就有
+        //   message_id，bot.js:643-644 直接 sent.message_id 消费可证）——按裸 Bot API
+        //   形状 res?.result?.message_id 取会永远 undefined（#37 行「无回执」实锤）。
+        //   取法兼容双形状：顶层优先，result 兜底（防中间层形状再变）。
         let approveMsgId = null;
         try {
           const res = await telegram.sendMessage(groupId, `通过 #${no}`);
-          approveMsgId = res?.result?.message_id ?? null;
+          approveMsgId = res?.message_id ?? res?.result?.message_id ?? null;
           if (approveMsgId) log(`[审核] #${no} 群发「通过 #${no}」成功（message_id=${approveMsgId}）`);
           else error(`[审核] #${no} 群发「通过 #${no}」返回里没有 message_id —— 按第 16 条不算成功，消息可能被丢弃`);
         } catch (err) {
@@ -2385,7 +2400,9 @@ export function apply(ctx, config) {
       ].join('\n'),
       { reply_markup: { force_reply: { force_reply: true, input_field_placeholder: '打回原因…' } } },
     );
-    const promptMsgId = res?.result?.message_id;
+    // #38：宿主返回【已解包】消息对象（顶层 message_id，见上方审核代发处注释）；
+    //   兼容双形状取法，别按裸 Bot API 的 result 形状取（会永远 undefined → 原因条登记不上）。
+    const promptMsgId = res?.message_id ?? res?.result?.message_id ?? null;
     if (!promptMsgId) return;
     pendingRejects.set(promptMsgId, {
       no, groupId, cardChat, cardMsgId,
@@ -2529,6 +2546,59 @@ export function apply(ctx, config) {
   }
   watchTaskTable();
 
+  // ---- 小工看门狗（任务 #32，2026-10-08：等价能力从 bot.js master 分支搬进插件源）----
+  // bot.js 的 master 分支自主 bot 迁插件架构后无人执行，#9 小工看门狗随之失联
+  // （实证：#28 进行中 5.5 小时无人翻牌改派）。判据与防风暴口径与 bot.js 版一致
+  //（存活=pidfile kill -0 + 日志 15 分钟新鲜度；停摆=同状态 ≥30 分钟；拉活冷却
+  // 10 分钟、连拉 3 次无效升级公告 —— 详见 src/herd.js 头注释）。
+  // 全机只许一个插件实例看护：.herd.lock 选主，没选中的实例只留一行日志不巡检；
+  // 停摆/判死结论合并成一条 sendRich 发协作群（群 id 表头优先，兜底协作群）。
+  const herdDir = process.env.DSH_BOT_DIR ?? dirname(TASK_TABLE_PATH);
+  // 协作群公告唯一实现（#33 抽出共用：herd 播报与任务表触发公告同一条发送腿，⛔ 不复制第二份）
+  const announceGroup = async (text) => {
+    const raw = groupChatIdFromTable() ?? HERD_GROUP_FALLBACK;
+    const chatId = Number(raw);
+    if (!telegram || !Number.isInteger(chatId)) throw new Error(`协作群 id 不可用（${raw ?? '无'}）`);
+    return telegram.sendRich(chatId, text);
+  };
+  const herd = createHerdWatchdog({
+    root: herdDir,
+    lockPath: join(herdDir, '.herd.lock'),
+    readTable: readTaskTable,
+    writeTable: writeTaskTable,
+    announce: announceGroup,
+    log,
+    error,
+  });
+  herd.start();
+
+  // ---- 主 bot 侧任务表自动触发（任务 #33，2026-10-08：bot.js watchTaskTable 的插件等价）----
+  // 每 5 分钟（与看门狗同拍）扫任务表：「待验收」→ 群发「🔔 验收触发 #N」+ 行占位「验收中」
+  // + 验收 prompt 注入本会话；「待审核+通过标记」→ 群发「🔔 发版触发 #N」+ 占位「发布中」
+  // + 发版 prompt 注入。光群发叫不醒会话（TG 不投 bot 发言），注入才是叫醒腿（领活同款通路）。
+  // 失败重试不丢：公告失败行不动、注入失败行回滚（详见 src/triggers.js 头注释）。
+  // 角色门：只有 BOT_ROLE=master 的实例跑 —— 审核实例（默认）与 worker 实例不设即不跑，
+  // 验收/发版轮只归主 bot；多实例误配双 master 也有 .trigger.lock 选主兜底。
+  let taskTriggers = null;
+  if (String(process.env.BOT_ROLE ?? '').trim() === 'master') {
+    taskTriggers = createTaskTriggers({
+      lockPath: join(herdDir, '.trigger.lock'),
+      readTable: readTaskTable,
+      writeTable: writeTaskTable,
+      announce: announceGroup,
+      chatId: () => {
+        const g = groupChatIdFromTable();
+        return g ? Number(g) : state.ownerUserId; // bot.js 原版兜底（群 id 缺失时私聊）
+      },
+      inject: (chatId, text) => enqueue(`tg:${chatId}`, () => promptFromHub({ source: 'tg', chatId, text, raw: null })),
+      log,
+      error,
+    });
+    taskTriggers.start();
+  } else {
+    log('[触发器] 本实例非 master（BOT_ROLE 未设 = 审核模式）—— 任务表自动触发不开（归主 bot 实例）');
+  }
+
   // （互为看门狗 #11 已按老板令于 2026-10-07 整体删除：互相保活=互相误杀，把健康的
   //   主 bot 反复 kickstart 勒死——任务表 #12/#13 有案。当时为它加的 [hb] 心跳保留，
   //   日志活性对人工排查有用，已无人拿它当判死依据。）
@@ -2541,6 +2611,8 @@ export function apply(ctx, config) {
     state.stopped = true;
     if (taskTimer) clearInterval(taskTimer);
     if (hbTimer) clearInterval(hbTimer);
+    herd.stop(); // 看门狗定时器 + .herd.lock（只删自己的锁）
+    taskTriggers?.stop(); // 触发器定时器 + .trigger.lock（#33；没 start 过则空转）
     approvalBridge?.dispose();
     pollAbort?.abort();
     wxAbort?.abort();

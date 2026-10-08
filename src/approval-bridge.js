@@ -245,7 +245,7 @@ function cardText(request, status, note = null) {
  * @param {object}   deps
  * @param {object}   deps.ctx       插件上下文（会挂 approval/request 监听）
  * @param {object}   deps.telegram  Telegram 客户端实例（不可用 → 完全不接管）
- * @param {() => (string|number|null)} deps.getChatId 主人会话 id，拿不到返回 null
+ * @param {() => (string|number|null)} deps.getChatId 卡片目标会话 id（#39：协作群优先、表头缺群 id 时回主人私聊），拿不到返回 null
  * @param {(msg: string) => void} [deps.log]
  * @param {(msg: string) => void} [deps.error]
  * @param {number}   [deps.timeoutMs] 审批超时，默认 10 分钟

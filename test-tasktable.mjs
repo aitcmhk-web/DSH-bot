@@ -40,10 +40,16 @@ const writeFileSync = (...a) => __fs.writeFileSync(...a);
 const renameSync = (...a) => __fs.renameSync(...a);
 const statSync = (...a) => __fs.statSync(...a);
 const join = (...a) => __path.join(...a);
+const dirname = (...a) => __path.dirname(...a); // #38：#32/#34 半成品 herd 段（apply 顶层）用裸名 dirname，harness 先例照 join 供给
+// #38：herd/triggers 是 ./herd.js、./triggers.js 的 export —— run.mjs 单文件拼接没有模块可 import，
+// 照 fsStub 先例给 no-op stub 让 iChunk 拼装面可跑。本测不测看门狗/触发器行为（归 #32/#33 判据）。
+const HERD_GROUP_FALLBACK = '-5334440553';
+const createHerdWatchdog = () => ({ start() {} });
+const createTaskTriggers = () => ({ start() {} });
 const assert = (await import('node:assert')).strict;
 const console2 = console;
 `;
-const pathImport = `import { join as __join } from 'node:path';\nconst __path = { join: __join };\n`;
+const pathImport = `import { join as __join, dirname as __dirname } from 'node:path';\nconst __path = { join: __join, dirname: __dirname };\n`;
 
 // ---------- bot.js 侧测试 ----------
 const bTest = `
@@ -427,9 +433,12 @@ const telegram = {
     if (this.failNextSend) { this.failNextSend = false; throw new Error('测试桩：发送失败'); }
     this.sent.push({ chatId, text, extra });
     if (this.noMsgIdOnce) { this.noMsgIdOnce = false; return { ok: true }; }
-    // #20：真实 TG 会回 result.message_id（原因条登记待回复要用它当 key）
+    // #38：桩必须按【宿主真实形状】打——宿主 telegram.sendMessage 返回已解包的消息对象
+    // （顶层就有 message_id，bot.js:643-644 直接 sent.message_id 消费可证）。
+    // 旧桩按裸 Bot API 打 {result:{message_id}} = 打桩比真实现更宽容的测试=没测（第 22 条），
+    // 旧代码 result 取法被它喂成假绿。⛔ 桩形状不许再迁就实现。
     this.lastMsgId = 900 + this.sent.length;
-    return { ok: true, result: { message_id: this.lastMsgId } };
+    return { ok: true, message_id: this.lastMsgId };
   },
   async sendRich(chatId, text, extra = {}) { this.sent.push({ chatId, text, extra }); return { ok: true }; },
   async editMessageText(chatId, messageId, text) { this.edits.push({ chatId, messageId, text }); return { ok: true }; },
@@ -674,6 +683,8 @@ await press(7, 'review:approve:13');
 assert.equal(telegram.sent[telegram.sent.length - 1].text, '通过 #13', '「通过 #N」格式一字不改（群发只给人看）');
 assert.ok(logCalls.some((l) => /群发「通过 #13」成功（message_id=\\d+）/.test(l)), '群发成功必须落 message_id 证据（第 16 条）');
 assert.match(telegram.edits[telegram.edits.length - 1].text, /message_id=/, '卡片回执带 message_id');
+assert.match(telegram.edits[telegram.edits.length - 1].text, /已发协作群（message_id=/, '卡片走「已发协作群（message_id=…）」分支（#38 判据②）');
+assert.doesNotMatch(telegram.edits[telegram.edits.length - 1].text, /没拿到送达回执/, '正常发送不得再报「没拿到送达回执」（#38 判据②）');
 assert.match(telegram.edits[telegram.edits.length - 1].text, /等主 bot 发版/, '卡片告知已写标记接力');
 const row13 = __fs.readFileSync(TASK_TABLE, 'utf8').split('\\n').find((l) => /^\\|\\s*13\\s*\\|/.test(l));
 assert.ok(row13, '行还在');
@@ -730,6 +741,55 @@ assert.ok(logCalls.some((l) => /无送达回执/.test(l)), '汇总日志也要�
 const row16 = __fs.readFileSync(TASK_TABLE, 'utf8').split('\\n').find((l) => /^\\|\\s*16\\s*\\|/.test(l));
 assert.match(row16, /message_id=无回执/, '假成功的标记明说无回执');
 
+// 12)（#39）审批桥卡片发协作群（老板 2026-10-08 定「提权申请也放在群里，和审核一样」）。
+//     getChatId 源文本从 src/index.js 原样抽出（测的是源码不是复刻，文件头铁律），
+//     配真实 approval-bridge.js 模块直驱 approval/request，断言卡片 sendMessage 的 chatId：
+//     12a 表头群 id → 协作群；12b 表头无群 id → 回退 ownerUserId 私聊（不失联）。
+const __gAt = __idxSrc.indexOf('getChatId:');
+const __gEnd = __idxSrc.indexOf('\\n    log,', __gAt);
+assert.ok(__gAt > 0 && __gEnd > __gAt, 'getChatId 段应存在于 src/index.js（切片锚点）');
+const __gChunk = __idxSrc.slice(__gAt, __gEnd); // 「getChatId: …,」成员原文（含尾逗号）
+const __getChatId = new Function(
+  'telegram', 'state', 'groupChatIdFromTable',
+  'return ({ ' + __gChunk + ' }).getChatId;',
+)(telegram, state, groupChatIdFromTable);
+const { installApprovalBridge } = await import('${BOT}/src/approval-bridge.js');
+const __approvalHandlers = [];
+const __bridge = installApprovalBridge({
+  ctx: { on(type, fn) { __approvalHandlers.push(fn); return () => {}; } },
+  telegram,
+  getChatId: __getChatId,
+  log,
+  error,
+});
+const __fireApproval = async (reason) => {
+  void __approvalHandlers[0]({ reason, toolName: 'bash', signal: null }, () => 'unavailable');
+  await sleep(5); // 卡片发送是异步的，让微任务跑完（4 组审核卡同款节奏）
+};
+// 12a 表头有群 id → 卡片发协作群
+__fs.writeFileSync(TASK_TABLE, [
+  '# t',
+  '> 协作群 chat id: -5334440553',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 39 | 提权卡片进群的活 | 插件版 | 进行中 | — |',
+].join('\\n'));
+const sentBefore12 = telegram.sent.length;
+await __fireApproval('测试提权申请（#39）');
+assert.equal(telegram.sent.length, sentBefore12 + 1, '审批请求应发一张卡片');
+assert.equal(telegram.sent[telegram.sent.length - 1].chatId, -5334440553, '提权卡片必须发协作群（表头群 id 优先，不发私聊）');
+assert.match(telegram.sent[telegram.sent.length - 1].text, /等待审批/, '卡片是等待审批形状');
+// 12b 表头无群 id → 回退 ownerUserId 私聊（群 id 缺失不失联）
+__fs.writeFileSync(TASK_TABLE, [
+  '# t',
+  '> 协作群 chat id:（占位）',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 39 | 提权卡片进群的活 | 插件版 | 进行中 | — |',
+].join('\\n'));
+await __fireApproval('测试群 id 缺失回退');
+assert.equal(telegram.sent[telegram.sent.length - 1].chatId, 7, '表头无群 id → 回退 owner 私聊 7（不失联）');
+__bridge.dispose(); // 清挂起项（超时定时器已被遮蔽，这里连 pending 一起收干净）
 console2.log('index.js 侧 6 组断言全过');
 `;
 
