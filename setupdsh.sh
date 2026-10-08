@@ -227,7 +227,7 @@ ensure_dsh() {
 # ⚠️ 这里写死的 tag 必须是**本次发布自己的 tag**（发新版本时同步改，别漏）。
 #    走 TG 菜单那条路会先上网拉最新这份脚本再跑，所以实际生效的永远是网上最新的 tag；
 #    没网时才退回包里这份 —— 那时它也只能装这个 tag。
-SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.41}"
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.42}"
 # ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
 #    ⛔ 绝不拿日期或路径冒充版本号（2026-10-01 用户骂过）。
 plugin_version() {
@@ -296,6 +296,41 @@ upgrade_plugins() {
   rm -f "$PLUGLIST_FILE" 2>/dev/null || true
 }
 
+# ensure_hardrules_block — 给缺「最高指令」块的 profile 幂等补挂 file:// v2 插件。
+# 背景（2026-10-08 老板令收口双挂载）：npm 包内 hard-rules.js v1 已随 v1.0.42 退役，
+# 全机权威源 = /Users/tcm/DSH/hard-rules/index.mjs（v2，含教训注入），由各 profile 的
+# cordis.patch.yml 以 file:// 挂载。缺块的 profile 补上，已有的原样不动（幂等）；
+# 改前逐份备份，临时文件 + mv 原子替换（bot 运行时 HMR 会热重载 patch，不能留中间态）。
+# ⚠️ sync-from-web.mjs 只重写 llm 托管块、其余原样搬运（2026-10-08 #37 修复后），补的块不会被冲。
+HARD_RULES_MARK='id: hard-rules'
+ensure_hardrules_block() {
+  HARD_BLOCK='
+# ── 最高指令：每次动手类工具（bash/edit/write）跑完，把规则原文重新顶进上下文 ──
+#    实现 /Users/tcm/DSH/hard-rules/index.mjs，规则 /Users/tcm/DSH/BOT/HARD-RULES.md
+#    本块由 setupdsh.sh 幂等补挂（2026-10-08 v1.0.42 收口）；sync-from-web.mjs 不托管它。
+- insert:
+    - id: hard-rules
+      name: "file:///Users/tcm/DSH/hard-rules/index.mjs"
+'
+  PATCHLIST="$(find "${DSH_HOME:-$HOME/.dsh}/profiles" -maxdepth 2 -name cordis.patch.yml 2>/dev/null || true)"
+  [ -n "$PATCHLIST" ] || return 0
+  PATCHLIST_FILE="${TMPDIR:-/tmp}/setupdsh-patchlist.$$"
+  printf '%s\n' "$PATCHLIST" > "$PATCHLIST_FILE" 2>/dev/null || return 0
+  while IFS= read -r PF; do
+    [ -n "$PF" ] || continue
+    if grep -q "$HARD_RULES_MARK" "$PF" 2>/dev/null; then continue; fi
+    STAMP="$(date +%Y%m%d-%H%M%S)"
+    cp "$PF" "${PF}.bak-hardrules-${STAMP}" || { say "⚠️ ${PF} 备份失败，跳过补挂"; continue; }
+    if cp "$PF" "${PF}.setupdsh-tmp" && printf '%s\n' "$HARD_BLOCK" >> "${PF}.setupdsh-tmp" && mv "${PF}.setupdsh-tmp" "$PF"; then
+      say "✅ 最高指令块已补挂：$(basename "$(dirname "$PF")")（备份 ${PF}.bak-hardrules-${STAMP}）"
+    else
+      rm -f "${PF}.setupdsh-tmp" 2>/dev/null || true
+      say "⚠️ ${PF} 补挂失败（保留原文件），可重跑本脚本重试"
+    fi
+  done < "$PATCHLIST_FILE"
+  rm -f "$PATCHLIST_FILE" 2>/dev/null || true
+}
+
 # ============ 主流程 ============
 say ""
 say "=================================="
@@ -310,6 +345,7 @@ ensure_git
 ensure_node
 ensure_dsh
 upgrade_plugins
+ensure_hardrules_block
 
 say ""
 say "============ 机器环境安装完成 ============"

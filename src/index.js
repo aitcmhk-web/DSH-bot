@@ -35,7 +35,6 @@ import { readWebLlmPiAi, readWebLlmDeepseek, webPatchPath } from './web-patch.js
 import { LiveStatus, describeTool } from './status.js';
 import { transcribe, configure as configureAsr, currentBackend } from './asr.js';
 import { installApprovalBridge } from './approval-bridge.js';
-import { createHardRulesHandler, HARD_RULES_EVERY_N } from './hard-rules.js';
 import { createSourceGuardInstaller } from './source-guard.js';
 import { createHerdWatchdog, HERD_GROUP_FALLBACK } from './herd.js';
 import { makeMgmtState, mgmtRoundTick, fireMgmtRound, MGMT_CHAT_KEY } from './mgmt-round.js';
@@ -972,47 +971,11 @@ export function apply(ctx, config) {
     error,
   });
 
-  // -------------------------------------------------------------------------
-  // 最高指令（HARD-RULES.md）：每干若干步，就把原文重新顶进上下文
-  // -------------------------------------------------------------------------
-  // 用户 2026-10-02 定：不是「开头读过一次就算」，而是「每干若干步就再出现一次」，
-  // 否则干着干着就忘了。2026-10-03 定：挂载点从 `tools/post-execute`（工具已经跑完才
-  // 触发，第一次动手本身来不及约束）换成 `agent/pre-step`（模型这一步的请求发出之前），
-  // 计数也从「按动手次数」改成「按步」—— 逻辑抽在 `src/hard-rules.js`，文件头写了机制
-  // 和两个必须守住的坑（空转步不记账、双挂载按 `agent:turn:step` 去重）。
-  // ⚠️ 文件在**启动时读一次**并缓存（用户 2026-10-02 定）—— 改完内容要重启 bot 才生效。
-  const HARD_RULES_PATH = new URL('../HARD-RULES.md', import.meta.url);
-  let hardRulesText = '';
-  try {
-    hardRulesText = readFileSync(HARD_RULES_PATH, 'utf8').trim();
-  } catch {
-    hardRulesText = '';
-  }
-  const hardRulesHandler = createHardRulesHandler({
-    text: hardRulesText,
-    everyN: HARD_RULES_EVERY_N,
-    log: (msg) => log(msg),
-  });
-  if (hardRulesHandler !== null) {
-    // ⚠️ 挂两份（ctx + ctx.root）：`agent/pre-step` 是 agent 作用域事件，
-    //    插件根 ctx 通常收得到，但被挂到不相关 scope 下就会漏 —— 与
-    //    approval-bridge.js 同款做法（理由见其文件头注释）。handler 内部按
-    //    `agent:turn:step` 去重，所以两份不会重复注入。
-    const targets = ctx.root && ctx.root !== ctx ? [ctx, ctx.root] : [ctx];
-    let mounted = 0;
-    for (const target of targets) {
-      if (typeof target?.on !== 'function') continue;
-      try {
-        target.on('agent/pre-step', hardRulesHandler);
-        mounted += 1;
-      } catch (err) {
-        log(`最高指令挂载失败: ${err?.message ?? err}`);
-      }
-    }
-    log(`最高指令已挂载（${mounted} 处 / 第 1 步 + 每 ${HARD_RULES_EVERY_N} 步 / ${hardRulesText.length} 字）：${HARD_RULES_PATH.pathname}`);
-  } else {
-    log(`最高指令文件为空或不存在，跳过挂载：${HARD_RULES_PATH.pathname}`);
-  }
+
+  // ⛔ 最高指令注入的原内置实现（src/hard-rules.js v1）已随 v1.0.42 退役：
+  //    它与 file:// 挂载的 /Users/tcm/DSH/hard-rules/index.mjs（v2，含教训注入）构成双挂载，
+  //    bot/四小工/desktop 一回合注入两次。权威源 = v2（6 个 profile patch file:// 引用），
+  //    缺块的 profile 由 setupdsh.sh 幂等补挂；本包不再内置注入（2026-10-08 老板令收口）。
 
   // -------------------------------------------------------------------------
   // 来源闸（source-guard）：结论不标来源就打回（拦截型）
