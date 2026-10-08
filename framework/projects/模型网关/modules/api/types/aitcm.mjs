@@ -10,6 +10,7 @@ function AITCM_翻译(载荷) {
   const p = 载荷 && typeof 载荷 === 'object' ? 载荷 : {};
   const system = AITCM_系统字段
     .filter((k) => typeof p[k] === 'string' && p[k].trim())
+    .map((k) => p[k])
     .join('\n\n');
   const 行 = [];
   for (const [k, v] of Object.entries(p)) {
