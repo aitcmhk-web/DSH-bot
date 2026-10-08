@@ -649,7 +649,7 @@ class LiveStatus {
       this.telegram.sendChatAction(this.chatId, 'typing').catch(() => {});
     }, 4500);
     this.typingTimer.unref?.();
-    this.tickTimer = setInterval(() => this.#scheduleEdit(), 2000);
+    this.tickTimer = setInterval(() => this.#scheduleEdit(), 5000); // 2026-10-08 老板令：2s→5s，减少 TG 编辑限流
     this.tickTimer.unref?.();
     this.telegram.sendChatAction(this.chatId, 'typing').catch(() => {});
   }
@@ -1428,6 +1428,9 @@ function watchWorkerTasks() {
         return; // 一轮只动一件事：换人后再等下一轮扫描（防同轮重复写表）
       }
 
+      // ── ②′ 例行进度汇报捡标记（#41）：动了表/投了递就收工，下轮再领活（一轮只动一件事）──
+      if (progressReportPickup(lines)) return;
+
       let picked = -1;
       for (let i = 0; i < lines.length; i++) {
         const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*(?:待领取|打回)\s*\|/);
@@ -1438,8 +1441,9 @@ function watchWorkerTasks() {
       const cells = rowLine.split('|'); // ['', no, task, owner, status, note, '']
       if (cells.length < 6) return;
       const no = cells[1].trim(), task = cells[2].trim();
-      const conclusionCol = cells[5] ? cells[5].trim() : '';
+      const conclusionCol = stripProgressMarkerNote(cells[5] ? cells[5].trim() : ''); // #41：陈旧汇报标记不进领活 prompt
       cells[4] = ' 进行中 '; // 先占位，防下轮重复领
+      cells[5] = ` ${stripProgressMarkerNote(cells[5])} `; // #41：表上同样剥掉（新单从干净汇报账起步，防陈旧标记误判龄）
       lines[picked] = cells.join('|');
       writeTaskTable(lines.join('\n'));
       const groupId = groupChatIdFromTable();
@@ -1448,32 +1452,167 @@ function watchWorkerTasks() {
       workerCurrentTask = { no, chatId };
       state.workerTask = workerCurrentTask;
       saveState();
-      const hasProgress = conclusionCol.includes(`你是子 bot ${INSTANCE}`) || conclusionCol.includes(`bot ${INSTANCE}`);
-      const reasonBlock = conclusionCol ? [
-        '',
-        '<打回原因>',
-        conclusionCol,
-        '</打回原因>',
-        ...(hasProgress ? [`（结论列里已有你写的进度，接着干别重头）`] : []),
-      ].join('\n') : '';
-      submitTurn(chatId, [
-        {
-          type: 'text',
-          text: [
-            '<领活（系统触发，无需回复此段）>',
-            `你是子 bot ${INSTANCE}（worker，TG 身份 @aitcm${INSTANCE.replace(/bot$/, '')}bot），从任务表领到 #${no}。任务：${task}`,
-            reasonBlock,
-            '红线：⛔ 不 git push、⛔ 不打 tag、⛔ 不发版（发版只归主 bot 验收后做）；改动只在工作区 /Users/tcm/DSH/BOT 内。',
-            '干完：把 /Users/tcm/DSH/BOT/任务表.md 该行状态改成「待验收」（先改状态占位再干也行，防止重复领的是「进行中」），然后把做了什么、改了哪些文件总结发回协作群。',
-            '</领活>',
-          ].filter(l => l !== '').join('\n'),
-        },
-      ]);
+      submitTurn(chatId, buildWorkerClaimBlocks(no, task, conclusionCol));
       console.log(`[${_ts()}][任务表] worker ${INSTANCE} 领 #${no} → chat ${chatId}`);
     } catch (err) {
       console.error(`[${_ts()}][任务表] worker 领活轮询出错: ${err.message}`);
     }
   }, TASK_POLL_MS);
+}
+
+/** 领活 prompt 构造（#40 抽公共）：正常领活与「丢失重投」共用这一份文本 ——
+ *  红线/干完动作一字不差，⛔ 两处各写一遍必走样（门一 第 1 条：同一概念只留一个权威源）。
+ *  resubmit=true → 抬头改「丢失重投」：行已在「进行中」，补回的是被杀进程丢掉的那条指令。 */
+function buildWorkerClaimBlocks(no, task, conclusionCol, { resubmit = false } = {}) {
+  const hasProgress = conclusionCol.includes(`你是子 bot ${INSTANCE}`) || conclusionCol.includes(`bot ${INSTANCE}`);
+  const reasonBlock = conclusionCol ? [
+    '',
+    '<打回原因>',
+    conclusionCol,
+    '</打回原因>',
+    ...(hasProgress ? [`（结论列里已有你写的进度，接着干别重头）`] : []),
+  ].join('\n') : '';
+  const headline = resubmit
+    ? `丢失重投（进程刚被杀重启，上一条领活指令丢失）：#${no} 仍在你名下「进行中」。任务：${task}`
+    : `你是子 bot ${INSTANCE}（worker，TG 身份 @aitcm${INSTANCE.replace(/bot$/, '')}bot），从任务表领到 #${no}。任务：${task}`;
+  return [
+    {
+      type: 'text',
+      text: [
+        '<领活（系统触发，无需回复此段）>',
+        headline,
+        reasonBlock,
+        '红线：⛔ 不 git push、⛔ 不打 tag、⛔ 不发版（发版只归主 bot 验收后做）；改动只在工作区 /Users/tcm/DSH/BOT 内。',
+        '干完：把 /Users/tcm/DSH/BOT/任务表.md 该行状态改成「待验收」（先改状态占位再干也行，防止重复领的是「进行中」），然后把做了什么、改了哪些文件总结发回协作群。',
+        '</领活>',
+      ].filter(l => l !== '').join('\n'),
+    },
+  ];
+}
+
+// ── #41 每 5 分钟例行进度汇报·worker 侧（2026-10-08 老板令，权威源=04-开发总设计 D16）──
+// master 侧（src/progress-report.js，挂 herd 心跳）每 5 分钟在「进行中」行结论列落
+// 请求标记「⏰ 汇报请求(MM-DD HH:MM)」；本侧在领活轮询里捡标记 → submitTurn 固定
+// 提示词进协作群（领活同款通路）。防堆叠：该 chat 有在途回合（在飞未清/邮箱没清空）
+// → 只把标记时间戳刷新（=活着证明）不投递——followup 排队语义下再排只会堆积
+// （mgmt-round.js 同款 rationale）；标记 10 分钟（=连续 2 个 5 分钟周期）没被刷新/
+// 剥掉 → master 交看门狗改派。⚠️ 本文件是 CJS，import 不了 src/ 的 ESM——标记契约
+// （正则/格式/提示词/门槛）两侧各有一份同文实现，双侧测试互为对照
+// （test-progress-report.mjs / test-tasktable.mjs 第 12 组）。
+const PROGRESS_REPORT_PROMPT =
+  '例行进度汇报：①本单进展到哪一步 ②下一步干什么 ③需要解决的问题（无也要报无）';
+const PROGRESS_RECHECK_MS = 4 * 60 * 1000; // 忙时刷新门槛（< master 5 分钟一拍；src/progress-report.js 同值同义）
+const PROGRESS_MARKER_RE = /⏰ 汇报请求\((\d{2}-\d{2} \d{2}:\d{2})\)/;
+
+/** 时间戳（MM-DD HH:MM，与 herd.js localStamp / src/progress-report.js progressStamp 同形）。 */
+function progressStampNow(now = Date.now()) {
+  const d = new Date(now);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 时间戳→毫秒（跨年：解析落未来 1 天外按去年算；src/progress-report.js 同款）。 */
+function parseProgressStampLocal(s, now = Date.now()) {
+  const [md, hm] = String(s).split(' ');
+  const [mo, d] = md.split('-').map(Number);
+  const [h, mi] = hm.split(':').map(Number);
+  let t = new Date(new Date(now).getFullYear(), mo - 1, d, h, mi).getTime();
+  if (t - now > 24 * 60 * 60 * 1000) {
+    t = new Date(new Date(now).getFullYear() - 1, mo - 1, d, h, mi).getTime();
+  }
+  return t;
+}
+
+/** 结论列剥汇报标记（领活占位清陈旧标记用；src/progress-report.js stripMarkerFromLine 同款）。 */
+function stripProgressMarkerNote(note) {
+  return String(note ?? '')
+    .split('；')
+    .filter((seg) => !PROGRESS_MARKER_RE.test(seg))
+    .join('；')
+    .trim();
+}
+
+/** 例行进度汇报 prompt：固定提示词一字不改（任务 #41 判据），包系统触发头尾（领活同款形状）。 */
+function buildProgressReportBlocks() {
+  return [
+    {
+      type: 'text',
+      text: [
+        '<例行汇报（系统触发，无需回复此段）>',
+        PROGRESS_REPORT_PROMPT,
+        '（这是例行进度汇报不是新任务：不用改任务表状态，答完继续手头的活）',
+        '</例行汇报>',
+      ].join('\n'),
+    },
+  ];
+}
+
+/** 捡本实例名下「进行中」行的汇报请求标记（#41）。动了表/投了递 → true（调用方本轮收工，
+ *  一轮只动一件事）；名下无可捡标记 → false（零动作，领活扫描照旧）。 */
+function progressReportPickup(lines) {
+  if (!INSTANCE) return false;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^\|\s*\d+\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*进行中\s*\|/);
+    if (!m || m[2] !== INSTANCE) continue;
+    const marker = lines[i].match(PROGRESS_MARKER_RE);
+    if (!marker) continue;
+    const cells = lines[i].split('|'); // ['', no, task, owner, status, note, '']
+    if (cells.length < 6) return false;
+    const groupId = groupChatIdFromTable();
+    const chatId = groupId ? Number(groupId) : state.ownerUserId;
+    if (!chatId) return false;
+    const box = chatMailboxes.get(chatId);
+    const busy =
+      (state.inFlight && String(state.inFlight.chatId) === String(chatId)) ||
+      (box && (box.running || box.pending.length > 0));
+    if (busy) {
+      // 防堆叠：在途回合未清 → 不投递，只刷新标记（≥RECHECK 才刷，防 5 秒轮询刷屏写表）
+      if (Date.now() - parseProgressStampLocal(marker[1]) < PROGRESS_RECHECK_MS) return false;
+      const rest = stripProgressMarkerNote(cells[5]);
+      cells[5] = ` ${rest ? `${rest}；` : ''}⏰ 汇报请求(${progressStampNow()}) `;
+      lines[i] = cells.join('|');
+      writeTaskTable(lines.join('\n'));
+      console.log(`[${_ts()}][任务表] 在途回合未清 → #${cells[1].trim()} 汇报标记已刷新（忙跳过防堆叠）`);
+      return true;
+    }
+    // 空闲：先剥标记落盘（写失败=本函数抛错，下 tick 原样重来），再投递
+    cells[5] = ` ${stripProgressMarkerNote(cells[5])} `;
+    lines[i] = cells.join('|');
+    writeTaskTable(lines.join('\n'));
+    submitTurn(chatId, buildProgressReportBlocks());
+    console.log(`[${_ts()}][任务表] #${cells[1].trim()} 例行进度汇报已投递（chat ${chatId}）`);
+    return true;
+  }
+  return false;
+}
+
+/** #40 领活指令防丢·丢失重投（2026-10-08 主bot根因实锤）：
+ *  小工领活 prompt 刚开处理进程即被 SIGTERM 杀掉重启（launchd.log [herd] 06:47…14:02 全天 8 圈）：
+ *  行已翻「进行中」，warnAboutLostTurn 只警告+清标志**不重投**，领活轮询只认「待领取/打回」
+ *  → 永不再触发 → 小工空转，看门狗 30 分钟再翻回 → 再领 → 再死。修法不依赖凶手身份，
+ *  两道保险共用本函数：① worker 启动自检（角色分流行直呼）；② warnAboutLostTurn 调用点补同款。
+ *  「同单幂等只投一次」三道闸：a) 本进程已为该单重投过（resubmittedClaims）；
+ *  b) 该 chat 有在途回合（state.inFlight 未清 / 邮箱里还攒着没跑的轮次）；
+ *  c) 行已不归本实例名下「进行中」（已交付/被改派/已重置）→ 零重投。 */
+const resubmittedClaims = new Set();
+function resubmitLostWorkerClaim() {
+  if (!INSTANCE) return false;
+  const wt = state?.workerTask;
+  if (!wt?.no || !wt?.chatId) return false;
+  if (resubmittedClaims.has(String(wt.no))) return false;
+  if (state.inFlight && String(state.inFlight.chatId) === String(wt.chatId)) return false;
+  const box = chatMailboxes.get(wt.chatId);
+  if (box && (box.running || box.pending.length > 0)) return false;
+  const rowLine = (readTaskTable() ?? '')
+    .split('\n')
+    .find((l) => new RegExp(`^\\|\\s*${wt.no}\\s*\\|`).test(l));
+  if (!rowLine) return false;
+  const cells = rowLine.split('|');
+  if (cells.length < 6 || cells[3].trim() !== INSTANCE || cells[4].trim() !== '进行中') return false;
+  resubmittedClaims.add(String(wt.no));
+  submitTurn(wt.chatId, buildWorkerClaimBlocks(wt.no, cells[2].trim(), (cells[5] ?? '').trim(), { resubmit: true }));
+  console.log(`[${_ts()}][任务表] 丢失重投：#${wt.no} 仍在本实例名下「进行中」→ 已重投领活 prompt（同单只投一次）`);
+  return true;
 }
 
 /** 审核按钮接力（任务 #25，2026-10-07）：找「状态=待审核 且 结论列带插件写的通过标记」的行。
@@ -3604,6 +3743,9 @@ if (boot.route) {
   // If the previous process died mid-turn, that message's reply never went out
   // and Telegram will not redeliver it. Tell the owner rather than stay silent.
   await warnAboutLostTurn();
+  // 任务 #40（2026-10-08）：warn 只警告+清标志不重投 —— 调用点补「丢失重投」（②）：
+  // 死在领活/干活轮上的，行仍归 worker 名下「进行中」时把丢掉的领活 prompt 补回来。
+  resubmitLostWorkerClaim();
   // 断开前没来得及写 handoff 的场合（重启电脑/launchd 拉起/崩溃自愈）在此补上。
   await catchUpHandoffOnBoot();
 } else {
@@ -3746,6 +3888,8 @@ try {
 
 // ---- 协作任务表轮询（主 bot = 验收/发布；派活逻辑见 watchTaskTable 头注释）----
 // 角色分流：worker（001bot…）只盯领活；master 盯验收。同一个 5 秒轮询节奏，账本同一张。
-if (BOT_ROLE === 'worker') { watchWorkerTasks(); startHeartbeat(); } else { watchTaskTable(); watchWorkerHerd(); startHeartbeat(); }
+// #40 ①启动自检：worker 起来先查名下「进行中」行有没有被杀丢的领活指令（模型启动失败路径
+// warnAboutLostTurn 没跑到时这层兜底；幂等闸在 resubmitLostWorkerClaim 里，两处都调也只投一次）。
+if (BOT_ROLE === 'worker') { resubmitLostWorkerClaim(); watchWorkerTasks(); startHeartbeat(); } else { watchTaskTable(); watchWorkerHerd(); startHeartbeat(); }
 
 await Promise.all([pollLoop(), weixinPollLoop()]);

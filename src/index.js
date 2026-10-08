@@ -38,6 +38,7 @@ import { installApprovalBridge } from './approval-bridge.js';
 import { createSourceGuardInstaller } from './source-guard.js';
 import { createHerdWatchdog, HERD_GROUP_FALLBACK } from './herd.js';
 import { makeMgmtState, mgmtRoundTick, fireMgmtRound, MGMT_CHAT_KEY } from './mgmt-round.js';
+import { progressReportTick } from './progress-report.js';
 import { createTaskTriggers } from './triggers.js';
 
 /** Cordis 插件名。 */
@@ -88,7 +89,7 @@ export const Config = Schema.object({
     .description('停机太久时，超过这个年龄的积压消息不再执行（默认 2 小时）'),
   turnTimeoutMs: Schema.number().default(30 * 60 * 1000)
     .description('等模型回答的超时（毫秒，默认 30 分钟）。超时后该会话的队列才会解锁'),
-  logLabel: Schema.string().default('botplugin').description('日志前缀'),
+  logLabel: Schema.string().default('').description('日志前缀（留空 = 不加前缀，跟软件版格式对齐）'),
 
   // ---- 语音转文字 ----
   // 默认走 ali（线上 qwen3-asr-flash 优先，~0.6s；网关不在/出错自动回落本地 sensevoice，
@@ -115,12 +116,18 @@ export const Config = Schema.object({
     .description('启动时后台自动探测各模型是否支持识图：通的继承识图，不通的自动标记纯文字（写 web 端模型配置，自动备份；不阻塞启动）'),
 });
 
-/** 日志小工具。 */
+/** 日志小工具。⚠️ 时间戳对齐软件版 bot.js（带日期）；label 为空时不加前缀。 */
 function makeLog(label) {
-  const ts = () => new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  const ts = () => {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+      + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  };
+  const tag = label ? `[${label}] ` : '';
   return {
-    log: (line) => console.log(`[${ts()}][${label}] ${line}`),
-    error: (line) => console.error(`[${ts()}][${label}] ${line}`),
+    log: (line) => console.log(`[${ts()}]${tag}${line}`),
+    error: (line) => console.error(`[${ts()}]${tag}${line}`),
   };
 }
 
@@ -2549,12 +2556,44 @@ export function apply(ctx, config) {
   // 门控条件与下方 #33 taskTriggers 一字同款（同一份角色门口径，第 1 条）。
   let herd = null;
   if (String(process.env.BOT_ROLE ?? '').trim() === 'master') {
+    // 例行管理回合（任务 #34，2026-10-08：老板令「靠消息唤醒还是没有发挥管理者的主观能动性」）：
+    // 每 30 分钟主动给 agent 开一回合管理回合（读任务表/验收/发版/派活/收尾播报）。
+    // ⛔ 不新造定时器：跟看门狗 onHeartbeat 同拍（第 1 条）——herd 每 5 分钟一拍带起
+    //   mgmtRoundTick，tick 内自判「距上次 ≥30 分钟」；主 bot 日志落 [mgmt-round] 心跳。
+    // 角色门与上方 herd/taskTriggers 一字同款（同一份角色门口径，第 1 条）：管理回合
+    // 只归 BOT_ROLE=master 实例；审核实例与 worker 实例走 else 分支，不建 herd = 零拍子。
+    const mgmtState = makeMgmtState(); // busy 防堆叠标志 + 上次触发时刻（跨拍保留）
     herd = createHerdWatchdog({
       root: herdDir,
       lockPath: join(herdDir, '.herd.lock'),
       readTable: readTaskTable,
       writeTable: writeTaskTable,
       announce: announceGroup,
+      // 投递照 runtime.js:279 现成 followup 排队语义：runtime.prompt 排队立即返回，
+      // waitForTurn 等回合结束（自带 30 分钟超时兜底）。busy 未清前 tick 自跳过不堆叠。
+      // #41 每 5 分钟例行进度汇报（2026-10-08 老板令）挂同一拍：扫「进行中」行落请求
+      // 标记 / 判龄升级交看门狗（src/progress-report.js）。与上面 #34 同拍不同拍子——
+      // 两族各自自判（#34 判距上次 ≥30 分钟、#41 判每行标记年龄），零共享状态，
+      // 互不覆盖（派单打回原因点名防覆盖）；各自 try/catch，一个异常不连累另一个。
+      onHeartbeat: (now) => {
+        try {
+          mgmtRoundTick(
+            mgmtState,
+            { fire: () => fireMgmtRound(runtime, { log, error }), log, error },
+            now,
+          );
+        } catch (err) {
+          error(`[mgmt-round] tick 异常: ${err?.stack ?? err?.message ?? err}`);
+        }
+        try {
+          progressReportTick(
+            { readTable: readTaskTable, writeTable: writeTaskTable, announce: announceGroup, log, error },
+            now,
+          );
+        } catch (err) {
+          error(`[progress] tick 异常: ${err?.stack ?? err?.message ?? err}`);
+        }
+      },
       log,
       error,
     });
@@ -2602,7 +2641,7 @@ export function apply(ctx, config) {
     state.stopped = true;
     if (taskTimer) clearInterval(taskTimer);
     if (hbTimer) clearInterval(hbTimer);
-    herd?.stop(); // 看门狗定时器 + .herd.lock（只删自己的锁；非 master 实例未挂 = 空转）
+    herd?.stop(); // 看门狗定时器 + .herd.lock + 管理回合拍子 + #41 汇报巡检拍子（#34/#41 均无自有定时器/锁，随 herd 停；非 master 实例未挂 = 空转）
     taskTriggers?.stop(); // 触发器定时器 + .trigger.lock（#33；没 start 过则空转）
     approvalBridge?.dispose();
     pollAbort?.abort();

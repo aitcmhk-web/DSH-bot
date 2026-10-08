@@ -401,7 +401,86 @@ intervalFn();
 assert.equal(submitted.length, submittedBefore11 + 2, '无标记不许触发');
 assert.match(readTaskTable(), /\\| 42 \\| 还在等审核的活 \\| 003bot \\| 待审核 \\|/, '没触发不许动状态');
 
-console2.log('bot.js 侧 11 组断言全过');
+// 12)（#41）例行进度汇报·worker 侧（2026-10-08 老板令）：master 侧插件（src/progress-report.js，
+//     挂 herd 心跳）每 5 分钟在「进行中」行结论列落请求标记 ⏰ 汇报请求(MM-DD HH:MM)；
+//     本侧领活轮询捡标记 → submitTurn 固定提示词进协作群（领活同款通路）；忙（在途回合
+//     未清）→ 只刷新标记不投递（防堆叠）；领活占位剥陈旧标记；无标记/非进行中行零动作。
+const chatMailboxes = new Map(); // bot.js 模块级（切片外），测试桩同形状
+watchWorkerTasks(); // 换 worker tick（第 10/11 组已把 intervalFn 换回主 bot tick）
+const stampAgo12 = (min) => {
+  const d = new Date(Date.now() - min * 60 * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+};
+// 12a 空闲 + 本实例「进行中」行带标记 → 投递固定提示词 + 剥标记
+__fs.writeFileSync(TASK_TABLE_PATH, [
+  '# t',
+  '> 协作群 chat id: -100888',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 50 | 汇报的活 | 002bot | 进行中 | 前情；⏰ 汇报请求(' + stampAgo12(6) + ') |',
+].join('\\n'));
+const submittedBefore12 = submitted.length;
+intervalFn();
+assert.equal(submitted.length, submittedBefore12 + 1, '空闲应投递例行进度汇报');
+assert.equal(submitted[submitted.length - 1].chatId, -100888, '投递进协作群（表头群 id，回答即汇报）');
+assert.match(submitted[submitted.length - 1].blocks[0].text, /例行进度汇报：①本单进展到哪一步 ②下一步干什么 ③需要解决的问题（无也要报无）/, '固定提示词一字不改');
+assert.match(submitted[submitted.length - 1].blocks[0].text, /<例行汇报（系统触发，无需回复此段）>/, '系统触发头尾（领活同款形状）');
+assert.doesNotMatch(readTaskTable(), /⏰ 汇报请求/, '投递前剥标记（master 下拍重落，不堆积）');
+assert.match(readTaskTable(), /前情/, '前情结论保留');
+// 12b 忙（在途回合未清）+ 标记旧（6 分钟 > 4 分钟门槛）→ 只刷新标记不投递（防堆叠）
+chatMailboxes.set(-100888, { running: true, pending: [] });
+__fs.writeFileSync(TASK_TABLE_PATH, [
+  '# t',
+  '> 协作群 chat id: -100888',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 50 | 汇报的活 | 002bot | 进行中 | 前情；⏰ 汇报请求(' + stampAgo12(6) + ') |',
+].join('\\n'));
+const oldStamp12 = readTaskTable().match(/⏰ 汇报请求\\((\\d{2}-\\d{2} \\d{2}:\\d{2})\\)/)[1];
+intervalFn();
+assert.equal(submitted.length, submittedBefore12 + 1, '忙时不许投递（followup 排队语义下再排只会堆积）');
+const tableAfter12b = readTaskTable();
+assert.doesNotMatch(tableAfter12b, new RegExp(oldStamp12), '旧时间戳要被刷掉（=活着证明，master 判龄依据）');
+assert.match(tableAfter12b, /⏰ 汇报请求\\(\\d{2}-\\d{2} \\d{2}:\\d{2}\\)/, '标记还在（master 侧按新鲜在途跳过，不升级）');
+assert.match(tableAfter12b, /前情/, '前情保留');
+// 12b2 忙 + 标记新鲜（< 4 分钟门槛）→ 零写表零投递（防 5 秒轮询刷屏写表）
+__fs.writeFileSync(TASK_TABLE_PATH, tableAfter12b);
+const snap12b2 = readTaskTable();
+intervalFn();
+assert.equal(submitted.length, submittedBefore12 + 1, '标记新鲜+忙 → 零投递');
+assert.equal(readTaskTable(), snap12b2, '标记新鲜+忙 → 零写表');
+chatMailboxes.delete(-100888);
+// 12c 反向：无标记的进行中行 / 已发布行 → 零投递零写表
+__fs.writeFileSync(TASK_TABLE_PATH, [
+  '# t',
+  '> 协作群 chat id: -100888',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 51 | 无标记的活 | 002bot | 进行中 | — |',
+  '| 52 | 已发布的活 | 002bot | 已发布 | ✅ 老板已通过 |',
+].join('\\n'));
+const snap12c = readTaskTable();
+intervalFn();
+assert.equal(submitted.length, submittedBefore12 + 1, '无标记/已发布 → 零投递');
+assert.equal(readTaskTable(), snap12c, '无标记/已发布 → 零写表（master 没落请求就没汇报）');
+// 12d 领活占位剥陈旧标记：待领取行结论带旧标记 → 领活时剥掉（新单从干净汇报账起步，
+//     防上单遗留的旧标记被 master 按龄误判「2 周期未报」直接升级）
+__fs.writeFileSync(TASK_TABLE_PATH, [
+  '# t',
+  '> 协作群 chat id: -100888',
+  '| # | 任务 | 负责 | 状态 | 验收结论 |',
+  '|---|---|---|---|---|',
+  '| 53 | 新领的活 | 002bot | 待领取 | 旧账；⏰ 汇报请求(10-08 20:00) |',
+].join('\\n'));
+intervalFn();
+assert.equal(submitted.length, submittedBefore12 + 2, '待领取照常领（#6 行为不回退）');
+assert.match(submitted[submitted.length - 1].blocks[0].text, /领到 #53/, '领的是 53 单');
+assert.match(readTaskTable(), /\\| 53 \\| 新领的活 \\| 002bot \\| 进行中 \\| 旧账 \\|/, '占位后陈旧标记剥净');
+assert.doesNotMatch(readTaskTable(), /⏰ 汇报请求/, '表上不再有旧标记');
+watchTaskTable(); // 换回主 bot tick（同第 10 组后规矩）
+
+console2.log('bot.js 侧 12 组断言全过');
 `;
 
 // ---------- index.js 侧测试 ----------
