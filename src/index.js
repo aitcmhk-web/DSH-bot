@@ -36,6 +36,7 @@ import { LiveStatus, describeTool } from './status.js';
 import { transcribe, configure as configureAsr, currentBackend } from './asr.js';
 import { installApprovalBridge } from './approval-bridge.js';
 import { createHardRulesHandler, HARD_RULES_EVERY_N } from './hard-rules.js';
+import { createSourceGuardInstaller } from './source-guard.js';
 import { createHerdWatchdog, HERD_GROUP_FALLBACK } from './herd.js';
 import { makeMgmtState, mgmtRoundTick, fireMgmtRound, MGMT_CHAT_KEY } from './mgmt-round.js';
 import { createTaskTriggers } from './triggers.js';
@@ -1011,6 +1012,24 @@ export function apply(ctx, config) {
     log(`最高指令已挂载（${mounted} 处 / 第 1 步 + 每 ${HARD_RULES_EVERY_N} 步 / ${hardRulesText.length} 字）：${HARD_RULES_PATH.pathname}`);
   } else {
     log(`最高指令文件为空或不存在，跳过挂载：${HARD_RULES_PATH.pathname}`);
+  }
+
+  // -------------------------------------------------------------------------
+  // 来源闸（source-guard）：结论不标来源就打回（拦截型）
+  // -------------------------------------------------------------------------
+  // 用户 2026-10-08 定：只靠「每若干步注入一次最高指令」是提示型，看不到就漏 ——
+  // 要一道**拦得住**的闸。机制：`agent/turn-stopping` 在回合即将关闭时触发，此时
+  // `agent.steer(...)` 会往 next-step inbox 塞消息，loop 重读 inbox 后**不关回合、再走一步**
+  // （@deepseek-ai/dsh-agent-loop/lib/index.js:998-1005、809-811）—— 正好用来打回补档位。
+  // 实现抽在 `src/source-guard.js`，文件头写了机制、「双挂载去重」「同回合只打回一次」两个坑。
+  {
+    const installSourceGuard = createSourceGuardInstaller({ log: (msg) => log(msg) });
+    const sgTargets = ctx.root && ctx.root !== ctx ? [ctx, ctx.root] : [ctx];
+    let sgMounted = 0;
+    for (const target of sgTargets) {
+      if (installSourceGuard(target)) sgMounted += 1;
+    }
+    log(`来源闸已挂载（${sgMounted} 处）：收尾未标来源档位会被打回补一次`);
   }
 
   // -------------------------------------------------------------------------
@@ -2561,16 +2580,25 @@ export function apply(ctx, config) {
     if (!telegram || !Number.isInteger(chatId)) throw new Error(`协作群 id 不可用（${raw ?? '无'}）`);
     return telegram.sendRich(chatId, text);
   };
-  const herd = createHerdWatchdog({
-    root: herdDir,
-    lockPath: join(herdDir, '.herd.lock'),
-    readTable: readTaskTable,
-    writeTable: writeTaskTable,
-    announce: announceGroup,
-    log,
-    error,
-  });
-  herd.start();
+  // 角色门（老板 2026-10-08 令「把插件版的看门狗去掉」+ #32 验收口径①）：只有 BOT_ROLE=master
+  // 的实例才挂 —— 审核实例（默认，即插件版 @newdshbot）与小工实例（BOT_ROLE=worker）不挂、
+  // 不播报、不抢 .herd.lock；看门狗能力由主 bot 侧 bot.js 老 herd 独跑承担，交接后再归这里。
+  // 门控条件与下方 #33 taskTriggers 一字同款（同一份角色门口径，第 1 条）。
+  let herd = null;
+  if (String(process.env.BOT_ROLE ?? '').trim() === 'master') {
+    herd = createHerdWatchdog({
+      root: herdDir,
+      lockPath: join(herdDir, '.herd.lock'),
+      readTable: readTaskTable,
+      writeTable: writeTaskTable,
+      announce: announceGroup,
+      log,
+      error,
+    });
+    herd.start();
+  } else {
+    log('[herd] 本实例非 master（BOT_ROLE 未设 = 审核模式）—— 小工看门狗不开（归主 bot 实例）');
+  }
 
   // ---- 主 bot 侧任务表自动触发（任务 #33，2026-10-08：bot.js watchTaskTable 的插件等价）----
   // 每 5 分钟（与看门狗同拍）扫任务表：「待验收」→ 群发「🔔 验收触发 #N」+ 行占位「验收中」
@@ -2611,7 +2639,7 @@ export function apply(ctx, config) {
     state.stopped = true;
     if (taskTimer) clearInterval(taskTimer);
     if (hbTimer) clearInterval(hbTimer);
-    herd.stop(); // 看门狗定时器 + .herd.lock（只删自己的锁）
+    herd?.stop(); // 看门狗定时器 + .herd.lock（只删自己的锁；非 master 实例未挂 = 空转）
     taskTriggers?.stop(); // 触发器定时器 + .trigger.lock（#33；没 start 过则空转）
     approvalBridge?.dispose();
     pollAbort?.abort();
