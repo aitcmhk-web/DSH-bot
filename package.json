@@ -1,6 +1,6 @@
 {
   "name": "dsh-botplugin",
-  "version": "1.0.46",
+  "version": "1.0.47",
   "description": "Telegram and WeChat bridges plus handoff continuity for DeepSeek Harness (DSH)",
   "keywords": [
     "dsh-plugin",
@@ -30,6 +30,7 @@
   "files": [
     "src",
     "vendor",
+    "sync-model-blocks.mjs",
     "cordis.patch.yml",
     "setupbot.sh",
     "setup-bot.sh",
@@ -44,6 +45,7 @@
     "使用说明.txt",
     "test-image-admit.mjs",
     "test-image-e2e.mjs",
+    "test-model-sync.mjs",
     "test-route-display.mjs",
     "test-sticky-pick.mjs",
     "test-sticky-pick-child.mjs",

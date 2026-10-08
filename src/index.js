@@ -32,6 +32,7 @@ import { BotRuntime } from './runtime.js';
 import { Hub, makeMessage, markAsHubOutput } from './hub.js';
 import { buildRoutes, routeByKey, routeFor, describeRoute, isRouteFailure, reasoningEffortFor } from './models.js';
 import { readWebLlmPiAi, readWebLlmDeepseek, webPatchPath } from './web-patch.js';
+import { syncOwnProfileFromWeb } from './model-sync.js';
 import { LiveStatus, describeTool } from './status.js';
 import { transcribe, configure as configureAsr, currentBackend } from './asr.js';
 import { installApprovalBridge } from './approval-bridge.js';
@@ -415,6 +416,24 @@ export function createInstanceLock({ lockPath, log, error }) {
  */
 export function apply(ctx, config) {
   const { log, error } = makeLog(config.logLabel);
+
+  // -------------------------------------------------------------------------
+  // 插件版自愈：把 web 的模型块并集补齐进**本 profile**（2026-10-09 定案）
+  // -------------------------------------------------------------------------
+  // 为什么非做不可：菜单读的是 web 的 patch，但 `dsh-llm-pi-ai` 注册 adapter 只认本 profile
+  // 组合出来的 `config.providers`，而 web→profile 的广播只覆盖 web / desktop。于是 web 里
+  // 新加的 provider 在插件菜单里看得见、一选就 `no adapter registered for provider "xxx"`
+  // （用户报障：xiaomi-token-plan-cn）。这里补上那一环，写完由 HMR 触发 pi-ai 重新注册。
+  // 纪律：只增不改不删；只写本 profile，绝不写 web；失败绝不影响插件启动。
+  try {
+    const r = syncOwnProfileFromWeb({ log: (m) => log(String(m)) });
+    if (r.action === 'written') {
+      log(`[modelsync-plugin] 本 profile 模型块已补齐（${r.blocks.join(' / ')}），等待 HMR 重新注册`);
+    }
+  } catch (err) {
+    error(`[modelsync-plugin] 同步失败（已忽略，不影响启动）：${(err && err.message) || err}`);
+  }
+
   const state = {
     stopped: false,
     ownerUserId: null,
