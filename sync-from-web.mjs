@@ -794,7 +794,10 @@ function extractProviderBlocks(text, webProviders) {
 
 /**
  * 从现有 patch 文本里抽出「非 llm-pi-ai」的顶层块（含其前的注释）。
- * 以 `- id: xxx` 为块起点，到下一个 `- id:` 或文件尾为终点。
+ * 以 `- id: xxx` 为块起点，到下一个块的头部注释起点（或文件尾）为终点。
+ * ⚠️ #37（2026-10-08）：终点不能用下一个 `- id:` 行 —— 否则下一块的头部注释
+ *    会先被算进本块尾部、下一块自己又「向上吸收」一遍 → 每跑一次同步凭空多一份注释
+ *    （实测：LLITE 门控注释 09-30 起每次 bot 启动 +1 遍，堆到 333 遍）。
  */
 function extractOtherBlocks(text) {
   const lines = text.split('\n');
@@ -803,10 +806,15 @@ function extractOtherBlocks(text) {
     if (/^- id:/.test(lines[i])) starts.push(i);
   }
   if (starts.length === 0) return '\n';
+  // 每块先算「头部注释起点」（向上吸收紧邻的注释行，遇非注释/空行停）
+  const heads = starts.map((from) => {
+    let begin = from;
+    while (begin > 0 && /^\s*#/.test(lines[begin - 1])) begin--;
+    return begin;
+  });
   const chunks = [];
   for (let s = 0; s < starts.length; s++) {
     const from = starts[s];
-    const to = s + 1 < starts.length ? starts[s + 1] : lines.length;
     const id = lines[from].replace(/^- id:\s*/, '').trim();
     // ⚠️ 这两个块**由 Web 端同步生成**，不从旧文件照搬（照搬 = Web 端改动永远进不来）：
     //    · llm-pi-ai      → extractWebProviderBlocks() 生成
@@ -815,10 +823,9 @@ function extractOtherBlocks(text) {
     //    此前 llm-deepseek 被当成「手工块」原样保留，导致 BOT 端手写了 models 数组
     //    并写死第三个模型 deepseek-v4-flash —— 出厂表里根本没有它，且会随 DSH 升级漂移。
     if (id === 'llm-pi-ai' || id === 'llm-deepseek') continue;
-    // 往上吸收紧邻的注释行（属于这个块的说明）
-    let begin = from;
-    while (begin > 0 && /^\s*#/.test(lines[begin - 1])) begin--;
-    chunks.push(lines.slice(begin, to).join('\n').replace(/\s+$/, ''));
+    // 本块范围 = 头部注释起点 → 下一块头部注释起点（注释只归属一次，不重不漏）
+    const to = s + 1 < starts.length ? heads[s + 1] : lines.length;
+    chunks.push(lines.slice(heads[s], to).join('\n').replace(/\s+$/, ''));
   }
   return chunks.length ? '\n' + chunks.join('\n\n') + '\n' : '\n';
 }
@@ -912,10 +919,25 @@ function main() {
               console.log(`[websync]    跳过实例 profile ${dir}（没有 cordis.patch.yml）`);
               continue;
             }
+            // ⚠️ #37（2026-10-08）：必须**逐份用该 profile 自己的 patch 为底重建**，
+            //    不能拿主 profile 的成品 patchText 整份覆盖 —— agent-instructions 门控
+            //    （DSH_WORKER_INSTRUCTIONS 三分支）是各实例自己的非托管内容，小工和
+            //    主 bot 不一样；拿主 bot 版盖过去会把小工门控冲回两分支（07:42 部署车
+            //    换上的三分支 09:53 就这么被冲掉）。托管块（llm-pi-ai / llm-deepseek）
+            //    的权威源仍是 Web 端 settings，各份一致；其余块各归各（AGENTS.md 第 1 条）。
+            let ownExisting = null;
+            try {
+              ownExisting = readFileSync(p, 'utf8');
+            } catch {
+              ownExisting = null;
+            }
+            // 读得到自己的旧 patch → 以它为底重建（非托管内容原样保留）；
+            // 读不到 → 退回主 profile 的成品（首次装机兜底，维持原行为）。
+            const perProfileText = ownExisting !== null ? buildPatch(settings, ownExisting) : patchText;
             const tmp2 = p + '.tmp-' + process.pid;
-            writeFileSync(tmp2, patchText);
+            writeFileSync(tmp2, perProfileText);
             renameSync(tmp2, p);
-            console.log(`[websync] ✅ 已同步 provider 表 → ${p}`);
+            console.log(`[websync] ✅ 已同步 provider 表 → ${p}（以该 profile 自己的 patch 为底重建）`);
           } catch (err2) {
             console.error(`[websync] ⚠️  实例 provider 表写入失败（${err2.code ?? err2.message}）: ${p}`);
           }
