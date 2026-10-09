@@ -42,6 +42,7 @@ import { makeMgmtState, mgmtRoundTick, fireMgmtRound, MGMT_CHAT_KEY } from './mg
 import { progressReportTick } from './progress-report.js';
 import { createTaskTriggers } from './triggers.js';
 import { createMailboxWatcher } from './mailbox.js';
+import { createFinalReview } from './final-review.mjs'; // #64 终审卡 DSH 侧宿主接线
 
 /** Cordis 插件名。 */
 export const name = 'botplugin';
@@ -1652,6 +1653,8 @@ export function apply(ctx, config) {
     if (!authorize(userId).ok) return;
     // 审批按钮（appr:ok:/appr:no:）优先于模型菜单处理。
     if (approvalBridge?.handleApprovalCallback(data, query)) return;
+    // 终审卡（任务 #64）：fin:ok:/fin:no: 前缀 → 终审投递件（env 门控，未启用即让位）。
+    if (finalReview && (await finalReview.handleCallback(query))) return;
     // 审核卡（任务 #15 建、#20 改）：✅ → 群发「通过 #N」（主 bot 接力发版）；❌ → edit
     //   卡片提示 + 另发一条 ForceReply 原因条（#20：老板 tap 引用即弹键盘直输原因，不用
     //   手打格式），老板回复原因条 → 拼成「打回 #N：原因」群发（格式一字不改，主 bot 闭环
@@ -2365,6 +2368,10 @@ export function apply(ctx, config) {
         }
         // 审核卡（任务 #15）：同一轮询顺带扫「待审核」行 → 协作群卡片（REVIEWER_MODE 才开）
         reviewTick(table);
+        // 终审卡（任务 #64）：同拍扫 待审-*.json → 发终审卡（env 门控，默认关零动作）
+        void finalReview?.tick().catch((err) => {
+          error(`[终审] 轮询失败: ${err?.message ?? err}`);
+        });
       } catch (err) {
         error(`[任务表] 轮询失败: ${err?.message ?? err}`);
       }
@@ -2386,6 +2393,26 @@ export function apply(ctx, config) {
   const REVIEW_GROUP_FALLBACK = '-5334440553'; // 协作群兜底（表头有「协作群 chat id」时以表头为准）
   /** 已成功发出卡的 #N（防 5 秒轮询重复发）。 */
   const reviewCardsSent = new Set();
+
+  // -------------------------------------------------------------------------
+  // 终审核卡·DSH 侧宿主接线（任务 #64，#57 交付的 createFinalReview）。
+  // env 门控：AITCM_终审卡目录 默认关（未设 = 零行为变化）；设了才建投递器。
+  // groupId 群 id 取法照 #39：表头优先、兜底协作群（同 REVIEW_GROUP_FALLBACK）。
+  // ownerUserId 现有身份门来源 = state.ownerUserId（与审核卡同源，⛔ 不新增第二处）。
+  // -------------------------------------------------------------------------
+  const FINREVIEW_DIR = String(process.env.AITCM_终审卡目录 ?? '').trim();
+  const finalReview = FINREVIEW_DIR
+    ? createFinalReview({
+        telegram,
+        watchDir: FINREVIEW_DIR,
+        groupId: groupChatIdFromTable() ?? REVIEW_GROUP_FALLBACK,
+        ownerUserId: state.ownerUserId,
+        log,
+        error,
+      })
+    : null;
+  if (finalReview) log(`[终审] 终审卡投递已启用（watchDir=${FINREVIEW_DIR}）`);
+
 
   // -------------------------------------------------------------------------
   // 打回原因 ForceReply（任务 #20，2026-10-07）：点 ❌ 后除卡片提示外，另发一条
@@ -2423,6 +2450,8 @@ export function apply(ctx, config) {
   /** 老板对原因条的回复（#20）。返回 true = 本条已消费，调用方不要再当普通消息走。
    *  ⚠️ 必须挂在 handleTelegramMessage 群模式过滤之前：群里回复不带 @点名，晚了会被静默丢。 */
   async function handleRejectReasonReply(message) {
+    // 终审卡（任务 #64）：终审原因条的回复先分流给终审投递件（登记表独立于 pendingRejects）。
+    if (finalReview && (await finalReview.noteReply(message))) return true;
     const promptMsgId = message?.reply_to_message?.message_id;
     if (!promptMsgId || !pendingRejects.has(promptMsgId)) return false;
     // 身份门：只有老板的回复算数（老板 id 唯一来源 state.ownerUserId，与卡片回调同源）。
