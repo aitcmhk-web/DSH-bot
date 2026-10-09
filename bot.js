@@ -37,6 +37,9 @@ import {
   isRouteFailure,
   reasoningEffortFor,
 } from './models.js';
+// #45（2026-10-09）：例行管理回合（#34）的真身接线。逻辑/提示词/节奏的唯一权威源
+// 是 src/mgmt-round.js（插件侧同用一份），本文件只接拍子与投递，⛔ 不复制第二份逻辑。
+import { makeMgmtState, mgmtRoundTick, MGMT_ROUND_PROMPT } from './src/mgmt-round.js';
 
 // ⚠️ 必须在 loadEnv() **之前**拿到 .env 的原始值做快照。
 // 原因（2026-09-19 实测踩坑）：env.js 的规则是「真实环境变量优先于 .env」，
@@ -1910,7 +1913,13 @@ function herdTick(now = Date.now(), kick = defaultWorkerKick) {
 function watchWorkerHerd() {
   setInterval(() => {
     try {
-      if (!shuttingDown) herdTick();
+      if (!shuttingDown) {
+        // #45：每拍先落一行活体心跳 —— 日志停摆=假活信号（第 6 条 11）。旧版只在
+        // 出问题时才出声，「巡检在跑、一切健康」和「拍子死了」在日志上分不开。
+        console.log(`[${_ts()}][herd] 看门狗心跳正常（每 ${HERD_CHECK_MS / 60000} 分钟巡检拍子在跑）`);
+        heartbeatMgmtRound(); // #34/#45 管理回合同拍判定（tick 内自判距上次 ≥30 分钟；自带异常隔离）
+        herdTick();
+      }
     } catch (err) {
       console.error(`[${_ts()}][herd] 巡检失败: ${err?.stack ?? err?.message}`);
     }
@@ -3884,6 +3893,46 @@ try {
 
   hubReady = true;
   console.log(`[${_ts()}][hub] 节点已就绪，端点: [${hub.ids().join(', ')}]`);
+}
+
+// ---- 例行管理回合接线（#45，2026-10-09；#34 的 bot.js 主实例真身）--------
+// 根因备案：#34 的自醒逻辑只接在插件 src/index.js 里，但主 bot 进程从未挂载该插件
+//（✅ launchd.log「已挂载 — 入口」零命中；插件只在插件版跑且 BOT_ROLE 门把它挡住）
+// → [mgmt-round] 永远零跳动。本接线把自醒接进真正跑主 bot 的本文件：
+//   - 逻辑/提示词/节奏 import 自 src/mgmt-round.js（第 1 条，不复制第二份）；
+//   - 拍子复用 watchWorkerHerd 的 5 分钟巡检（同拍，⛔ 不新造定时器）；
+//   - 投递走本文件现成 submitTurn 信箱（忙时合包自带防堆叠），回答照常落协作群，
+//     正好满足 #34 「③收尾给协作群一句话」。
+// 位置注意：本块在 test-tasktable.mjs 的 bot.js 切片（TASK_TABLE_PATH→handleMessage）
+// 之外，顶层 const 的初始化不进测试 eval；heartbeatMgmtRound 由 watchWorkerHerd 调用。
+const mgmtState = makeMgmtState();
+mgmtState.lastFiredAt = Date.now(); // 首回合 = 启动后约 30 分钟；不在每次重启后立刻补打一枪
+
+function heartbeatMgmtRound() {
+  try {
+    mgmtRoundTick(mgmtState, {
+      fire: () => {
+        const groupId = groupChatIdFromTable();
+        const chatId = groupId ? Number(groupId) : state.ownerUserId;
+        if (!chatId) throw new Error('协作群 id 与 ownerUserId 均不可用，管理回合无处投递');
+        submitTurn(chatId, [
+          {
+            type: 'text',
+            text: [
+              '<例行管理回合（系统触发，无需回复此段）>',
+              MGMT_ROUND_PROMPT, // 固定提示词，一字不改（权威源 src/mgmt-round.js）
+              '</例行管理回合>',
+            ].join('\n'),
+          },
+        ]);
+        console.log(`[${_ts()}][mgmt-round] 提示词已投递 → chat ${chatId}`);
+      },
+      log: (m) => console.log(`[${_ts()}]${m}`),
+      error: (m) => console.error(`[${_ts()}]${m}`),
+    }, Date.now());
+  } catch (err) {
+    console.error(`[${_ts()}][mgmt-round] tick 异常: ${err?.stack ?? err?.message}`);
+  }
 }
 
 // ---- 协作任务表轮询（主 bot = 验收/发布；派活逻辑见 watchTaskTable 头注释）----

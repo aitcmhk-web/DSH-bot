@@ -277,7 +277,8 @@ export function herdTick(state, deps, now = Date.now(), kick) {
  *  - 持有者活着且心跳新鲜（或缺心跳）→ 让位，won=false
  *  - 持有者活着但心跳停 > HERD_LOCK_STALE_MS（半瘫：定时器不再走）→ 接管，tookOver=true
  *  - 持有者已死/内容坏 → 接管，tookOver=true
- *  - 文件系统出错 → fail-closed：不跑看门狗（双重 kickstart 比没人看护更糟），won=false */
+ *  - 文件系统出错 → won=false + 显式日志，拍子照挂每拍重试（#45：一次抖动不许永久哑火；
+ *    错误期间谁都选不上 = 天然 fail-closed，无双主风险） */
 export function claimHerdLock(lockPath, now = Date.now()) {
   const serialize = () => `${JSON.stringify({ pid: process.pid, heartbeat: now })}\n`;
   try {
@@ -361,9 +362,10 @@ export function createHerdWatchdog(deps) {
     const c = claimHerdLock(deps.lockPath, Date.now());
     if (!c.won) {
       if (c.error) {
-        // 文件系统出错：fail-closed（巡检与管理回合都停，双重 kickstart 比没人看护更糟）。
-        deps.error?.(`[herd] .herd.lock 不可用（${c.error}）—— 停止巡检与附带任务`);
-        stop();
+        // #45（2026-10-09）：不再 stop() 永久停摆 —— 本拍选不上 = 不巡检不跑附带任务
+        //（fail-closed 语义仍在：双重 kickstart 比没人看护更糟），但拍子保留下拍重试；
+        // 错误持续期间每拍一条显式日志，不静默。
+        deps.error?.(`[herd] .herd.lock 不可用（${c.error}）—— 本拍跳过巡检与附带任务，下拍重试`);
         return;
       }
       // 从属拍：别人在看护，本拍只跑附带任务（管理回合），下拍再试选主。
@@ -389,7 +391,12 @@ export function createHerdWatchdog(deps) {
     }
     if (!c.won) {
       if (c.error) {
-        deps.error?.(`[herd] .herd.lock 不可用（${c.error}）—— 本实例不开巡检`);
+        // #45（2026-10-09）：文件系统出错 ≠ 有人持锁 —— 原实现直接 return（不挂定时器），
+        // 一次 EACCES/ENOSPC 抖动 = 看门狗永久哑火。现在照挂拍子每拍重试选主，错误持续
+        // 期间每拍一条显式日志，不静默（claim 是唯一闸门，错误期间谁都选不上，无双主风险）。
+        deps.error?.(`[herd] .herd.lock 不可用（${c.error}）—— 照挂拍子，每拍重试选主`);
+        timer = setInterval(tick, HERD_CHECK_MS);
+        if (timer.unref) timer.unref();
         return false;
       }
       // 从属模式：不停定时器（#32 缺口补丁）——持锁者死透后全机要有人接管。
