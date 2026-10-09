@@ -40,6 +40,10 @@ import {
 // #45（2026-10-09）：例行管理回合（#34）的真身接线。逻辑/提示词/节奏的唯一权威源
 // 是 src/mgmt-round.js（插件侧同用一份），本文件只接拍子与投递，⛔ 不复制第二份逻辑。
 import { makeMgmtState, mgmtRoundTick, MGMT_ROUND_PROMPT } from './src/mgmt-round.js';
+// #49（2026-10-09）：报错箱监听（#46）的真身接线。监听/偏移/注入文本的唯一权威源
+// 是 src/mailbox.js（插件侧 src/index.js 同用一份，那条接线原样保留），本文件只接
+// 角色门与投递，⛔ 不复制第二份逻辑。
+import { createMailboxWatcher } from './src/mailbox.js';
 
 // ⚠️ 必须在 loadEnv() **之前**拿到 .env 的原始值做快照。
 // 原因（2026-09-19 实测踩坑）：env.js 的规则是「真实环境变量优先于 .env」，
@@ -3626,6 +3630,13 @@ function shutdown(signal) {
   console.log(`\n[bot] ${signal} received, shutting down…`);
   abortController.abort();
   releaseInstanceLock();
+  // #49：报错箱监听收尾（关 watch/保险巡检、放 .mailbox.lock）——失败不连累关机流程
+  //（锁残留也有 claim 的「失联残留」显式接管兜底，见 src/herd.js）。
+  try {
+    mailboxWatcher?.stop();
+  } catch {
+    /* 锁不存在或已释放 —— 没什么要收的 */
+  }
 
   // ⚠️ 2026-09-19 修「重启撞 409 自杀」的第二半（第一半在 restart-helper.sh 杀进程组）：
   //    原来这里 `.finally(() => process.exit(0))` —— 一旦 runtime.stop() 抛错或超时，
@@ -3933,6 +3944,43 @@ function heartbeatMgmtRound() {
   } catch (err) {
     console.error(`[${_ts()}][mgmt-round] tick 异常: ${err?.stack ?? err?.message}`);
   }
+}
+
+// ---- 报错箱监听接线（#49，2026-10-09；#46 的 bot.js 主实例真身）--------
+// 根因备案：#46 的接线只接在插件 src/index.js 里，但主 bot 进程从未挂载该插件
+//（✅ launchd.log 14:52 启动「已挂载」仅 hard-rules/source-guard 两件）→ 15:00 测试行
+// 追加后主bot零反应（launchd.log 零 [报错箱] 行、.mailbox.offset.json/.mailbox.lock
+// 均不存在 = 监听从未启动）。同 #45「警报器装在了别人家」根因家族。本接线把监听
+// 接进真正跑主 bot 的本文件：
+//   - 监听/偏移/选主/注入文本 import 自 src/mailbox.js（第 1 条，不复制第二份）；
+//     src/index.js 插件侧接线原样保留（将来迁插件架构仍可用）；
+//   - 角色门与插件侧同款口径：只有 master 实例挂（worker 不开，报错只叫醒主bot），
+//     .mailbox.lock 选主兜底双 master 误配；
+//   - 注入腿用本文件现成 submitTurn（#45 mgmt-round 同腿；TG 平台光落文件叫不醒会话）。
+//     ⚠️ 语义差异必须钉死在这里：插件侧 inject 走 promptFromHub 跑完整轮次、失败返回
+//     {ok:false} 可重投；本侧 submitTurn 是「进会话信箱=本腿职责完成」（忙时合包，
+//     恒不返回失败）——若照搬不回 {ok:true}，mailboxTick 会永远判「注入失败」、偏移
+//     永不推进、每 60s 重投死循环。轮次级失败由 drainMailbox/runPrompt 日志负责；
+//     报错箱本体（报错箱.md）是持久留痕，注入只是叫醒腿，不因轮次失败丢报错。
+let mailboxWatcher = null;
+if (BOT_ROLE === 'master') {
+  mailboxWatcher = createMailboxWatcher({
+    dir: APP_DIR, // 报错箱.md / .mailbox.lock / .mailbox.offset.json 都在 bot 目录（与插件侧 herdDir 同一处）
+    lockPath: join(APP_DIR, '.mailbox.lock'),
+    inject: (chatId, text) => {
+      submitTurn(chatId, [{ type: 'text', text }]);
+      return { ok: true }; // 进会话信箱 = 本腿完成（语义差异见上注释，⛔ 不可省）
+    },
+    chatId: () => {
+      const g = groupChatIdFromTable();
+      return g ? Number(g) : state.ownerUserId; // 与插件侧同款兜底（群 id 缺失时私聊）
+    },
+    log: (m) => console.log(`[${_ts()}]${m}`),
+    error: (m) => console.error(`[${_ts()}]${m}`),
+  });
+  mailboxWatcher.start();
+} else {
+  console.log(`[${_ts()}][报错箱] 本实例是 worker —— 报错箱监听不开（归主 bot 实例）`);
 }
 
 // ---- 协作任务表轮询（主 bot = 验收/发布；派活逻辑见 watchTaskTable 头注释）----
