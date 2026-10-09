@@ -258,6 +258,8 @@ function loadState() {
     routeKey: null,
     lastUpdateId: null,
     inFlight: null,
+    // #40（2026-10-09 补）：worker 名下的活（{ no, chatId }）——重启后启动自检①靠它判丢单重投
+    workerTask: null,
   });
   if (!existsSync(STATE_FILE)) return blank();
   try {
@@ -275,6 +277,13 @@ function loadState() {
       // `finally`. See `warnAboutLostTurn()` for why this is advisory only.
       inFlight:
         parsed.inFlight && typeof parsed.inFlight === 'object' ? parsed.inFlight : null,
+      // #40（2026-10-09 补）：白名单放行 workerTask —— ⛔ 不放行 = 领活时 saveState 写进盘、
+      // 重启 loadState 又丢掉（本 loader 是白名单，缺的字段下一次存盘就被丢），
+      // 启动自检①（resubmitLostWorkerClaim）永远查不到 = 等于没接。
+      workerTask:
+        parsed.workerTask && typeof parsed.workerTask === 'object' && parsed.workerTask.no != null
+          ? parsed.workerTask
+          : null,
     };
   } catch (err) {
     console.error(`[state] ignoring unreadable ${STATE_FILE}: ${err.message}`);
