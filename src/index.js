@@ -41,6 +41,7 @@ import { createHerdWatchdog, HERD_GROUP_FALLBACK } from './herd.js';
 import { makeMgmtState, mgmtRoundTick, fireMgmtRound, MGMT_CHAT_KEY } from './mgmt-round.js';
 import { progressReportTick } from './progress-report.js';
 import { createTaskTriggers } from './triggers.js';
+import { createMailboxWatcher } from './mailbox.js';
 
 /** Cordis 插件名。 */
 export const name = 'botplugin';
@@ -2648,6 +2649,34 @@ export function apply(ctx, config) {
     log('[触发器] 本实例非 master（BOT_ROLE 未设 = 审核模式）—— 任务表自动触发不开（归主 bot 实例）');
   }
 
+  // ---- 报错箱监听（任务 #46，2026-10-09：插件版→主bot 单向报错直通口）----
+  // 插件版撞到错就往 <bot目录>/报错箱.md 末尾追加一行（格式约定见该文件头部注释），
+  // 这里见新行即把「📬 报错箱新条目：<原文>」注入本会话 —— 注入腿与上方 #33 taskTriggers
+  // 一字同款（enqueue + promptFromHub；TG 平台不投 bot 发言，注入才叫得醒）。
+  // fs.watch + 防抖 + 字节偏移增量读、偏移落 .mailbox.offset.json 防重启重放、
+  // 60s 保险巡检兜底 watch 漏报 —— 机制详见 src/mailbox.js 头注释。
+  // 答复不回信箱：走任务表对应行结论列；处理完在该报错行行尾补「已答→#N」。
+  // 角色门与上方 herd/taskTriggers 一字同款（同一份角色门口径，第 1 条）：只有
+  // BOT_ROLE=master 的实例挂 —— 审核实例与 worker 实例不开，报错只叫醒主bot会话；
+  // .mailbox.lock 选主兜底双 master 误配。
+  let mailboxWatcher = null;
+  if (String(process.env.BOT_ROLE ?? '').trim() === 'master') {
+    mailboxWatcher = createMailboxWatcher({
+      dir: herdDir,
+      lockPath: join(herdDir, '.mailbox.lock'),
+      inject: (chatId, text) => enqueue(`tg:${chatId}`, () => promptFromHub({ source: 'tg', chatId, text, raw: null })),
+      chatId: () => {
+        const g = groupChatIdFromTable();
+        return g ? Number(g) : state.ownerUserId; // 与 taskTriggers 同款兜底（群 id 缺失时私聊）
+      },
+      log,
+      error,
+    });
+    mailboxWatcher.start();
+  } else {
+    log('[报错箱] 本实例非 master（BOT_ROLE 未设 = 审核模式）—— 报错箱监听不开（归主 bot 实例）');
+  }
+
   // （互为看门狗 #11 已按老板令于 2026-10-07 整体删除：互相保活=互相误杀，把健康的
   //   主 bot 反复 kickstart 勒死——任务表 #12/#13 有案。当时为它加的 [hb] 心跳保留，
   //   日志活性对人工排查有用，已无人拿它当判死依据。）
@@ -2662,6 +2691,7 @@ export function apply(ctx, config) {
     if (hbTimer) clearInterval(hbTimer);
     herd?.stop(); // 看门狗定时器 + .herd.lock + 管理回合拍子 + #41 汇报巡检拍子（#34/#41 均无自有定时器/锁，随 herd 停；非 master 实例未挂 = 空转）
     taskTriggers?.stop(); // 触发器定时器 + .trigger.lock（#33；没 start 过则空转）
+    mailboxWatcher?.stop(); // 报错箱 watch + 保险巡检 + .mailbox.lock（#46；没 start 过则空转）
     approvalBridge?.dispose();
     pollAbort?.abort();
     wxAbort?.abort();

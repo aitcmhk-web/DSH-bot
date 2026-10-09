@@ -2,6 +2,9 @@ node_modules/
 weixin-account.json
 .botplugin-state.json
 .botplugin.lock
+.mailbox.offset.json
+.mailbox.lock
+报错箱.md
 *.log
 .DS_Store
 *.bak.*
