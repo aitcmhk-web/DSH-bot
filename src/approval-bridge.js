@@ -273,6 +273,31 @@ export function installApprovalBridge({
     return telegram[method](...args);
   };
 
+  // #48（2026-10-09）：审批卡片发送的 429 感知重试。
+  // 为什么：telegram.js 的口径是「400/429 不重试，原样抛给调用方」（src/telegram.js:21），
+  // 而审批卡片恰恰是最贵的失败点 —— 卡片发不出去 = 桥让位（next()）= 无应答者 =
+  // 秒回「no approval channel is available」。dshbot/bot.log 实锤：通道当天多次正常
+  // 放行（07:53/12:39/12:50/13:22×3），而 12:38/14:04/14:10 三次断通道全是
+  // `sendMessage: Too Many Requests: retry after N` —— 通道没坏，是被限流打断的。
+  // 规矩：只对 TG 限流生效；等待秒数取 TG 给的 retry after（封顶 30s，防长占回合）；
+  // 共 3 次尝试，耗尽仍失败 → 原样抛出，走既有 next() 让位（失败关闭语义不变）。
+  const CARD_SEND_ATTEMPTS = 3;
+  const RETRY_WAIT_CAP_SECONDS = 30;
+  async function callTelegramWithRetry(method, ...args) {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await callTelegram(method, ...args);
+      } catch (err) {
+        const message = String(err?.message ?? err);
+        if (attempt >= CARD_SEND_ATTEMPTS || !/Too Many Requests/i.test(message)) throw err;
+        const parsed = Number((message.match(/retry after (\d+)/i) ?? [])[1]);
+        const wait = Number.isFinite(parsed) ? Math.min(parsed, RETRY_WAIT_CAP_SECONDS) : 5;
+        log(`审批卡片遇 TG 限流（429），${wait}s 后重试（第 ${attempt}/${CARD_SEND_ATTEMPTS - 1} 次重试）`);
+        await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+      }
+    }
+  }
+
   /** 分多条发送时，终态文本里标注完整内容的位置；单条时返回 null。 */
   const detailNote = (entry) =>
     entry.parts > 1 ? `（完整内容见上方 ${entry.parts - 1} 条消息）` : null;
@@ -418,7 +443,9 @@ export function installApprovalBridge({
         let lastMessageId = null;
         for (let i = 0; i < chunks.length; i += 1) {
           const isLast = i === chunks.length - 1;
-          const sent = await callTelegram(
+          // #48：唯一换成重试版的调用点 —— 卡片发不出去 = 通道秒断，值得等限流过去；
+          // 其余（编辑卡片/应答按钮）失败只影响观感，保持原样不重试。
+          const sent = await callTelegramWithRetry(
             'sendMessage',
             chatId,
             chunks[i],
