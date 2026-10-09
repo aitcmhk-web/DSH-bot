@@ -179,9 +179,16 @@ test('B5 herd.js 哑火口修复在源码里（不再 stop()、start 照挂拍�
 
 // ── C 组：heartbeatMgmtRound 行为（bot.js 真实切片 + 真 mgmt-round 直驱）────
 const wiringStart = bot.indexOf('const mgmtState = makeMgmtState();');
-const wiringEnd = bot.indexOf('// ---- 协作任务表轮询', wiringStart);
+let wiringEnd = bot.indexOf('// ---- 协作任务表轮询', wiringStart);
+// #49 打回修正（2026-10-09）：#49 报错箱接线块插在 mgmtState 与任务表轮询之间，旧切片
+// 把它裹进 harness 有两险：① import 时踩裸 BOT_ROLE（harness 无此变量）整文件红；
+// ② start 真 fs.watch 盯真 APP_DIR —— 测试可能消费真报错箱/推进真偏移。C 组只测管理
+// 回合接线 → 切片止步于报错箱块之前；报错箱接线归 test-mailbox-wiring.mjs 测（有 BOT_ROLE 桩）。
+const mailboxBlockStart = bot.indexOf('// ---- 报错箱监听接线', wiringStart);
+if (mailboxBlockStart > 0 && mailboxBlockStart < wiringEnd) wiringEnd = mailboxBlockStart;
 assert.ok(wiringStart > 0 && wiringEnd > wiringStart, 'bot.js 管理回合接线块切片失败');
 const wiringChunk = bot.slice(wiringStart, wiringEnd);
+assert.ok(!wiringChunk.includes('createMailboxWatcher'), '切片不得裹进报错箱接线块（真 fs.watch 进测试 + 踩裸 BOT_ROLE）');
 
 const harness = await import(
   'data:text/javascript,' +
