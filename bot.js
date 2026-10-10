@@ -1826,8 +1826,26 @@ function reviveDecide(state, isBad, now) {
   return { action: 'kick', attempts: state.attempts };
 }
 
-/** 把一行翻「待领取」并在结论列追加改派原因（行被别人动过/不是进行中 → 放弃）。 */
-function reassignTaskRow(no, reason, now = Date.now()) {
+/** 队列最短选择（#66 换人钩子 / #6 打回换人共用同一份，⛔ 不复制第二份判定）：
+ *  名下「进行中」行数最少的小工；`exclude` = 不参与（本体/原负责人）；
+ *  同数按 WORKER_NAMES 声明序取 → 001→004 平手时的确定性顺位。空队列返回 null。 */
+function pickLeastBusyWorker(lines, exclude = []) {
+  const skip = new Set(exclude);
+  const queue = {};
+  for (const n of WORKER_NAMES) if (!skip.has(n)) queue[n] = 0;
+  for (const line of lines) {
+    const mm = line.match(/^\|\s*\d+\s*\|[^|]+\|\s*([^\s|]+)\s*\|\s*进行中\s*\|/);
+    if (mm && mm[1] in queue) queue[mm[1]] += 1;
+  }
+  const entries = Object.entries(queue);
+  if (entries.length === 0) return null;
+  return entries.sort((a, b) => a[1] - b[1])[0][0];
+}
+
+/** 把一行翻「待领取」并在结论列追加改派原因（行被被改过/不是进行中 → 放弃）。
+ *  `to` 给定时同步改「负责」列给该小工（队列最短由调用方算），返回是否成功；
+ *  #66 换人钩子 / #6 打回换人 / #9 看门狗三处共用，⛔ 别再写第二份翻牌逻辑。 */
+function reassignTaskRow(no, reason, now = Date.now(), to = null) {
   const table = readTaskTable();
   if (!table) return false;
   const lines = table.split('\n');
@@ -1836,6 +1854,10 @@ function reassignTaskRow(no, reason, now = Date.now()) {
   const cells = lines[i].split('|');
   if (cells.length < 6 || !WORKER_NAMES.includes(cells[3].trim())) return false;
   if (cells[4].trim() !== '进行中') return false;
+  if (to) {
+    if (!WORKER_NAMES.includes(to)) return false;
+    cells[3] = ` ${to} `;
+  }
   cells[4] = ' 待领取 ';
   const stamp = new Date(now).toISOString().slice(5, 16).replace('T', ' ');
   const prev = cells[5].trim();
@@ -1843,6 +1865,125 @@ function reassignTaskRow(no, reason, now = Date.now()) {
   lines[i] = cells.join('|');
   writeTaskTable(lines.join('\n'));
   return true;
+}
+
+// ── 换人钩子（任务 #66，老板 2026-10-10 令「小工超过10分钟文件0改动就换 bot，
+//    做成每30分钟唤醒主bot的钩子」）────────────────────────────────────────
+// 与 #9 进度快照（herdTick ②，看状态列）**互补不重复**：那条盯「行状态纹丝不动」，
+// 本条盯「任务目标文件的 mtime」——行结论列/心跳在刷而目标文件没动 = 活卡在别处，
+// 状态快照看不出来。判据：对每条「进行中」的行取其任务描述里的目标文件路径，
+// 自上次快照起 **≥10 分钟零改动** → 行翻「待领取」+ 改派给队列最短的小工 +
+// 结论列追加「⏰ 换人钩子（时间）：文件10分钟零改动，改派 X」+ 协作群一条播报。
+// 快照语义复用 #9：首见只记时间戳（不判龄），下一拍才比对 → 心跳/结论列刷新
+// 都不触发；行离开「进行中」（完工/改派）→ 清快照，再进「进行中」重新首见。
+// 30 分钟唤醒：不新造定时器（第 1 条），挂 herd 同一拍（5 分钟）自带判龄 ——
+// 距上次钩子巡检 ≥30 分钟才跑一轮，等价「每 30 分钟唤醒主 bot 一次」。
+// ⛔ 不杀进程、⛔ 不动 launchd；文件读取失败（路径不存在/权限）→ 记 0（视同没改动），
+//    不误报「有改动」。
+const FILE_REASSIGN_INTERVAL_MS = 30 * 60 * 1000; // 钩子每 30 分钟唤醒一轮（老板令）
+const FILE_STALE_MS = 10 * 60 * 1000;             // 文件 10 分钟零改动 = 换人判据（老板令）
+
+/** 任务描述里抽出像文件路径的 token（正斜杠或带扩展名；绝对/相对皆可；头尾引号括号剥除）。 */
+function extractTaskFilePaths(task) {
+  return String(task ?? '')
+    .split(/\s+/)
+    .map((s) => s.replace(/^[「『"'`（(<【]+/, '').replace(/[，、；。（）()【】「」"'`<>,]+$/g, ''))
+    .filter((s) => s.includes('/') || /\.[A-Za-z0-9]{1,8}$/.test(s));
+}
+
+/** 取一组文件里最新的 mtime（毫秒）。全都读不到 → 0（视同零改动，不误报有改动）。 */
+function newestTargetMtime(paths, now = Date.now()) {
+  let newest = 0;
+  for (const p of paths) {
+    try {
+      const m = statSync(p).mtimeMs;
+      if (m > newest) newest = m;
+    } catch {
+      /* 路径不存在/无权限 → 这条不算改动 */
+    }
+  }
+  return Math.max(newest, 0) || 0;
+}
+
+/** 30 分钟一拍的换人钩子巡检（纯函数，测试直驱）。返回结论文案数组（空 = 没事）。
+ *  `state` 跨拍持有（首次调用先用 `makeFileHookState()` 建）；deps =
+ *  { readTable, writeTable, announce } — announce = 协作群发送（fire-and-forget）。 */
+function fileReassignTick(state, deps, now = Date.now()) {
+  const { readTable, writeTable, announce } = deps;
+  const verdicts = [];
+  if (now - (state.lastRun ?? 0) < FILE_REASSIGN_INTERVAL_MS) return verdicts; // 每 30 分钟才跑一轮
+  state.lastRun = now;
+  const table = readTable();
+  if (!table) return verdicts;
+  const lines = table.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]+)\|\s*([^\s|]+)\s*\|\s*([^|]+?)\s*\|/);
+    if (!m || !WORKER_NAMES.includes(m[3])) continue;
+    const no = m[1];
+    const status = m[4];
+    if (status !== '进行中') {
+      if (state.progress.has(no)) state.progress.delete(no); // 离开进行中 → 清快照
+      continue;
+    }
+    const paths = extractTaskFilePaths(m[2]);
+    if (paths.length === 0) continue; // 描述里认不出目标文件 → 本钩子无判据不判（归 #9 状态列管），防误翻
+    const mtimeMs = newestTargetMtime(paths, now);
+    const prev = state.progress.get(no);
+    if (!prev) {
+      state.progress.set(no, { files: paths, mtimeMs, since: now }); // 首见只记时，不判
+      continue;
+    }
+    // 目标文件变了（或换了一组）→ 重新起算 10 分钟
+    if (mtimeMs !== prev.mtimeMs || paths.join(' ') !== prev.files.join(' ')) {
+      state.progress.set(no, { files: paths, mtimeMs, since: now });
+      continue;
+    }
+    if (now - prev.since < FILE_STALE_MS) continue; // 心跳在刷、文件未满 10 分钟 → 不换
+    const target = pickLeastBusyWorker(lines, [m[3]]); // 不回流原负责人
+    const stamp = new Date(now).toISOString().slice(5, 16).replace('T', ' ');
+    const staleMin = Math.round((now - prev.since) / 60000);
+    const reason = target
+      ? `⏰ 换人钩子（${stamp}）：文件10分钟零改动，改派 ${target}`
+      : `⏰ 换人钩子（${stamp}）：文件10分钟零改动（无可改派的小工）`;
+    if (reassignTaskRow(no, reason, now, target)) {
+      const fresh = readTable(); // 重读拿最新行（reassignTaskRow 已落盘），改派计数即刻为真
+      if (fresh) {
+        lines.length = 0;
+        lines.push(...fresh.split('\n'));
+      }
+      verdicts.push(`#${no}（${m[3]}）目标文件 ${staleMin} 分钟零改动 → 翻「待领取」改派 ${target ?? '(无)'}`);
+    }
+    state.progress.delete(no); // 本行已处置 → 下轮重新首见
+  }
+  if (verdicts.length > 0 && announce) {
+    void Promise.resolve()
+      .then(() => announce(`⏰ 换人钩子播报：\n${verdicts.map((v) => `· ${v}`).join('\n')}`))
+      .catch((err) => console.error(`[${_ts()}][herd] 换人钩子公告失败: ${err?.message ?? err}`));
+  }
+  return verdicts;
+}
+
+function makeFileHookState() {
+  return { progress: new Map(), lastRun: 0 };
+}
+
+/** 心跳入口：#66 换人钩子（挂在 #9 看门狗同一拍，⛔ 不新造定时器）。30 分钟跑一轮，
+ *  协作群 id 表头优先、兜底协作群（与 herdTick 播报同一条发送腿，⛔ 不复制第二份）。 */
+const fileHookState = makeFileHookState();
+function heartbeatFileReassign() {
+  try {
+    fileReassignTick(fileHookState, {
+      readTable: readTaskTable,
+      writeTable: writeTaskTable,
+      announce: (text) => {
+        const chatId = Number(groupChatIdFromTable() ?? HERD_GROUP_FALLBACK);
+        if (!telegram || !Number.isInteger(chatId)) throw new Error(`协作群 id 不可用（${chatId}）`);
+        return telegram.sendRich(chatId, text);
+      },
+    }, Date.now());
+  } catch (err) {
+    console.error(`[${_ts()}][herd] 换人钩子 tick 异常: ${err?.stack ?? err?.message}`);
+  }
 }
 
 /** 一次巡检：存活 + 进度。公告合并成一条发协作群（群 id 表头优先，兜底协作群）。
@@ -1931,6 +2072,7 @@ function watchWorkerHerd() {
         // 出问题时才出声，「巡检在跑、一切健康」和「拍子死了」在日志上分不开。
         console.log(`[${_ts()}][herd] 看门狗心跳正常（每 ${HERD_CHECK_MS / 60000} 分钟巡检拍子在跑）`);
         heartbeatMgmtRound(); // #34/#45 管理回合同拍判定（tick 内自判距上次 ≥30 分钟；自带异常隔离）
+        heartbeatFileReassign(); // #66 换人钩子同拍判定（tick 内自判距上次 ≥30 分钟；自带异常隔离）
         herdTick();
       }
     } catch (err) {
