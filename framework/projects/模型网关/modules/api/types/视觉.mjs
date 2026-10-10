@@ -1,5 +1,5 @@
 // 视觉.mjs · 模型「类型」处理器：视觉上游（#22 回归修复：#19 改造时漏注册，视觉条目全 400）
-// 视觉条目（AITCM·舌象 = qwen-vl-max）走 OpenAI 兼容 chat/completions：图片以 data URL image_url 进 messages content
+// 视觉条目（AITCM·舌象 = qwen3-vl-plus）走 OpenAI 兼容 chat/completions：图片以 data URL image_url 进 messages content
 //（AITCM 信封处理器负责把 载荷.图片 翻成 image_url；直通口则由调用方自带完整 messages）。
 // 线协议与 chat 同形（JSON POST）→ 调用复用 chat 的实现（一份线协议代码，不复制）；将来协议分家只改本文件（D11）。
 //

@@ -27,7 +27,7 @@
     "key": "${GW_KEY_1}",
     "类型": "视觉",
     "参数": {
-      "model": "qwen-vl-max"
+      "model": "qwen3-vl-plus"
     }
   },
   {

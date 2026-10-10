@@ -1499,6 +1499,8 @@ function buildWorkerClaimBlocks(no, task, conclusionCol, { resubmit = false } = 
         headline,
         reasonBlock,
         '红线：⛔ 不 git push、⛔ 不打 tag、⛔ 不发版（发版只归主 bot 验收后做）；改动只在工作区 /Users/tcm/DSH/BOT 内。',
+        '有疑问找总控（主 bot），⛔ 不许去问老板：拿不准的、撞车的、要报错的，一律写进 /Users/tcm/DSH/BOT/任务表.md 本行结论列并 @总控，主 bot 会在同列答复并唤醒你；⛔ 不许只在群里发文字、不许空报「做不了」、不许停下等答案（先把能干的干完，问题一起贴）。',
+        '报错必须贴原文：撞到任何报错，第一件事是把错误原文原样写进任务表本行结论列（@总控），⛔ 不许吞错、⛔ 不许改写。',
         '干完：把 /Users/tcm/DSH/BOT/任务表.md 该行状态改成「待验收」（先改状态占位再干也行，防止重复领的是「进行中」），然后把做了什么、改了哪些文件总结发回协作群。',
         '</领活>',
       ].filter(l => l !== '').join('\n'),
