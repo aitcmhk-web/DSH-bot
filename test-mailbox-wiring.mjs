@@ -99,9 +99,9 @@ function wiringBlock() {
   return bot.slice(start, end);
 }
 
-test('B1 版本号两处同步：package.json=1.0.55、setupdsh.sh SPEC=v1.0.55', () => {
-  assert.equal(pkg.version, '1.0.55');
-  assert.match(setupdsh, /DSH-bot#v1\.0\.55/);
+test('B1 版本号两处同步：package.json=1.0.56、setupdsh.sh SPEC=v1.0.56', () => {
+  assert.equal(pkg.version, '1.0.56');
+  assert.match(setupdsh, /DSH-bot#v1\.0\.56/);
 });
 
 test('B2 bot.js 已 import mailbox 唯一权威源（不复制第二份，第 1 条）', () => {

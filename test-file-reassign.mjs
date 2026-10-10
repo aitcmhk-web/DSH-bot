@@ -81,7 +81,7 @@ test('T1 接线在位：watchWorkerHerd 每拍带起换人钩子，原巡检不�
   assert.match(wiringChunk, /\[herd\] 看门狗心跳正常/, '每拍活体心跳日志不能丢');
   assert.match(bot, /const FILE_REASSIGN_INTERVAL_MS = 30 \* 60 \* 1000;/, '30 分钟唤醒门常量在位');
   assert.match(bot, /const FILE_STALE_MS = 10 \* 60 \* 1000;/, '10 分钟换人判据常量在位');
-  assert.equal(pkg.version, '1.0.55', '改 src 必须升版');
+  assert.equal(pkg.version, '1.0.56', '改 src 必须升版');
 });
 
 test('T2 首见只记时不判龄：古老 mtime 第一拍不许翻', async () => {

@@ -2499,14 +2499,17 @@ export function apply(ctx, config) {
    *  现网 dshbot 实例没设 BOT_ROLE → 生效。 */
   const REVIEWER_MODE = !['master', 'worker'].includes(String(process.env.BOT_ROLE ?? '').trim());
 
-  /** 找第一个「状态=待审核」的行（不限负责者 —— 审核覆盖所有小工的活）。 */
-  function findReviewRow(table) {
+  /** 找所有「状态=待审核」的行（不限负责者 —— 审核覆盖所有小工的活）。
+   *  ⚠️ 必须返回全部：早先只返回第一行 + reviewCardsSent 每 #N 一次的节流，
+   *  会让更老的待审行永久占位、后面的行永远收不到卡（#71 实案：#17 挡住 #69）。 */
+  function findReviewRows(table) {
+    const rows = [];
     const lines = table.split('\n');
     for (let i = 0; i < lines.length; i++) {
       const m = lines[i].match(/^\|\s*(\d+)\s*\|([^|]*)\|([^|]*)\|\s*待审核\s*\|/);
-      if (m) return { index: i, line: lines[i], no: m[1], task: m[2].trim(), owner: m[3].trim() };
+      if (m) rows.push({ index: i, line: lines[i], no: m[1], task: m[2].trim(), owner: m[3].trim() });
     }
-    return null;
+    return rows;
   }
 
   /** 卡片处理完改文案（防重复点击）；失败静默 —— 卡片留着顶多多按一次。 */
@@ -2571,16 +2574,18 @@ export function apply(ctx, config) {
     log(`[审核] #${row.no} 审核卡片已发协作群`);
   }
 
-  /** 审核轮：发现「待审核」行就发卡（挂在 watchTaskTable 的同一个 5s 轮询里）。 */
+  /** 审核轮：扫所有「待审核」行逐行发卡（挂在 watchTaskTable 的同一个 5s 轮询里）。
+   *  ⛔ 节流保持每 #N 每进程一次（reviewCardsSent）；发送失败移除标记，下一轮重试。 */
   function reviewTick(table) {
     if (!REVIEWER_MODE) return;
-    const row = findReviewRow(table);
-    if (!row || reviewCardsSent.has(row.no)) return;
-    reviewCardsSent.add(row.no); // 先记后发：发送失败就移除，下一轮重试（成功恰好一次）
-    sendReviewCard(row).catch((err) => {
-      reviewCardsSent.delete(row.no);
-      error(`[审核] #${row.no} 卡片发送失败，下轮重试: ${err?.message ?? err}`);
-    });
+    for (const row of findReviewRows(table)) {
+      if (reviewCardsSent.has(row.no)) continue;
+      reviewCardsSent.add(row.no); // 先记后发：发送失败就移除，下一轮重试（成功恰好一次）
+      sendReviewCard(row).catch((err) => {
+        reviewCardsSent.delete(row.no);
+        error(`[审核] #${row.no} 卡片发送失败，下轮重试: ${err?.message ?? err}`);
+      });
+    }
   }
   watchTaskTable();
 

@@ -147,8 +147,8 @@ const herdSrc = readFileSync(`${BOT}/src/herd.js`, 'utf8');
 const pkg = JSON.parse(readFileSync(`${BOT}/package.json`, 'utf8'));
 
 test('B1 版本号已升（改 src/ 必须升版，第 23 条）', () => {
-  // 跟随当前版本走（#45 起每次升版同步本行；#46/#48 漏更导致红过，#66 修到 1.0.55）。
-  assert.equal(pkg.version, '1.0.55');
+  // 跟随当前版本走（#45 起每次升版同步本行；#46/#48 漏更导致红过，#66 修到 1.0.55、#71 修到 1.0.56）。
+  assert.equal(pkg.version, '1.0.56');
 });
 
 test('B2 bot.js 已 import mgmt-round 唯一权威源', () => {
