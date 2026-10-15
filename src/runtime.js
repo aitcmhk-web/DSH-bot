@@ -1,0 +1,664 @@
+/**
+ * BotRuntime —— 会话运行时。
+ *
+ * 建会话、投递消息、把回答转成事件，全部通过宿主的 `ctx.agents` 服务完成
+ * （调用顺序与官方 dsh-sdk-jsonrpc-server 一致）。
+ *
+ * 切模型：模型在 agents.create({agentOptions}) 时定死，宿主接口只提供
+ * resume(resumeSessionId) 续已持久化的会话，没有「给活着的 agent 换模型」，
+ * 因此切档 = dispose 旧句柄 → 用同一个会话 ID 重建。
+ * dispose 只关句柄、不删日志（persistence 对 session/disposed 只做最后冲刷），
+ * 所以重建时 create 抛 already exists → 走 resume：完整历史回放给新模型接着聊，
+ * 上下文跨档保留；handoff 只是记忆兜底，不是衔接必需。
+ *
+ * 会话 id：`/new` 必须真的换一个新 id。若沿用固定的 `botplugin:<chatKey>`，
+ * `/new` 只关句柄，下一条消息 create 又撞 `already exists` → resume 回同一份
+ * 持久化历史，等于「没换」。id = `botplugin:<chatKey>:<时间戳36进制+随机>`，
+ * 由 index.js 的 `.botplugin-state.json` 记住（options.sessionIds），落盘里查不到
+ * 就现造一个（磁盘上没有该 chat 的会话 id 时即从零开始，配合 index.js 的冷启动记忆注入）。
+ */
+
+// 故意不 import 任何 @deepseek-ai/* 包；需要的东西都已本地实现：
+//   · brandString → 官方实现就是 return value（纯类型标记），直接传字符串即可。
+//   · createUserMessage → 见 src/message.js。
+import { createUserMessage, textContent } from './message.js';
+
+/** 会话 id 的插件内前缀，避免与宿主其它来源的会话撞名。 */
+const SESSION_PREFIX = 'botplugin';
+
+/**
+ * 归一化思考强度：'none' / 'off' / 空 → 返回 undefined = 整个参数一个字节都不发；
+ * 其余（low / medium / high / max …）原样发。
+ *
+ * 'off' 在 pi-ai 和 deepseek-official 两边都被拒（UNSUPPORTED_REASONING_EFFORT）：
+ * 只要 reasoningEffort 字段出现，哪怕值是 off 也算拒，所以在发送边界一律拦下。
+ */
+export function normalizeEffort(effort) {
+  const v = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+  return v && v !== 'none' && v !== 'off' ? v : undefined;
+}
+
+/**
+ * 会话事件名。
+ *
+ * 官方约定（`@deepseek-ai/dsh-sdk-jsonrpc-server/lib/index.js:68`）：
+ *      `ctx.on("session/event", (session, event) => {...})`
+ *    要点三条：
+ *      ① 事件名是 `session/event`（斜杠）；
+ *      ② 挂在 ctx 上，不是 agent 上；
+ *      ③ 回调是两个参数 `(session, event)`，不是一个 payload 对象。
+ *    官方紧接着用 `String(session.id)` 当 sessionId —— 同一套约定。
+ */
+const SESSION_EVENT = 'session/event';
+
+/** 兼容旧写法：万一宿主某版本用连字符，也收一份（不影响正确性）。 */
+const EVENT_ALIASES = ['session-event'];
+
+const log = (...args) => console.log('[botplugin]', ...args);
+const logErr = (...args) => console.error('[botplugin]', ...args);
+
+/**
+ * 一个 chat（Telegram 私聊 / 微信）对应一个 DSH 会话。
+ *
+ * chatKey：插件内部给会话起的稳定标识（TG 用 `tg:<userId>`，微信用 `wx:<id>`）。
+ * 两端各自一个 key，互不耦合；谁先绑定谁先有会话。
+ */
+export class BotRuntime {
+  /** @type {Map<string, {handle: object, routeKey: string|null}>} */
+  #sessions = new Map();
+
+  /** 正在建的会话（同一 key 并发来消息时复用同一次创建，别建两个）。 */
+  #creating = new Map();
+
+  /** 会话事件订阅者。见 {@link BotRuntime#onSessionEvent} 的说明。 */
+  #subscribers = new Set();
+
+  /** @type {object|null} */
+  #ctx = null;
+
+  #stopped = false;
+
+  /** 默认档位（provider/model/reasoningEffort），由配置给出。 */
+  #defaultRoute = null;
+
+  /** ctx 级会话事件是否已订阅（防止每个新会话重复挂）。 */
+  #ctxBridged = false;
+
+  /** cwd —— 新会话的工作区。 */
+  #cwd = process.cwd();
+
+  /**
+   * 会话 id 的落盘口（见构造函数 JSDoc）。null = 没接，退回固定 id
+   * 「一个 chat 一个 id」。
+   */
+  #sessionIds = null;
+
+  /**
+   * @param {object} options
+   * @param {object} options.ctx Cordis 插件上下文（apply 的第一个参数）
+   * @param {{provider:string, model:string, reasoningEffort?:string}} [options.route] 默认档位
+   * @param {string} [options.cwd] 会话工作区，默认进程 cwd
+   * @param {{get:(chatKey:string)=>(string|null), set:(chatKey:string, id:string)=>void}} [options.sessionIds]
+   *   会话 id 的落盘口。给了它，每个 chat 当前用哪个会话 id 由它记住，
+   *   `/new` 换 id 之后下一条消息才真的开新会话；不给则退回
+   *   `${SESSION_PREFIX}:${chatKey}` 固定 id（`/new` 只关句柄、下次仍 resume 回旧历史）。
+   */
+  constructor({ ctx, route, cwd, sessionIds } = {}) {
+    this.#ctx = ctx ?? null;
+    if (route) this.#defaultRoute = route;
+    if (cwd) this.#cwd = cwd;
+    if (sessionIds) this.#sessionIds = sessionIds;
+    // ctx 级事件订阅必须在构造时就挂上：ctx.on('session/event') 跟具体 agent
+    //    无关，等到建会话才挂会丢掉之前的事件。
+    this.#bridgeCtxEvents();
+  }
+
+  /** ctx 级的会话事件订阅（每实例一次）。 */
+  #bridgeCtxEvents() {
+    const ctx = this.#ctx;
+    if (!ctx || typeof ctx.on !== 'function') {
+      logErr('ctx 上没有 .on() —— 收不到会话事件，只能靠 turn 超时兜底');
+      return;
+    }
+    this.#bridgeAgentEvents(null);
+  }
+
+  /** 运行时是否已就绪（宿主 agents 服务在不在）。 */
+  get ready() {
+    return !this.#stopped && this.#agents() !== undefined;
+  }
+
+  /**
+   * 取宿主的 agents 服务。
+   *
+   * ⚠️ 必须是 `ctx.agents`（属性），不是 `ctx.get('agents')`。
+   *    官方源码（`@deepseek-ai/dsh-sdk-jsonrpc-server/lib/index.js:157` 与 `:219`）都是
+   *    `this.ctx.agents.create(...)` / `this.ctx.agents.get(...)`。
+   *    只写 `ctx?.get('agents')` 不行 —— `?.` 只能挡 `ctx` 为 null，
+   *    挡不住「没有 get 方法」，于是运行到建会话那一刻才炸：
+   *    加 typeof 兜底，缺服务时给出可读错误而不是 TypeError。
+   */
+  #agents() {
+    const ctx = this.#ctx;
+    if (!ctx) return undefined;
+    return ctx.agents ?? (typeof ctx.get === 'function' ? ctx.get('agents') : undefined);
+  }
+
+  /**
+   * 取宿主的附件服务（`ctx.attachments`）。
+   *
+   * ⚠️ 这是图片能被模型看见的关键一步：
+   *    `{type:'image', data:<base64>, mediaType}` 只是半成品，
+   *    必须换成 `{type:'image', attachment:<durable ref>}` 模型才读得到内容。
+   *    官方 `durablePromptContent` 干的就是这件事
+   *    （`@deepseek-ai/dsh-sdk-jsonrpc-server/lib/index.js:19-33`）——
+   *    但它挂在 JSON-RPC 的 session/prompt 路上，本插件直接 `agent.followup()`
+   *    绕过了那一层，于是图片静默丢掉（表现为「知道有图但不知道内容」）。
+   *
+   * ⚠️ 走 `ctx.attachments`（属性）优先，`ctx.get('attachments')` 兜底 ——
+   *    与 #agents() 同一套写法，依据同样是官方源码里 `ctx.attachments` 的用法
+   *    （`dsh-api-session-controller/lib/types/commands.js:316`）。
+   *
+   * ⚠️ 属性访问包 try/catch：Cordis 的 `ctx.x` 受 inject 门禁，未声明时抛
+   *    `cannot get property "attachments" without inject`，而不是返回 undefined ——
+   *    没有这层保护，`?? ctx.get(...)` 兜底根本没机会执行，异常直接冒到 prompt()。
+   *    inject 已在 index.js 声明（= 正路），这里是第二道保险：
+   *    万一宿主/未来版本门禁行为有变，仍能拿到服务而不是整条消息失败。
+   *    真拿不到时返回 undefined，由 #durableContent 报明确错误。
+   */
+  #attachments() {
+    const ctx = this.#ctx;
+    if (!ctx) return undefined;
+    try {
+      if (ctx.attachments) return ctx.attachments;
+    } catch {
+      // 被 inject 门禁挡住：落到下面的 ctx.get()
+    }
+    return typeof ctx.get === 'function' ? ctx.get('attachments') : undefined;
+  }
+
+  /**
+   * 把内容块里的 base64 图片换成宿主持久化引用（唯一的转换入口）。
+   *
+   * 语义照抄官方 `durablePromptContent`（出处见 {@link #attachments} 注释）：
+   *   ① 没有任何 `{type:'image', data}` 块 → 原样返回，一次存储都不做；
+   *   ② 有 → `admitEncodedImages(store, [{data, mediaType}])` 拿回引用数组；
+   *   ③ 按原顺序把每个图片块替换成 `{type:'image', attachment}`，其余块不动。
+   *
+   * ⚠️ 为什么优先调 `admitPromptContent`（宿主的公开入口）而不是自己拼：
+   *    官方两条路（`dsh-api-session-controller/lib/types/commands.js:316`）用的都是它，
+   *    它内部会 preserve 文本/文件块的顺序。只有它不存在时才退回
+   *    `admitEncodedImages` + 手写替换（两者等价，见 dsh-attachment:99-101 / 228-245）。
+   *
+   * ⚠️ 拿不到附件服务时必须报错，不许静默放行 —— 静默放行的结果就是
+   *    发了图、模型说没看见，而日志里一片正常。
+   *
+   * @param {Array<object>} blocks 原始内容块
+   * @returns {Promise<Array<object>>} 可直接投给 agent 的内容块
+   */
+  async #durableContent(blocks) {
+    const hasEncodedImage = blocks.some(
+      (b) => b && b.type === 'image' && typeof b.data === 'string',
+    );
+    if (!hasEncodedImage) return blocks;
+    const store = this.#attachments();
+    if (!store) {
+      throw new Error(
+        '有图片块，但拿不到宿主的 attachments 服务（ctx.attachments）—— 图片无法持久化，' +
+          '继续投递只会让模型看到一张空图。请检查宿主是否加载了 attachment 插件。',
+      );
+    }
+    if (typeof store.admitPromptContent === 'function') {
+      return await store.admitPromptContent(blocks);
+    }
+    return await this.#durableContentFallback(store, blocks);
+  }
+
+  /** `admitPromptContent` 缺席时的等价兜底：逐块替换，其余原样。 */
+  async #durableContentFallback(store, blocks) {
+    const images = blocks.filter((b) => b && b.type === 'image' && typeof b.data === 'string');
+    const refs = await store.saveImages(
+      images.map((image) => ({
+        data: Buffer.from(image.data, 'base64'),
+        // 字段名与宿主 saveInput 对齐（dsh-attachment/lib/index.js:82 读 mediaType）。
+        // 兼容 mimeType 只是防御历史调用方，新代码一律写 mediaType。
+        mediaType: image.mediaType ?? image.mimeType ?? 'image/jpeg',
+      })),
+    );
+    let next = 0;
+    return blocks.map((block) =>
+      block && block.type === 'image' && typeof block.data === 'string'
+        ? { type: 'image', attachment: refs[next++] }
+        : block,
+    );
+  }
+
+  /** 当前活着的会话数，供 /status 显示。 */
+  get sessionCount() {
+    return this.#sessions.size;
+  }
+
+  /**
+   * 更新默认档位。**只影响之后新建的会话** —— 已经在跑的会话不会被改动，
+   * 想生效请走 {@link switchRoute}。
+   * @param {{provider:string, model:string, reasoningEffort?:string}} route
+   */
+  setDefaultRoute(route) {
+    this.#defaultRoute = route;
+  }
+
+  /**
+   * 给某个 chat 发一条消息。会话不存在就按当前档位建一个。
+   *
+   * 这是排队语义（followup 立即返回），回答靠事件收，不在返回值里。
+   *
+   * @param {string} chatKey 会话标识，如 'tg:123456789'
+   * @param {string|Array<object>} content 文本，或已构造好的内容块数组
+   * @returns {Promise<{ok:true, messageId?:string, created:boolean} | {ok:false, error:string}>}
+   */
+  async prompt(chatKey, content) {
+    if (this.#stopped) return { ok: false, error: 'runtime stopped' };
+    const rec = await this.#ensureSession(chatKey);
+    if (!rec.ok) return rec;
+    try {
+      const raw = typeof content === 'string' ? textContent(content) : content;
+      // ⚠️ 图片块必须在这里换成宿主持久化引用 —— 详见 #durableContent 注释。
+      //    这一步放在 createUserMessage 之前：转换抛错时消息根本没投出去，
+      //    发送侧会收到明确的失败提示，而不是一条"静默丢图的成功"。
+      const admitted = await this.#durableContent(raw);
+      const message = createUserMessage({
+        content: admitted,
+        source: { kind: 'user' },
+      });
+      rec.handle.agent.followup(message);
+      return { ok: true, messageId: message.id, created: rec.created };
+    } catch (err) {
+      logErr(`followup failed for ${chatKey}: ${err.message}`);
+      return { ok: false, error: err.message };
+    }
+  }
+
+  /**
+   * 切档位：关掉这个 chat 的旧句柄，按新档位重建同一会话。
+   *
+   * ⚠️ 宿主没有「给活着的 agent 换模型」，只能走 dispose → 重建；
+   *    重建会命中 already exists → resume，历史保留、新模型接着聊（见文件头）。
+   *
+   * @param {string} chatKey
+   * @param {{provider:string, model:string, reasoningEffort?:string}} route
+   */
+  async switchRoute(chatKey, route) {
+    this.#defaultRoute = route;
+    const rec = this.#sessions.get(chatKey);
+    if (rec) {
+      this.#sessions.delete(chatKey);
+      await this.#dispose(chatKey, rec);
+    }
+    const next = await this.#ensureSession(chatKey);
+    return next.ok
+      ? { ok: true, route }
+      : next;
+  }
+
+  /**
+   * 主动结束某个 chat 的会话（保留其它 chat）。
+   *
+   * ⚠️ 只关句柄，**不换会话 id**：下一条消息还会 resume 同一份持久化历史。
+   *    要真的从零开始请用 {@link BotRuntime#resetSession}。
+   * @param {string} chatKey
+   */
+  async closeSession(chatKey) {
+    const rec = this.#sessions.get(chatKey);
+    if (!rec) return;
+    this.#sessions.delete(chatKey);
+    await this.#dispose(chatKey, rec);
+  }
+
+  /**
+   * 换新会话：关掉旧句柄，并作废旧会话 id —— 下一条消息建一个全新会话。
+   *
+   * 与 {@link BotRuntime#closeSession} 的区别就是这一步「作废 id」：
+   * 老 id 不变的话，`/new` 之后 create 会撞 `already exists` → resume 回旧历史。
+   *
+   * ⚠️ 调用顺序：要写 handoff / 记账，必须在**本方法之前**做
+   *    （`sessionIdOf()` 拿的是旧句柄，作废后就查不到了）。
+   * @param {string} chatKey
+   */
+  async resetSession(chatKey) {
+    const rec = this.#sessions.get(chatKey);
+    if (rec) {
+      this.#sessions.delete(chatKey);
+      await this.#dispose(chatKey, rec);
+    }
+    this.#mintSessionId(chatKey);
+  }
+
+  /**
+   * 取某 chat 的会话 id（没有则 null）。写 handoff / 记忆时要用。
+   * @param {string} chatKey
+   * @returns {string|null}
+   */
+  sessionIdOf(chatKey) {
+    const rec = this.#sessions.get(chatKey);
+    if (!rec) return null;
+    return String(rec.handle.agent.id);
+  }
+
+  /** 列出当前活着的会话（chatKey → sessionId），供 /status。 */
+  listSessions() {
+    return [...this.#sessions].map(([chatKey, rec]) => ({
+      chatKey,
+      sessionId: String(rec.handle.agent.id),
+      routeKey: rec.routeKey,
+    }));
+  }
+
+  /** 停掉全部会话。插件卸载时调。 */
+  async stop() {
+    this.#stopped = true;
+    const entries = [...this.#sessions];
+    this.#sessions.clear();
+    await Promise.allSettled(entries.map(([key, rec]) => this.#dispose(key, rec)));
+  }
+
+  // -------------------------------------------------------------------------
+  // 事件与「等一轮回答」
+  // -------------------------------------------------------------------------
+  //
+  // agent.followup() 是排队语义，回答只能靠订阅事件收。
+  //    不同宿主版本的事件挂点与命名略有差异，所以三种挂法都试
+  //    （agent.on / ctx.on / ctx.agents.on 的 'session/event' 与 'session-event'），
+  //    谁能收谁收，收不到就靠超时兜底。
+
+  /**
+   * 挂上会话事件监听。
+   *
+   * @param {(payload:{sessionId:string, event:object}) => void} handler
+   * @returns {() => void} 取消订阅
+   */
+  onSessionEvent(handler) {
+    this.#subscribers.add(handler);
+    // 只进 #subscribers，不往 agent.on 上重复挂：两处都挂同一个 handler
+    //    会被调两次，还绕过错误隔离（一个订阅者抛错会带崩事件链上的其他订阅者）。
+    return () => {
+      this.#subscribers.delete(handler);
+    };
+  }
+
+  /**
+   * 把事件派发给所有订阅者。
+   *
+   * 会话是懒建的：监听挂载时可能还没有 agent，直接挂 agent.on 会收不到事件。
+   *    统一走这个口子，谁订阅谁收到，与会话建立的先后无关。
+   *
+   * @param {{sessionId:string, event:object}} payload
+   */
+  #emitSessionEvent(payload) {
+    for (const fn of [...this.#subscribers]) {
+      try { fn(payload); } catch (err) { logErr(`session event handler failed: ${err.message}`); }
+    }
+  }
+
+  /**
+   * 等某个会话的一轮结束。
+   *
+   * 必须带超时（30 分钟）：模型卡住时没有超时会让这个 chat 的队列永久堵死，
+   *    表现就是发消息永远不回、日志里什么都没有。
+   *
+   * @param {string} chatKey
+   * @param {number} timeoutMs
+   * @returns {Promise<{ok:true, text:string} | {ok:false, error:string}>}
+   */
+  waitForTurn(chatKey, timeoutMs = 30 * 60 * 1000) {
+    const rec = this.#sessions.get(chatKey);
+    const sessionId = rec ? String(rec.handle.agent.id) : null;
+
+    return new Promise((resolve) => {
+      let text = '';
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        off?.();
+        resolve(result);
+      };
+
+      const timer = setTimeout(
+        () => finish({ ok: false, error: '等待回复超时（30 分钟）' }),
+        timeoutMs,
+      );
+
+      const off = this.onSessionEvent((payload) => {
+        const { sessionId: sid, event } = payload ?? {};
+        if (sessionId !== null && sid !== sessionId) return;
+
+        // 一轮结束
+        if (event?.type === 'turn/end') {
+          const reason = event.data?.reason ?? null;
+          if (reason?.kind === 'error') {
+            const failure = reason.error ?? {};
+            // ⚠️ 只带 message 会把判定依据丢掉：欠费 / 限流信息常在 errorCode/code/
+            //    status 这些字段里，光看 message 判不出该不该切档，会漏掉该跳模型的情况。
+            //    这里把整个 failure 结构带出去（error 仍是人看的字符串），
+            //    由调用方用 isRouteFailure(failure) 判。
+            finish({
+              ok: false,
+              error: failure.message ?? failure.error?.message ?? '模型调用失败',
+              failure,
+            });
+            return;
+          }
+          finish({ ok: true, text: text.trim() });
+          return;
+        }
+
+        // 助手文字按整轮覆盖，不是累加
+        if (event?.type === 'assistant/message') {
+          const content = event.data?.message?.content;
+          if (!Array.isArray(content)) return;
+          // 只取正文：reasoning（思考过程）不进正文 —— 否则会一起发到 TG、
+          // 并写进记忆/handoff，把大段思考过程当成回答发出去。
+          const t = content
+            .filter((b) => b?.type === 'text')
+            .map((b) => b.text ?? '')
+            .join('');
+          if (t.trim()) text = t;
+        }
+      });
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // 内部
+  // -------------------------------------------------------------------------
+
+  async #ensureSession(chatKey) {
+    const existing = this.#sessions.get(chatKey);
+    if (existing) {
+      // agent 可能被宿主外部 dispose，必须复查它还活着
+      const live = this.#ctx?.agents?.get(existing.handle.agent.id) === existing.handle.agent;
+      if (live) return { ok: true, handle: existing.handle, created: false };
+      log(`session for ${chatKey} was disposed outside botplugin; recreating`);
+      this.#sessions.delete(chatKey);
+    }
+    const pending = this.#creating.get(chatKey);
+    if (pending) return pending;
+
+    const task = this.#create(chatKey);
+    this.#creating.set(chatKey, task);
+    try {
+      return await task;
+    } finally {
+      this.#creating.delete(chatKey);
+    }
+  }
+
+  /**
+   * 造一个新会话 id 并落盘（当前 chat 的下一条消息就用它）。
+   *
+   * id 里带时间戳 + 随机串，同一毫秒连点两次也不会重。
+   * @param {string} chatKey
+   * @returns {string} 新会话 id
+   */
+  #mintSessionId(chatKey) {
+    const id = `${SESSION_PREFIX}:${chatKey}:${Date.now().toString(36)}${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+    try {
+      this.#sessionIds?.set?.(chatKey, id);
+    } catch (err) {
+      // 落盘失败不算致命：本次运行照常用新 id，只是重启后会再开一个新的。
+      logErr(`session id 落盘失败（重启后会另开新会话）: ${err?.message ?? err}`);
+    }
+    return id;
+  }
+
+  /**
+   * 这个 chat 现在该用哪个会话 id。
+   *
+   * ⚠️ 落盘里查不到就现造一个，不能退回「固定 id」—— 磁盘上还躺着以前那批
+   *    固定 id 会话，resume 回去就是几十万 token 的旧历史。
+   * @param {string} chatKey
+   * @returns {string}
+   */
+  #sessionIdFor(chatKey) {
+    const saved = this.#sessionIds?.get?.(chatKey);
+    if (typeof saved === 'string' && saved) return saved;
+    // 没接落盘口（如单测直接 new）：退回固定 id，至少模型切换/重启能续上。
+    if (!this.#sessionIds) return `${SESSION_PREFIX}:${chatKey}`;
+    return this.#mintSessionId(chatKey);
+  }
+
+  async #create(chatKey) {
+    const agents = this.#agents();
+    if (agents === undefined) {
+      return { ok: false, error: 'host has no `agents` service (dsh-agent-loop not loaded)' };
+    }
+    const route = this.#defaultRoute;
+    if (!route?.provider || !route?.model) {
+      return { ok: false, error: 'no model route configured for botplugin' };
+    }
+    // 启动时序：inject:['agents'] 只保证服务对象在，不保证 agent 工厂已注册。
+    //    第一条消息可能赶在工厂注册前进来，create/resume 会抛
+    //    "no agent factory registered" —— 纯时序问题，等一等就好（最多 30s）。
+    // 会话 id 在进循环前定死一次：重试/回退 resume 都必须用同一个，别每次重造。
+    const sessionId = this.#sessionIdFor(chatKey);
+    const deadline = Date.now() + 30000;
+    for (;;) {
+      try {
+        let handle;
+        let created;
+        // 思考强度归一化（normalizeEffort）：'none'/'off'/空 不发，防止 UNSUPPORTED_REASONING_EFFORT。
+        const effort = normalizeEffort(route.reasoningEffort);
+        const agentOptions = {
+          provider: route.provider,
+          model: route.model,
+          ...(effort === undefined ? {} : { reasoningEffort: effort }),
+        };
+        try {
+          handle = await agents.create({
+            // ⚠️ 官方写法是 `brandString(\`...\`)`，但 brandString 的官方实现就是
+            //    `return value`（dsh-brand/lib/index.js:9）—— 纯类型标记，运行时是空操作。
+            //    这里直接传字符串，语义完全相同，且省掉一个解析不到的依赖。
+            sessionId,
+            meta: { cwd: this.#cwd },
+            agentOptions,
+          });
+          created = true;
+        } catch (err) {
+          // ⚠️ 会话**持久化在磁盘上**，进程/插件重启后还在。再次 create 会抛
+          //    `session "X" already exists`（dsh-session/lib/index.js:1380）。
+          //    官方为此给了 agents.resume({resumeSessionId, agentOptions})
+          //    （dsh-agent/lib/index.js:430；工厂实现 dsh-agent-loop/lib/index.js:1876）：
+          //    重开持久化日志、回放事件、接着聊 —— 这正是聊天机器人重启后该有的行为。
+          if (!String(err?.message ?? err).includes('already exists')) throw err;
+          handle = await agents.resume({
+            resumeSessionId: sessionId,
+            agentOptions,
+          });
+          created = false;
+        }
+        this.#sessions.set(chatKey, { handle, routeKey: route.key ?? null });
+        this.#bridgeAgentEvents(handle.agent);
+        log(`session ${created ? 'created' : 'resumed (重启接续)'} for ${chatKey} (${route.provider}/${route.model})`);
+        return { ok: true, handle, created };
+      } catch (err) {
+        const msg = String(err?.message ?? err);
+        if (msg.includes('no agent factory registered') && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          continue;
+        }
+        logErr(`session creation failed for ${chatKey}: ${msg}`);
+        return { ok: false, error: msg };
+      }
+    }
+  }
+
+  /**
+   * 把一个 agent 的事件转进内部派发口。
+   *
+   * ⚠️ 会话是懒建的，订阅却可能更早发生，所以每个新建的 agent 都要在这里
+   *    "接线"，不能只在 onSessionEvent 里挂一次。
+   *
+   * 官方写法（sdk-jsonrpc-server/lib/index.js:68）：事件挂在 ctx 上，
+   *    回调签名是 (session, event)。为了兼容「agent 上也能挂」的宿主版本，
+   *    仍尝试 agent.on 作为补充，两条路都收，重复由调用方幂等处理。
+   *    挂不上只记日志，不抛错 —— 还有 waitForTurn 的超时兜底。
+   */
+  #bridgeAgentEvents(agent) {
+    const sessionId = String(agent?.id ?? '');
+    let bound = 0;
+
+    // ① 首选：ctx 级订阅，官方签名 (session, event)
+    //    只挂一次（构造函数里已挂），重复挂会让同一条事件派发两次。
+    //    #ctxBridged 只在真的挂上时才置位：构造期 ctx.on 可能抛
+    //    "cannot create effect on inactive context"（宿主正在关停），
+    //    提前置位会堵死 #create 时的补挂机会。
+    const ctx = this.#ctx;
+    if (!this.#ctxBridged && ctx && typeof ctx.on === 'function') {
+      let ctxBound = 0;
+      for (const evt of [SESSION_EVENT, ...EVENT_ALIASES]) {
+        try {
+          ctx.on(evt, (session, event) => {
+            // 官方约定：第一个参数是 session 对象，用 String(session.id)。
+            // 兼容某些版本把两者合成一个 payload 的情况。
+            const sid = session?.id !== undefined ? String(session.id) : String(session?.sessionId ?? '');
+            this.#emitSessionEvent({ sessionId: sid, event: event ?? session?.event ?? session });
+          });
+          ctxBound += 1;
+        } catch { /* 换下一个名字 */ }
+      }
+      if (ctxBound > 0) this.#ctxBridged = true;
+      bound += ctxBound;
+    }
+
+    // ② 补充：agent 级订阅（若宿主版本支持）
+    if (agent && typeof agent.on === 'function') {
+      for (const evt of [SESSION_EVENT, ...EVENT_ALIASES]) {
+        try {
+          agent.on(evt, (payload) => {
+            this.#emitSessionEvent({
+              sessionId: payload?.sessionId ?? sessionId,
+              event: payload?.event ?? payload,
+            });
+          });
+          bound += 1;
+        } catch { /* 换下一个名字 */ }
+      }
+    }
+
+    if (bound === 0) {
+      logErr('挂不上任何会话事件 —— 只能靠 turn 超时兜底（回答会变慢但不会丢）');
+    }
+  }
+
+  async #dispose(chatKey, rec) {
+    try {
+      await rec.handle.dispose();
+    } catch (err) {
+      // 关不掉不能影响别的 chat —— 记一笔就走。
+      logErr(`dispose failed for ${chatKey}: ${err.message}`);
+    }
+  }
+}

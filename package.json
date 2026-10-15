@@ -1,0 +1,72 @@
+{
+  "name": "dsh-botplugin",
+  "version": "1.0.69",
+  "description": "Telegram and WeChat bridges plus handoff continuity for DeepSeek Harness (DSH)",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "telegram",
+    "telegram-bot",
+    "wechat",
+    "wechat-bot",
+    "bot",
+    "bridge",
+    "handoff"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aitcmhk-web/DSH-bot.git"
+  },
+  "homepage": "https://github.com/aitcmhk-web/DSH-bot#readme",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "vendor",
+    "sync-model-blocks.mjs",
+    "cordis.patch.yml",
+    "setupbot.sh",
+    "setup-bot.sh",
+    "安装-mybot.command",
+    "dsh-mybot-安装包.zip",
+    "weixin-login.mjs",
+    "qr-terminal.mjs",
+    "restart-helper.sh",
+    "setupdsh.sh",
+    "setupdsh-helper.sh",
+    "功能说明.txt",
+    "使用说明.txt",
+    "test-image-admit.mjs",
+    "test-image-e2e.mjs",
+    "test-model-sync.mjs",
+    "test-mailbox.mjs",
+    "test-route-display.mjs",
+    "test-sticky-pick.mjs",
+    "test-sticky-pick-child.mjs",
+    "HARD-RULES.md",
+    "!src/*.bak.*",
+    "!src/*.bak-*",
+    "!*.bak.*"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "bin": {
+    "dsh-weixin-login": "./weixin-login.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
+  }
+}
