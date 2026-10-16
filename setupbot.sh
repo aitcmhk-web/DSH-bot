@@ -34,7 +34,7 @@ ARG_PROFILE="${1:-}"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-16.1"
+SELF_VERSION="2026-10-16.2"
 
 SETUPBOT_URL="${SETUPBOT_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh}"
 SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot}"
@@ -968,6 +968,9 @@ write_launchers() {
   put "$CTL" 'WS="$(cd "$(dirname "$0")" && pwd)"'
   put "$CTL" "export DSH_HOME=\"$DSH_HOME_DIR\""
   put "$CTL" "DSH=\"$DSHBIN\""
+  # dsh 的启动行是 #!/usr/bin/env node；非交互 shell（cron、systemd、ssh 直跑）里没有 nvm 那层，
+  # 不给 PATH 就会卡在 env: 'node': No such file or directory。
+  put "$CTL" "export PATH=\"$(dirname "$DSHBIN"):\$PATH\""
   # ⚠️ 写入 PROFILE（setupbot 运行时的值），同时加兜底：如果为空从工作区目录名推断
   put "$CTL" "PROFILE=\"${PROFILE}\""
   put "$CTL" '[ -z "${PROFILE:-}" ] && PROFILE="$(basename "$WS")"'
