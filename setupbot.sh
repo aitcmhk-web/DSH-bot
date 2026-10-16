@@ -34,7 +34,7 @@ ARG_PROFILE="${1:-}"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-16.4"
+SELF_VERSION="2026-10-16.5"
 
 SETUPBOT_URL="${SETUPBOT_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh}"
 SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot}"
@@ -936,12 +936,10 @@ ensure_provider_block() {
 }
 
 # ============ 5.8 内置 DeepSeek 档位预设 ============
-# 安装时给了 DeepSeek 的 key，就把官方档位显式声明进本 profile：只存 key 不声明档位，
+# 安装时给了 DeepSeek 的 key，就把官方档位显式声明进配置：只存 key 不声明档位，
 # 菜单里一个模型都不会出 —— 表现就是「收得到消息、答不上话」。
 # 为什么声明而不是运行时兜底：菜单只认「配置里写过的档」，运行时拿出厂表补属于凭空多出条目。
-# ⚠️ 只加不减：本 profile 已经写过 `llm-deepseek`（哪怕 models 是空的）就一个字都不动 ——
-#    用户只留一个模型靠的就是改自己那份声明，不能被这里覆盖回去。
-# ⚠️ 与 ensure_provider_block 同一套：config 是整体替换，临时文件 + mv 原子替换。
+# 两份落点与「只加不减」的规则写在 ensure_ds_preset / ds_preset_into 上。
 DS_PRESET='- id: llm-deepseek
   name: "@deepseek-ai/dsh-llm-deepseek-api-key"
   config:
@@ -952,30 +950,48 @@ DS_PRESET='- id: llm-deepseek
       - id: deepseek-v4-pro
         name: DeepSeek-V4-Pro'
 ensure_ds_preset() {
-  cfg="$PROFILES/$PROFILE/cordis.patch.yml"
-  [ -f "$cfg" ] || return 0
   cred="$DSH_HOME_DIR/.credentials.yaml"
   if ! { [ -f "$cred" ] && grep -qE '^[[:space:]]+DEEPSEEK_API_KEY[[:space:]]*:' "$cred" 2>/dev/null; } \
      && [ -z "${DEEPSEEK_API_KEY:-}" ]; then
     return 0
   fi
-  if grep -qE '^[[:space:]]*-[[:space:]]*id:[[:space:]]*llm-deepseek[[:space:]]*$' "$cfg" 2>/dev/null; then
-    return 0
+  # 返回 0 = 写了；1 = 已经声明过（不动）；2 = 写失败
+  wrote=""
+  rc=0
+  ds_preset_into "$PROFILES/$PROFILE/cordis.patch.yml"; c=$?
+  [ "$c" = 2 ] && rc=1
+  [ "$c" = 0 ] && wrote=1
+  ds_preset_into "$PROFILES/web/cordis.patch.yml"; c=$?
+  [ "$c" = 2 ] && rc=1
+  [ "$c" = 0 ] && wrote=1
+  [ "$wrote" = 1 ] || return "$rc"
+  MODEL_STATUS="${MODEL_STATUS:+${MODEL_STATUS}；}官方 DeepSeek 档位（deepseek-flash / deepseek-v4-pro）"
+  say "✅ 官方 DeepSeek 档位已写进配置：deepseek-flash、deepseek-v4-pro（只想留一个，就去 web 端「设置 → 模型」删掉另一个）。"
+  return "$rc"
+}
+# 预设要落两份，缺一不可：
+#   ① 本 profile 的 cordis.patch.yml —— provider 注册在它自己身上，缺了就答不上话；
+#   ② profiles/web/cordis.patch.yml —— 插件的模型菜单直接读这份（web 端「设置 → 模型」的落盘）。
+# ⚠️ 只加不减：哪份已经写过 `llm-deepseek`（哪怕 models 是空的），哪份就一个字不动。
+# ⚠️ 与 ensure_provider_block 同一套：config 是整体替换，临时文件 + mv 原子替换。
+ds_preset_into() {
+  f="$1"
+  if grep -qE '^[[:space:]]*-[[:space:]]*id:[[:space:]]*llm-deepseek[[:space:]]*$' "$f" 2>/dev/null; then
+    return 1
   fi
-  tmp="$cfg.$$.tmp"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  tmp="$f.$$.tmp"
   {
-    if [ -s "$cfg" ]; then
-      body="$(grep -vE '^[[:space:]]*(#|$)' "$cfg" | tr -d '[:space:]')"
+    if [ -s "$f" ]; then
+      body="$(grep -vE '^[[:space:]]*(#|$)' "$f" | tr -d '[:space:]')"
     else
       body=""
     fi
-    if [ -n "$body" ] && [ "$body" != "[]" ]; then cat "$cfg"; fi
+    if [ -n "$body" ] && [ "$body" != "[]" ]; then cat "$f"; fi
     printf '%s\n' "$DS_PRESET"
     :
-  } > "$tmp" || { rm -f "$tmp"; return 1; }
-  mv "$tmp" "$cfg" || { rm -f "$tmp"; return 1; }
-  MODEL_STATUS="${MODEL_STATUS:+${MODEL_STATUS}；}官方 DeepSeek 档位（deepseek-flash / deepseek-v4-pro）"
-  say "✅ 官方 DeepSeek 档位已写进配置：deepseek-flash、deepseek-v4-pro（只想留一个，就去 web 端「设置 → 模型」删掉另一个）。"
+  } > "$tmp" || { rm -f "$tmp"; return 2; }
+  mv "$tmp" "$f" || { rm -f "$tmp"; return 2; }
   return 0
 }
 
