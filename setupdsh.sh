@@ -29,7 +29,7 @@ SRC_PATH="$0"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-16.5"
+SELF_VERSION="2026-10-16.6"
 
 SETUPDSH_URL="${SETUPDSH_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh}"
 SELF_DIR="$HOME/.dsh/setupdsh"
@@ -227,7 +227,7 @@ ensure_dsh() {
 # ⚠️ 这里写死的 tag 必须是**本次发布自己的 tag**（发新版本时同步改，别漏）。
 #    走 TG 菜单那条路会先上网拉最新这份脚本再跑，所以实际生效的永远是网上最新的 tag；
 #    没网时才退回包里这份 —— 那时它也只能装这个 tag。
-SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.73}"
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.74}"
 # ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
 #    ⛔ 绝不拿日期或路径冒充版本号。
 plugin_version() {
@@ -303,10 +303,71 @@ upgrade_plugins() {
 # ⚠️ sync-from-web.mjs 只重写 llm 托管块、其余原样搬运，补的块不会被冲。
 HARD_RULES_MARK='id: hard-rules'
 HARD_RULES_SRC='/Users/tcm/DSH/hard-rules/index.mjs'
+# strip_dead_hardrules — 清掉「指向的规则源根本不在本机」的 hard-rules 块。
+# 别的机器（Linux 服务器等）没有那份 file:// 源文件，块挂上去永远加载不了，
+# 是一段纯粹的脏引用。只删「源文件确实不存在」的块：开发机上规则源在，一个字不动。
+strip_dead_hardrules() {
+  PF="$1"
+  grep -q "$HARD_RULES_MARK" "$PF" 2>/dev/null || return 0
+  # 认块：先找条目行（排除注释掉的），再在它下面几行里找 file:// 引用
+  ID_LINE="$(awk '/^[^#]*id: *hard-rules/ { print NR; exit }' "$PF" 2>/dev/null)"
+  [ -n "$ID_LINE" ] || return 0
+  REF_LINE="$(awk -v s="$ID_LINE" 'NR > s && NR <= s + 5 && /file:\/\// { print NR; exit }' "$PF" 2>/dev/null)"
+  [ -n "$REF_LINE" ] || return 0
+  REF="$(sed -n "${REF_LINE}p" "$PF" | sed -e 's/.*file:\/\///' -e 's/".*//' -e 's/[[:space:]]*$//')"
+  [ -n "$REF" ] || return 0
+  if [ -f "$REF" ]; then return 0; fi
+  # 算出整块的起止行：起 = 条目行 + 它上面那串提到 hard-rules 的注释（含 - insert: 壳）
+  # 止 = 缩进比条目行更深的续行（name: 及其它子键）
+  RANGE="$(awk -v id="$ID_LINE" '
+    { L[NR] = $0 }
+    END {
+      s = id
+      if (id > 1 && L[id-1] ~ /^[[:space:]]*-[[:space:]]*insert:[[:space:]]*$/) s = id - 1
+      j = s - 1; found = 0; start = s; cnt = 0
+      while (j >= 1 && cnt < 6) {
+        if (L[j] !~ /^[[:space:]]*#/) break
+        if (L[j] ~ /hard-rules/) found = 1
+        start = j; j = j - 1; cnt = cnt + 1
+      }
+      if (found == 1 && start < s) s = start
+      if (s > 1 && L[s-1] ~ /^[[:space:]]*$/) s = s - 1
+      ind = L[id]; sub(/[^ ].*/, "", ind); n = length(ind)
+      e = id; i = id + 1
+      while (i <= NR) {
+        if (L[i] ~ /^[[:space:]]*$/) break
+        pre = L[i]; sub(/[^ ].*/, "", pre)
+        if (length(pre) <= n) break
+        e = i; i = i + 1
+      }
+      print s " " e
+    }
+  ' "$PF" 2>/dev/null)"
+  S="${RANGE%% *}"; E="${RANGE##* }"
+  case "$S" in ''|*[!0-9]*) return 0;; esac
+  case "$E" in ''|*[!0-9]*) return 0;; esac
+  STAMP="$(date +%Y%m%d-%H%M%S)"
+  cp "$PF" "${PF}.bak-hardrules-dead-${STAMP}" || { say "⚠️ ${PF} 备份失败，死块没清"; return 0; }
+  if awk -v s="$S" -v e="$E" 'NR < s || NR > e' "$PF" > "${PF}.setupdsh-tmp" 2>/dev/null; then
+    # 删完一条条目都不剩就补一行 `[]`（空 patch 的规范写法），别留个解析不出的空文件
+    if ! grep -qE '^[[:space:]]*-[[:space:]]' "${PF}.setupdsh-tmp" 2>/dev/null; then
+      printf '%s\n' '[]' >> "${PF}.setupdsh-tmp"
+    fi
+    if mv "${PF}.setupdsh-tmp" "$PF"; then
+      say "🧹 清掉 hard-rules 死块（它指向的 ${REF} 在这台机器上不存在）：$(basename "$(dirname "$PF")")（备份 .bak-hardrules-dead-${STAMP}）"
+    else
+      rm -f "${PF}.setupdsh-tmp" 2>/dev/null || true
+      say "⚠️ ${PF} 死块清理失败（保留原文件）"
+    fi
+  else
+    rm -f "${PF}.setupdsh-tmp" 2>/dev/null || true
+    say "⚠️ ${PF} 死块清理失败（保留原文件）"
+  fi
+}
+
 ensure_hardrules_block() {
-  # 这份插件只存在于装了它的那台机器；别的机器（Linux 服务器等）没有源文件，
-  # 补挂只会留下一个指向不存在路径的 file:// 死引用 —— 直接跳过。
-  [ -f "$HARD_RULES_SRC" ] || return 0
+  # ⚠️ 本机没有规则源（别人的机器）也要往下走 —— 得把历史留下的死块清掉，
+  #    清完再决定补不补；源不在就只清不补。
   HARD_BLOCK='
 # ── 最高指令：每次动手类工具（bash/edit/write）跑完，把规则原文重新顶进上下文 ──
 #    实现 /Users/tcm/DSH/hard-rules/index.mjs，规则 /Users/tcm/DSH/BOT/HARD-RULES.md
@@ -321,6 +382,9 @@ ensure_hardrules_block() {
   printf '%s\n' "$PATCHLIST" > "$PATCHLIST_FILE" 2>/dev/null || return 0
   while IFS= read -r PF; do
     [ -n "$PF" ] || continue
+    # ① 先清历史死块；② 本机没有规则源就只清不补；③ 本机有源且已有块就不重复补。
+    strip_dead_hardrules "$PF"
+    [ -f "$HARD_RULES_SRC" ] || continue
     if grep -q "$HARD_RULES_MARK" "$PF" 2>/dev/null; then continue; fi
     STAMP="$(date +%Y%m%d-%H%M%S)"
     cp "$PF" "${PF}.bak-hardrules-${STAMP}" || { say "⚠️ ${PF} 备份失败，跳过补挂"; continue; }

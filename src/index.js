@@ -100,7 +100,7 @@ export const Config = Schema.object({
   asrBackend: Schema.string().default('ali')
     .description('语音转文字后端：ali（默认，线上 qwen3-asr-flash ~0.6s，走模型网关，失败自动回退本地）、sensevoice（本地 FunASR，中文准）或 whisper（中文差，要用得显式填）'),
   asrWhisperBin: Schema.string().description('whisper 可执行文件路径（只有 asrBackend=whisper 时才用到）'),
-  asrPythonBin: Schema.string().description('python 解释器路径（sensevoice 用，默认 /opt/homebrew/bin/python3.11）'),
+  asrPythonBin: Schema.string().description('python 解释器路径（sensevoice 用；不填就自己找：mac 先 /opt/homebrew/bin/python3.11，Linux 先 /usr/bin/python3，再退回 PATH 里的 python3）'),
   asrKeepalive: Schema.boolean().default(false)
     .description('是否启用常驻转写服务（省掉每次约 7 秒的模型加载，代价是常驻约 1.5GB 内存）'),
   asrKeepalivePort: Schema.number().default(18081).description('常驻服务端口'),

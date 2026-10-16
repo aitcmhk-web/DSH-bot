@@ -34,7 +34,7 @@ ARG_PROFILE="${1:-}"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-16.5"
+SELF_VERSION="2026-10-16.6"
 
 SETUPBOT_URL="${SETUPBOT_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh}"
 SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot}"
@@ -1164,6 +1164,9 @@ write_launchers() {
     put "$f" 'else'
     put "$f" '  echo "⛔ 装了但 launchctl 里看不到，把上面几行发我。"'
     put "$f" 'fi'
+    # bot 装完顺带把 web 端（模型设置页）也装上自启 —— 用户只跑这一次
+    put "$f" 'echo'
+    put "$f" 'if [ -f "$(pwd)/install-web-autostart.command" ]; then sh "$(pwd)/install-web-autostart.command" < /dev/null; fi'
     put "$f" 'pause'
     chmod +x "$f" 2>/dev/null
 
@@ -1188,6 +1191,92 @@ write_launchers() {
     put "$f" 'else'
     put "$f" '  echo "✅ 已取消开机自启（自启文件已删）。"'
     put "$f" '  if [ "$ran" = "1" ]; then echo "   （刚才那份进程也被 launchd 一起停了；要手动跑就 ./start.command）"; fi'
+    put "$f" 'fi'
+    # 取消自启是「整个开机自启」这件事，web 端那份一起收掉
+    put "$f" 'if [ -f "$(pwd)/uninstall-web-autostart.command" ]; then echo; sh "$(pwd)/uninstall-web-autostart.command" < /dev/null; fi'
+    put "$f" 'pause'
+    chmod +x "$f" 2>/dev/null
+
+    # ---- web 端（模型设置页）自启：单独一对 .command ----
+    f="$WS/install-web-autostart.command"
+    : > "$f" 2>/dev/null || return 1
+    head_fn "$f" '安装 web 自启' "让模型设置页（web 端）开机自动跑" './install-web-autostart.command'
+    put "$f" "DSH=\"$DSHBIN\""
+    put "$f" "export DSH_HOME=\"$DSH_HOME_DIR\""
+    put "$f" 'WS="$(pwd)"'
+    put "$f" 'LABEL="com.local.dshweb"'
+    put "$f" 'PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"'
+    put "$f" ''
+    put "$f" 'echo "给 web 端（模型设置页）装开机自启"'
+    put "$f" 'echo "──────────────"'
+    put "$f" 'if ! mkdir -p "$HOME/Library/LaunchAgents" 2>/dev/null; then'
+    put "$f" '  echo "⛔ 建不了 ~/Library/LaunchAgents，装不了。"; pause; exit 1'
+    put "$f" 'fi'
+    put "$f" 'if [ -f "$PLIST" ]; then'
+    put "$f" '  cp -p "$PLIST" "$PLIST.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null && echo "（旧的自启文件已备份成 $PLIST.bak.…）"'
+    put "$f" 'fi'
+    put "$f" 'cat > "$PLIST" <<PLIST_EOF'
+    put "$f" '<?xml version="1.0" encoding="UTF-8"?>'
+    put "$f" '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    put "$f" '<plist version="1.0">'
+    put "$f" '<dict>'
+    put "$f" '  <key>Label</key><string>${LABEL}</string>'
+    put "$f" '  <key>ProgramArguments</key>'
+    put "$f" '  <array>'
+    put "$f" '    <string>${DSH}</string>'
+    put "$f" '    <string>--profile</string>'
+    put "$f" '    <string>web</string>'
+    put "$f" '    <string>--no-open</string>'
+    put "$f" '  </array>'
+    put "$f" '  <key>WorkingDirectory</key><string>${WS}</string>'
+    put "$f" '  <key>EnvironmentVariables</key>'
+    put "$f" '  <dict>'
+    put "$f" '    <key>DSH_HOME</key><string>${DSH_HOME}</string>'
+    put "$f" '    <key>PATH</key><string>${PATH}</string>'
+    put "$f" '  </dict>'
+    put "$f" '  <key>RunAtLoad</key><true/>'
+    put "$f" '  <key>StandardOutPath</key><string>${WS}/web.log</string>'
+    put "$f" '  <key>StandardErrorPath</key><string>${WS}/web.log</string>'
+    put "$f" '</dict>'
+    put "$f" '</plist>'
+    put "$f" 'PLIST_EOF'
+    put "$f" 'if ! plutil -lint "$PLIST" >/dev/null 2>&1; then'
+    put "$f" '  echo "⛔ 生成的自启文件格式不对，没有安装。把上面几行发我。"; pause; exit 1'
+    put "$f" 'fi'
+    put "$f" 'launchctl unload "$PLIST" 2>/dev/null || true'
+    put "$f" 'if ! launchctl load "$PLIST" 2>/dev/null; then'
+    put "$f" '  echo "⛔ launchctl load 失败了，把上面几行发我。"; pause; exit 1'
+    put "$f" 'fi'
+    put "$f" 'sleep 3'
+    put "$f" 'if launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
+    put "$f" '  echo "✅ web 端装好了：以后开机（登录）模型设置页自己就起来。"'
+    put "$f" '  echo "   入口网址（每次启动都换，带一次性口令）：grep \"dsh web:\" \"${WS}/web.log\" | tail -1"'
+    put "$f" '  echo "   取消自启：跑 ./uninstall-web-autostart.command"'
+    put "$f" 'else'
+    put "$f" '  echo "⛔ web 端装了但 launchctl 里看不到，把上面几行发我。"'
+    put "$f" 'fi'
+    put "$f" 'pause'
+    chmod +x "$f" 2>/dev/null
+
+    f="$WS/uninstall-web-autostart.command"
+    : > "$f" 2>/dev/null || return 1
+    head_fn "$f" '卸载 web 自启' "取消模型设置页（web 端）的开机自启" './uninstall-web-autostart.command'
+    put "$f" 'LABEL="com.local.dshweb"'
+    put "$f" 'PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"'
+    put "$f" ''
+    put "$f" 'echo "取消模型设置页（web 端）的开机自启"'
+    put "$f" 'echo "──────────────"'
+    put "$f" 'ran=0'
+    put "$f" 'if [ -f "$PLIST" ]; then'
+    put "$f" '  if launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
+    put "$f" '    launchctl unload "$PLIST" 2>/dev/null && ran=1 || true'
+    put "$f" '  fi'
+    put "$f" '  rm -f "$PLIST" 2>/dev/null'
+    put "$f" 'fi'
+    put "$f" 'if [ -f "$PLIST" ] || launchctl list 2>/dev/null | grep -qF "$LABEL"; then'
+    put "$f" '  echo "⛔ 没卸干净，把上面几行发我。"'
+    put "$f" 'else'
+    put "$f" '  echo "✅ 已取消 web 端的开机自启（自启文件已删）。"'
     put "$f" 'fi'
     put "$f" 'pause'
     chmod +x "$f" 2>/dev/null
@@ -1222,6 +1311,10 @@ write_launchers() {
       SVC_NAME="dsh-bot-${PROFILE}"
       SVC_FILE="/etc/systemd/system/${SVC_NAME}.service"
       SVC_BAK="${SVC_FILE}.setupdsh-bak"
+      # web 端（模型设置页）是另一个进程、另一个 unit：跟 bot 各起各的，
+      # 但装/卸跟着这对脚本一起走 —— 用户只跑一次 install-autostart。
+      WEB_SVC_NAME="dsh-web"
+      WEB_SVC_FILE="/etc/systemd/system/${WEB_SVC_NAME}.service"
 
       f="$WS/install-autostart.sh"
       : > "$f" 2>/dev/null || return 1
@@ -1258,17 +1351,35 @@ write_launchers() {
       put "$f" 'Environment=DSH_HOME=${DSH_HOME_DIR}'
       # dsh 的启动行是 #!/usr/bin/env node；systemd 默认 PATH 里没有 nvm 那层，不给就找不到 node。
       put "$f" "Environment=PATH=$(dirname "$DSHBIN"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      # 没有 [Install] 段，systemctl enable 只会打一句「unit files have no installation config」
+      # 然后什么都不做（退出码仍是 0）—— 服务当次能起来，但开机不会自己起。
+      put "$f" '[Install]'
+      put "$f" 'WantedBy=multi-user.target'
       put "$f" 'SVC_EOF'
       put "$f" 'sed -i "s|\${WS}|$(echo "$WS" | sed "s|/|\\\\\/|g")|g" "$SVC_FILE"'
       put "$f" 'sed -i "s|\${DSH_HOME_DIR}|$(echo "$DSH_HOME_DIR" | sed "s|/|\\\\\/|g")|g" "$SVC_FILE"'
       put "$f" 'if [ -f "$SVC_FILE" ]; then cp -p "$SVC_FILE" "$SVC_BAK" 2>/dev/null; fi'
       put "$f" 'if sudo systemctl daemon-reload && sudo systemctl enable "${SVC_NAME}" && sudo systemctl start "${SVC_NAME}"; then'
-      put "$f" '  echo "✅ 装好了：systemd 管理，开机自启、崩溃自动重启。"'
+      # enable 对没有 [Install] 的 unit 会「报个警告但退出码 0」，所以必须回头查 is-enabled，
+      # 不能凭 enable 没报错就说「开机自启装好了」。
+      put "$f" '  EN="$(sudo systemctl is-enabled "${SVC_NAME}" 2>/dev/null || echo unknown)"'
+      put "$f" '  if [ "$EN" = "enabled" ]; then'
+      put "$f" '    echo "✅ 装好了：systemd 管理，开机自启、崩溃自动重启。"'
+      put "$f" '  else'
+      put "$f" '    echo "⚠️ 服务在跑，但开机自启没设上（is-enabled=${EN}）—— 开机后不会自己起，把上面几行发我。"'
+      put "$f" '  fi'
       put "$f" '  echo "   查看状态：systemctl status ${SVC_NAME}"'
       put "$f" '  echo "   取消自启：./uninstall-autostart.sh"'
       put "$f" 'else'
       put "$f" '  echo "⛔ systemd 安装失败（可能需要 root 权限）。"'
       put "$f" '  echo "   手动启动：cd ${WS} && nohup ${DSH} --profile ${PROFILE} >> bot.log 2>&1 &"'
+      put "$f" 'fi'
+      # bot 装完顺带把 web 端（模型设置页）也装上自启 —— 用户只跑这一次
+      put "$f" 'echo'
+      put "$f" 'if [ -x "$(pwd)/install-web-autostart.sh" ]; then'
+      put "$f" '  "$(pwd)/install-web-autostart.sh"'
+      put "$f" 'else'
+      put "$f" '  echo "（没找到 install-web-autostart.sh，web 端自启这次没装；重跑一次 setupbot 再来。）"'
       put "$f" 'fi'
       chmod +x "$f" 2>/dev/null
 
@@ -1287,6 +1398,79 @@ write_launchers() {
       put "$f" 'rm -f "$SVC_FILE" 2>/dev/null'
       put "$f" 'sudo systemctl daemon-reload 2>/dev/null || true'
       put "$f" 'echo "✅ 已取消开机自启（service 文件已删）。"'
+      # 取消自启是「整个开机自启」这件事，web 端那份一起收掉
+      put "$f" 'if [ -x "$(pwd)/uninstall-web-autostart.sh" ]; then'
+      put "$f" '  echo'
+      put "$f" '  "$(pwd)/uninstall-web-autostart.sh"'
+      put "$f" 'fi'
+      chmod +x "$f" 2>/dev/null
+
+      # ---- web 端（模型设置页）自启：单独一对脚本 ----
+      f="$WS/install-web-autostart.sh"
+      : > "$f" 2>/dev/null || return 1
+      put "$f" '#!/bin/sh'
+      put "$f" '# 给 web 端（模型设置页）装开机自启（systemd）'
+      put "$f" 'WS="$(cd "$(dirname "$0")" && pwd)"'
+      put "$f" "DSH=\"${DSHBIN}\""
+      put "$f" "export DSH_HOME=\"${DSH_HOME_DIR}\""
+      put "$f" 'DSH_HOME_DIR="$DSH_HOME"'
+      put "$f" "WEB_SVC_NAME=\"${WEB_SVC_NAME}\""
+      put "$f" "WEB_SVC_FILE=\"${WEB_SVC_FILE}\""
+      put "$f" 'echo "给 web 端（模型设置页）装开机自启（systemd）"'
+      put "$f" 'echo "──────────────"'
+      put "$f" 'cat > "$WEB_SVC_FILE" <<WEB_EOF'
+      put "$f" '[Unit]'
+      put "$f" 'Description=DSH Web UI (--profile web)'
+      put "$f" 'After=network.target'
+      put "$f" ''
+      put "$f" '[Service]'
+      put "$f" 'Type=simple'
+      put "$f" "User=${USER:-root}"
+      put "$f" 'WorkingDirectory=${WS}'
+      # --no-open：headless 机器没有图形界面，不带这个参数它会去调 xdg-open 失败
+      put "$f" "ExecStart=${DSHBIN} --profile web --no-open"
+      put "$f" 'Restart=on-failure'
+      put "$f" 'RestartSec=5'
+      put "$f" 'StandardOutput=append:${WS}/web.log'
+      put "$f" 'StandardError=append:${WS}/web.log'
+      put "$f" 'Environment=DSH_HOME=${DSH_HOME_DIR}'
+      put "$f" "Environment=PATH=$(dirname "$DSHBIN"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      put "$f" '[Install]'
+      put "$f" 'WantedBy=multi-user.target'
+      put "$f" 'WEB_EOF'
+      put "$f" 'sed -i "s|\${WS}|$(echo "$WS" | sed "s|/|\\\\\/|g")|g" "$WEB_SVC_FILE"'
+      put "$f" 'sed -i "s|\${DSH_HOME_DIR}|$(echo "$DSH_HOME_DIR" | sed "s|/|\\\\\/|g")|g" "$WEB_SVC_FILE"'
+      # restart 而不是 start：unit 内容换过、老实例还在跑时也要换掉，入口网址才是新的
+      put "$f" 'if sudo systemctl daemon-reload && sudo systemctl enable "${WEB_SVC_NAME}" && sudo systemctl restart "${WEB_SVC_NAME}"; then'
+      put "$f" '  EN="$(sudo systemctl is-enabled "${WEB_SVC_NAME}" 2>/dev/null || echo unknown)"'
+      put "$f" '  if [ "$EN" = "enabled" ]; then'
+      put "$f" '    echo "✅ web 端装好了：开机自启，模型设置页随时能开。"'
+      put "$f" '  else'
+      put "$f" '    echo "⚠️ web 端在跑，但开机自启没设上（is-enabled=${EN}）。"'
+      put "$f" '  fi'
+      put "$f" '  echo "   入口网址（每次启动都换，带一次性口令）：grep \"dsh web:\" \"${WS}/web.log\" | tail -1"'
+      put "$f" '  echo "   想换新网址：sudo systemctl restart ${WEB_SVC_NAME}"'
+      put "$f" '  echo "   取消自启：./uninstall-web-autostart.sh"'
+      put "$f" 'else'
+      put "$f" '  echo "⛔ web 端 systemd 安装失败（可能需要 root 权限）。"'
+      put "$f" 'fi'
+      chmod +x "$f" 2>/dev/null
+
+      f="$WS/uninstall-web-autostart.sh"
+      : > "$f" 2>/dev/null || return 1
+      put "$f" '#!/bin/sh'
+      put "$f" '# 取消 web 端（模型设置页）的开机自启（systemd）'
+      put "$f" "WEB_SVC_NAME=\"${WEB_SVC_NAME}\""
+      put "$f" "WEB_SVC_FILE=\"${WEB_SVC_FILE}\""
+      put "$f" 'echo "取消 web 端（模型设置页）的开机自启（systemd）"'
+      put "$f" 'echo "──────────────"'
+      put "$f" 'if sudo systemctl is-active "${WEB_SVC_NAME}" >/dev/null 2>&1; then'
+      put "$f" '  sudo systemctl stop "${WEB_SVC_NAME}" 2>/dev/null || true'
+      put "$f" '  sudo systemctl disable "${WEB_SVC_NAME}" 2>/dev/null || true'
+      put "$f" 'fi'
+      put "$f" 'rm -f "$WEB_SVC_FILE" 2>/dev/null'
+      put "$f" 'sudo systemctl daemon-reload 2>/dev/null || true'
+      put "$f" 'echo "✅ 已取消 web 端的开机自启（service 文件已删）。"'
       chmod +x "$f" 2>/dev/null
     else
       # 无 systemd：提示手动 nohup
@@ -1309,6 +1493,7 @@ write_launchers() {
       put "$f" '#!/bin/sh'
       put "$f" 'sleep 10'
       put "$f" 'cd "$WS" && nohup "$DSH" --profile "$PROFILE" >> "$WS/bot.log" 2>&1 </dev/null &'
+      put "$f" 'cd "$WS" && nohup "$DSH" --profile web --no-open >> "$WS/web.log" 2>&1 </dev/null &'
       put "$f" 'EOF'
       put "$f" 'chmod +x "$rc"'
       put "$f" 'echo "✅ 写了 ~/.config/start-dsh-bot.sh，需要配合 crontab -e 加一行："'
@@ -1343,10 +1528,19 @@ write_launchers() {
 # 本机有没有我们用的本地语音引擎：阿里 FunASR SenseVoice（python3.11 + funasr）。
 # ⛔ 只检测、只提示 —— 装什么、占多少磁盘是用户的事，绝不自动安装。
 # ⛔ 不看 whisper：中文识别太差，我们不用它（真要用得显式配 asrBackend=whisper）。
-VOICE_PY="/opt/homebrew/bin/python3.11"
+VOICE_PY="/opt/homebrew/bin/python3.11"   # mac 上先看这个；Linux 上看 python3
+VOICE_PY_FOUND=""
 
+# 哪个解释器装了 funasr。顺序对齐插件 src/asr.js 的 findPython()：
+# mac 先 /opt/homebrew/bin/python3.11，Linux 先 /usr/bin/python3，最后退回 PATH 里的 python3。
 voice_engine_ready() {
-  if [ -x "$VOICE_PY" ] && "$VOICE_PY" -c 'import funasr' >/dev/null 2>&1; then return 0; fi
+  VOICE_PY_FOUND=""
+  P3="$(command -v python3 2>/dev/null || true)"
+  for c in "$VOICE_PY" /opt/homebrew/bin/python3.11 /usr/bin/python3 /usr/local/bin/python3 ${P3}; do
+    [ -n "$c" ] || continue
+    [ -x "$c" ] || continue
+    if "$c" -c 'import funasr' >/dev/null 2>&1; then VOICE_PY_FOUND="$c"; return 0; fi
+  done
   return 1
 }
 
@@ -1357,9 +1551,14 @@ voice_engine_hint() {
   fi
   say ""
   say "🎙 语音：本机还没装语音转文字引擎（阿里 FunASR）—— 不装也能用，只是发语音转不了文字。"
-  say "   复制这一条装（需要 Homebrew）："
+  say "   复制这一条装："
   say ""
-  say "   brew install python@3.11 ffmpeg && /opt/homebrew/bin/python3.11 -m pip install -U funasr modelscope torch torchaudio soundfile"
+  if IS_MACOS; then
+    say "   brew install python@3.11 ffmpeg && /opt/homebrew/bin/python3.11 -m pip install -U funasr modelscope torch torchaudio soundfile"
+  else
+    # Ubuntu / Debian 的系统 python3 受 PEP 668 保护，不带 --break-system-packages 会被 pip 直接拒绝。
+    say "   sudo apt update && sudo apt install -y python3-pip ffmpeg && python3 -m pip install --break-system-packages -U funasr modelscope torch torchaudio soundfile"
+  fi
   say ""
   say "   装完直接发语音，不用改配置（约 900MB 的模型首次转写时自动下载）。"
   return 0
@@ -1443,6 +1642,34 @@ finish() {
   else
     say "启动：敲 dsh --profile ${PROFILE}"
   fi
+
+  # web 端（模型设置页）：只绑本机 127.0.0.1:3080（DSH 的默认：host 127.0.0.1 / port 3080），
+  # 它明确拒绝 --host 0.0.0.0（那等于把远程代码执行摊到网上），所以远程只有 SSH 隧道这一条路。
+  if IS_MACOS; then
+    say "模型设置页（web 端）：http://127.0.0.1:3080 —— 本机浏览器直接开（装过上面的开机自启后它会一直挂着）"
+  else
+    WEB_SSH_HOST=""
+    WEB_SSH_PORT=""
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+      WEB_SSH_HOST="$(printf '%s\n' "$SSH_CONNECTION" | awk '{print $3}')"
+      WEB_SSH_PORT="$(printf '%s\n' "$SSH_CONNECTION" | awk '{print $4}')"
+      # 连进来时看到的可能是内网地址（NAT / 跳板），那就不是用户能用的地址 → 留空去问公网口
+      case "$WEB_SSH_HOST" in
+        127.*|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|::1) WEB_SSH_HOST="" ;;
+      esac
+    fi
+    if [ -z "$WEB_SSH_HOST" ]; then
+      WEB_SSH_HOST="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    fi
+    [ -n "$WEB_SSH_HOST" ] || WEB_SSH_HOST="<这台机器的IP>"
+    [ -n "$WEB_SSH_PORT" ] || WEB_SSH_PORT="22"
+    say "模型设置页（web 端）：只绑这台机器的 127.0.0.1:3080，从你自己电脑上看要开隧道（开着别关）："
+    say "   ssh -N -L 3080:127.0.0.1:3080 $(id -un 2>/dev/null || echo root)@${WEB_SSH_HOST} -p ${WEB_SSH_PORT}"
+    say "   然后在服务器上取入口网址（每次启动都换，带一次性口令）："
+    say "   grep \"dsh web:\" ${LAUNCH_DIR}/${PROFILE}/web.log | tail -1"
+    say "   把取到的网址贴进浏览器，就是这台机器的模型设置页 —— 加减模型都在那儿。"
+  fi
+
   if [ -n "${SELF_BIN_DIR:-}" ]; then
     say "以后重绑 TG / 微信：敲 setupbot"
     say "以后升级（git / DSH 本体 / 插件）：敲 setupdsh"
