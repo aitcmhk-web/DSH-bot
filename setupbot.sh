@@ -34,7 +34,7 @@ ARG_PROFILE="${1:-}"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-01.6"
+SELF_VERSION="2026-10-16.1"
 
 SETUPBOT_URL="${SETUPBOT_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh}"
 SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot}"
@@ -1158,6 +1158,16 @@ write_launchers() {
       : > "$f" 2>/dev/null || return 1
       put "$f" '#!/bin/sh'
       put "$f" "# 给「${PROFILE}」装开机自启（systemd）"
+      # 生成出来的是独立进程，.botctl.sh 里的变量不会跟过来，必须自带一份：
+      # 缺了它们脚本自己跑不通（$SVC_FILE 为空），生成时读未定义变量也会中途中止。
+      put "$f" 'WS="$(cd "$(dirname "$0")" && pwd)"'
+      put "$f" "PROFILE=\"${PROFILE}\""
+      put "$f" "DSH=\"${DSHBIN}\""
+      put "$f" "export DSH_HOME=\"${DSH_HOME_DIR}\""
+      put "$f" 'DSH_HOME_DIR="$DSH_HOME"'
+      put "$f" "SVC_NAME=\"${SVC_NAME}\""
+      put "$f" "SVC_FILE=\"${SVC_FILE}\""
+      put "$f" "SVC_BAK=\"${SVC_BAK}\""
       put "$f" 'echo "给「${PROFILE}」装开机自启（systemd）"'
       put "$f" 'echo "──────────────"'
       put "$f" '"$(pwd)/.botctl.sh" stop'
@@ -1171,12 +1181,14 @@ write_launchers() {
       put "$f" 'Type=simple'
       put "$f" "User=${USER:-root}"
       put "$f" 'WorkingDirectory=${WS}'
-      put "$f" "ExecStart=${DSH} --profile ${PROFILE}"
+      put "$f" "ExecStart=${DSHBIN} --profile ${PROFILE}"
       put "$f" 'Restart=on-failure'
       put "$f" 'RestartSec=5'
       put "$f" 'StandardOutput=append:${WS}/bot.log'
       put "$f" 'StandardError=append:${WS}/bot.log'
       put "$f" 'Environment=DSH_HOME=${DSH_HOME_DIR}'
+      # dsh 的启动行是 #!/usr/bin/env node；systemd 默认 PATH 里没有 nvm 那层，不给就找不到 node。
+      put "$f" "Environment=PATH=$(dirname "$DSHBIN"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       put "$f" 'SVC_EOF'
       put "$f" 'sed -i "s|\${WS}|$(echo "$WS" | sed "s|/|\\\\\/|g")|g" "$SVC_FILE"'
       put "$f" 'sed -i "s|\${DSH_HOME_DIR}|$(echo "$DSH_HOME_DIR" | sed "s|/|\\\\\/|g")|g" "$SVC_FILE"'
@@ -1195,6 +1207,8 @@ write_launchers() {
       : > "$f" 2>/dev/null || return 1
       put "$f" '#!/bin/sh'
       put "$f" "# 取消「${PROFILE}」的开机自启（systemd）"
+      put "$f" "SVC_NAME=\"${SVC_NAME}\""
+      put "$f" "SVC_FILE=\"${SVC_FILE}\""
       put "$f" 'echo "取消「${PROFILE}」的开机自启（systemd）"'
       put "$f" 'echo "──────────────"'
       put "$f" 'if sudo systemctl is-active "${SVC_NAME}" >/dev/null 2>&1; then'
@@ -1211,6 +1225,11 @@ write_launchers() {
       : > "$f" 2>/dev/null || return 1
       put "$f" '#!/bin/sh'
       put "$f" "# 让「${PROFILE}」开机自启（nohup，无 systemd）"
+      # 同 systemd 分支：生成的文件是独立进程，变量必须自带（下面 rc 里的 $WS / $DSH 靠它们展开）。
+      put "$f" 'WS="$(cd "$(dirname "$0")" && pwd)"'
+      put "$f" "PROFILE=\"${PROFILE}\""
+      put "$f" "DSH=\"${DSHBIN}\""
+      put "$f" "export DSH_HOME=\"${DSH_HOME_DIR}\""
       put "$f" 'echo "这台机器没有 systemd，用 nohup 方式自启"'
       put "$f" 'echo "──────────────"'
       put "$f" '"$(pwd)/.botctl.sh" stop'

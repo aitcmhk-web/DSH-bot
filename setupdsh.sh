@@ -29,7 +29,7 @@ SRC_PATH="$0"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-02.8"
+SELF_VERSION="2026-10-16.1"
 
 SETUPDSH_URL="${SETUPDSH_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh}"
 SELF_DIR="$HOME/.dsh/setupdsh"
@@ -227,7 +227,7 @@ ensure_dsh() {
 # ⚠️ 这里写死的 tag 必须是**本次发布自己的 tag**（发新版本时同步改，别漏）。
 #    走 TG 菜单那条路会先上网拉最新这份脚本再跑，所以实际生效的永远是网上最新的 tag；
 #    没网时才退回包里这份 —— 那时它也只能装这个 tag。
-SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.69}"
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.70}"
 # ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
 #    ⛔ 绝不拿日期或路径冒充版本号。
 plugin_version() {
@@ -302,7 +302,11 @@ upgrade_plugins() {
 # 改前逐份备份，临时文件 + mv 原子替换（bot 运行时 HMR 会热重载 patch，不能留中间态）。
 # ⚠️ sync-from-web.mjs 只重写 llm 托管块、其余原样搬运，补的块不会被冲。
 HARD_RULES_MARK='id: hard-rules'
+HARD_RULES_SRC='/Users/tcm/DSH/hard-rules/index.mjs'
 ensure_hardrules_block() {
+  # 这份插件只存在于装了它的那台机器；别的机器（Linux 服务器等）没有源文件，
+  # 补挂只会留下一个指向不存在路径的 file:// 死引用 —— 直接跳过。
+  [ -f "$HARD_RULES_SRC" ] || return 0
   HARD_BLOCK='
 # ── 最高指令：每次动手类工具（bash/edit/write）跑完，把规则原文重新顶进上下文 ──
 #    实现 /Users/tcm/DSH/hard-rules/index.mjs，规则 /Users/tcm/DSH/BOT/HARD-RULES.md
@@ -320,7 +324,14 @@ ensure_hardrules_block() {
     if grep -q "$HARD_RULES_MARK" "$PF" 2>/dev/null; then continue; fi
     STAMP="$(date +%Y%m%d-%H%M%S)"
     cp "$PF" "${PF}.bak-hardrules-${STAMP}" || { say "⚠️ ${PF} 备份失败，跳过补挂"; continue; }
-    if cp "$PF" "${PF}.setupdsh-tmp" && printf '%s\n' "$HARD_BLOCK" >> "${PF}.setupdsh-tmp" && mv "${PF}.setupdsh-tmp" "$PF"; then
+    # 空 patch 里那行 `[]` 是一个已经结束的 YAML 文档；直接往后追加等于写出「第二个文档
+    # 却没有 --- 分隔」，dsh 解析时直接拒绝启动（实测）。已有条目的文件同属一个序列，照旧追加。
+    if grep -qE '^[[:space:]]*-[[:space:]]' "$PF" 2>/dev/null; then
+      cp "$PF" "${PF}.setupdsh-tmp"
+    else
+      { grep -vE '^[[:space:]]*(\[\][[:space:]]*|\{\}[[:space:]]*)$' "$PF" 2>/dev/null || true; } > "${PF}.setupdsh-tmp"
+    fi
+    if printf '%s\n' "$HARD_BLOCK" >> "${PF}.setupdsh-tmp" && mv "${PF}.setupdsh-tmp" "$PF"; then
       say "✅ 最高指令块已补挂：$(basename "$(dirname "$PF")")（备份 ${PF}.bak-hardrules-${STAMP}）"
     else
       rm -f "${PF}.setupdsh-tmp" 2>/dev/null || true
