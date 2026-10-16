@@ -34,7 +34,7 @@ ARG_PROFILE="${1:-}"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-16.2"
+SELF_VERSION="2026-10-16.4"
 
 SETUPBOT_URL="${SETUPBOT_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh}"
 SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot}"
@@ -761,7 +761,7 @@ if (!def) {
 const isLocal = (r) => /localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]/i.test(r.baseURL);
 const defRoute = def ? routes.find((r) => r.provider === def.provider && r.model === def.model) ?? null : null;
 const effective = defRoute ?? routes[0] ?? null;
-const hasModels = routes.length > 0 || dsModels.length > 0 || dsKey;
+const hasModels = routes.length > 0 || dsModels.length > 0;
 const keyOk = (r) => !r.apiKeyEnv || Boolean(refs[r.apiKeyEnv]) || Boolean(process.env[r.apiKeyEnv]);
 const nameDs = (r) =>
   /deepseek|深度求索|(^|[-_])ds([-_]|$)/i.test(r.provider) || /deepseek|深度求索/i.test(r.label);
@@ -805,6 +805,12 @@ ensure_model() {
   pget() { printf '%s\n' "$PROBE" | sed -n "s/^$1=//p" | head -1; }
 
   if [ "$(pget hasModels)" != "1" ]; then
+    if [ "$(pget dsKey)" = "1" ]; then
+      # 有 key、没档位：这也是「收得到消息、答不上话」的一种形态。别再问一遍 key，
+      # 交给后面的 ensure_ds_preset 按官方预设声明档位。
+      say "ℹ️ DeepSeek key 已经有了，只是没声明档位 —— 按官方预设补上。"
+      return 0
+    fi
     say "⚠️ 这台机器一个模型都没配 —— 没有模型的机器人收得到消息、答不上话（瞎子）。"
     ask "把 DeepSeek 的 API key 粘进来（形如 sk-...；不填直接回车 = 先跳过）："
     K="$(printf '%s' "${REPLY_V}" | tr -d '[:space:]')"
@@ -926,6 +932,50 @@ ensure_provider_block() {
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$cfg" || { rm -f "$tmp"; return 1; }
   say "✅ 模型表已同步：web 端「设置 → 模型」里的档位已复制进工作区 ${PROFILE}（不复制＝收得到消息、答不上话）。"
+  return 0
+}
+
+# ============ 5.8 内置 DeepSeek 档位预设 ============
+# 安装时给了 DeepSeek 的 key，就把官方档位显式声明进本 profile：只存 key 不声明档位，
+# 菜单里一个模型都不会出 —— 表现就是「收得到消息、答不上话」。
+# 为什么声明而不是运行时兜底：菜单只认「配置里写过的档」，运行时拿出厂表补属于凭空多出条目。
+# ⚠️ 只加不减：本 profile 已经写过 `llm-deepseek`（哪怕 models 是空的）就一个字都不动 ——
+#    用户只留一个模型靠的就是改自己那份声明，不能被这里覆盖回去。
+# ⚠️ 与 ensure_provider_block 同一套：config 是整体替换，临时文件 + mv 原子替换。
+DS_PRESET='- id: llm-deepseek
+  name: "@deepseek-ai/dsh-llm-deepseek-api-key"
+  config:
+    baseURL: https://api.deepseek.com/anthropic
+    models:
+      - id: deepseek-flash
+        name: DeepSeek-V41-Flash
+      - id: deepseek-v4-pro
+        name: DeepSeek-V4-Pro'
+ensure_ds_preset() {
+  cfg="$PROFILES/$PROFILE/cordis.patch.yml"
+  [ -f "$cfg" ] || return 0
+  cred="$DSH_HOME_DIR/.credentials.yaml"
+  if ! { [ -f "$cred" ] && grep -qE '^[[:space:]]+DEEPSEEK_API_KEY[[:space:]]*:' "$cred" 2>/dev/null; } \
+     && [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+    return 0
+  fi
+  if grep -qE '^[[:space:]]*-[[:space:]]*id:[[:space:]]*llm-deepseek[[:space:]]*$' "$cfg" 2>/dev/null; then
+    return 0
+  fi
+  tmp="$cfg.$$.tmp"
+  {
+    if [ -s "$cfg" ]; then
+      body="$(grep -vE '^[[:space:]]*(#|$)' "$cfg" | tr -d '[:space:]')"
+    else
+      body=""
+    fi
+    if [ -n "$body" ] && [ "$body" != "[]" ]; then cat "$cfg"; fi
+    printf '%s\n' "$DS_PRESET"
+    :
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$cfg" || { rm -f "$tmp"; return 1; }
+  MODEL_STATUS="${MODEL_STATUS:+${MODEL_STATUS}；}官方 DeepSeek 档位（deepseek-flash / deepseek-v4-pro）"
+  say "✅ 官方 DeepSeek 档位已写进配置：deepseek-flash、deepseek-v4-pro（只想留一个，就去 web 端「设置 → 模型」删掉另一个）。"
   return 0
 }
 
@@ -1404,5 +1454,6 @@ pick_wechat
 ensure_model
 write_bot_config || die "配置文件没写成功（${PROFILES}/${PROFILE}/cordis.patch.yml）。把 setupbot 再跑一遍；还不行就把上面几行发我。"
 ensure_provider_block || say "⚠️ web 端的模型表没能复制进工作区 ${PROFILE} —— 先去 web 端「设置 → 模型」配好模型，再把 setupbot 跑一遍。"
+ensure_ds_preset || say "⚠️ 官方 DeepSeek 档位没能写进工作区 ${PROFILE}（配置不可写？）—— 现在只有 key、没有档位，机器人会答不上话。"
 finish
 exit 0
