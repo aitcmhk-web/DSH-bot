@@ -33,7 +33,7 @@ import { Hub, makeMessage, markAsHubOutput } from './hub.js';
 import { buildRoutes, routeByKey, routeFor, describeRoute, isRouteFailure, reasoningEffortFor } from './models.js';
 import { readWebLlmPiAi, readWebLlmDeepseek, readWebLlmDeepseekAccount, webPatchPath } from './web-patch.js';
 import { syncOwnProfileFromWeb } from './model-sync.js';
-import { LiveStatus, describeTool } from './status.js';
+import { LiveStatus, describeTool, 挑进度行 } from './status.js';
 import { transcribe, configure as configureAsr, currentBackend } from './asr.js';
 import { installApprovalBridge } from './approval-bridge.js';
 import { createHerdWatchdog, HERD_GROUP_FALLBACK } from './herd.js';
@@ -1258,20 +1258,22 @@ export function apply(ctx, config) {
           if (sid === null || payload?.sessionId !== sid) return;
           const { event } = payload ?? {};
           if (event?.type === 'tool/call') {
-            status.addNote(describeTool(event.data?.name, event.data?.arguments));
+            status.addNote(describeTool(event.data?.name), '工具');
             return;
           }
           if (event?.type === 'assistant/message') {
             const content = event.data?.message?.content;
             if (!Array.isArray(content)) return;
+            // 进度只回答「我正在做什么」（2026-10-18 口径）：
+            //   · ⛔ 不取 reasoning 块——思考是模型内部过程，中英文夹杂地刷屏没有意义；
+            //   · 正文里**只认 `[进度] …` 标记行**，其余正文（叙述、代码、结果片段）都不进进度消息。
             const t = content
-              .filter((b) => b?.type === 'text' || b?.type === 'reasoning')
-              .map((b) => b.text ?? b.reasoning ?? '')
+              .filter((b) => b?.type === 'text')
+              .map((b) => String(b.text ?? ''))
               .join('');
-            if (t.trim()) {
-              status.trackProgress(t.length);
-              status.addNote(t);
-            }
+            if (!t.trim()) return;
+            status.trackProgress(t.length);
+            for (const 行 of 挑进度行(t)) status.addNote(行, '进度');
           }
         })
       : null;

@@ -12,6 +12,10 @@
  *
  * 事件从哪来：runtime.onSessionEvent() 的 tool/call 与 assistant/message，
  * 由 index.js 喂进来（addNote / trackProgress），本类不碰 runtime。
+ *
+ * 进度口径（2026-10-18 定）：进度消息**只回答「我正在做什么」**——正文里带 `[进度]` 标记的行，
+ * 加认得出的工具中文标签。思考原文（reasoning 块）与工具参数（命令／文件路径／搜索词）一律不上屏：
+ * 前者是模型内部过程，后者会把操作细节漏给用户。工具标签可用 DSH_BOTPLUGIN_PROGRESS_TOOLS=0 关掉。
  */
 
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -45,25 +49,33 @@ export function truncate(text, max) {
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
-/** 工具调用 → 一行人话（认得出的给中文标签，认不出的原样）。 */
-export function describeTool(name, rawArguments) {
-  let args = {};
-  try {
-    args = typeof rawArguments === 'string' ? JSON.parse(rawArguments || '{}') : (rawArguments ?? {});
-  } catch {}
-  const hint =
-    args.command ??
-    args.file_path ??
-    args.path ??
-    args.pattern ??
-    args.query ??
-    args.url ??
-    args.description ??
-    args.objective ??
-    '';
-  const label = TOOL_LABELS[name] ?? `🔧 ${name}`;
-  const detail = truncate(hint, 120);
-  return detail ? `${label}\n${detail}` : label;
+/** 工具调用 → 一行人话。
+ *  只出**中文动作标签**：⛔ 不拼命令／文件路径／搜索词／网址（2026-10-18 口径——那些属操作细节，不上屏）。
+ *  入参：工具名（`rawArguments` 为历史参数，已不用）。出参：一行标签。副作用：无。 */
+export function describeTool(name) {
+  return TOOL_LABELS[name] ?? `🔧 ${String(name ?? '工具')}`;
+}
+
+/** 单条进度动态的字数上限。 */
+const PROGRESS_NOTE_MAX = 120;
+
+/** 进度行标记：我（助手）在回合里主动报的一句「正在做什么」。中括号全半角都认。 */
+const 进度标记 = /^[\[【［]\s*进度\s*[\]】］]\s*(.*)$/;
+
+/** 是否把工具中文标签也显示在进度里（默认显示；`DSH_BOTPLUGIN_PROGRESS_TOOLS=0` 只留进度行）。 */
+const 显示工具标签 = process.env.DSH_BOTPLUGIN_PROGRESS_TOOLS !== '0';
+
+/**
+ * 从一段助手正文里挑出进度行。入参：正文（可空）。出参：进度文本数组（已去标记、掐到 120 字，空行丢掉）。
+ * 副作用：无。口径：只认 `[进度] …` 这类显式标记——其余正文（含思考）一律不进进度消息。
+ */
+export function 挑进度行(text) {
+  return String(text ?? '')
+    .split('\n')
+    .map((行) => 行.trim().match(进度标记))
+    .filter(Boolean)
+    .map((m) => truncate(m[1], PROGRESS_NOTE_MAX))
+    .filter(Boolean);
 }
 
 /**
@@ -242,9 +254,17 @@ export class LiveStatus {
     this.telegram.sendChatAction(this.chatId, 'typing').catch(() => {});
   }
 
-  /** 加一条动态（工具调用 / 助手文字）。只留最近 12 条。 */
-  addNote(note) {
-    this.notes.push(truncate(note, 800));
+  /** 加一条动态。入参：note（文本）、类型（`'进度'` = 我主动报的「正在做什么」，其它＝工具标签）。
+   *  只留最近 12 条（上屏显示最近 3 条，见 render）。
+   *  口径：只显示「正在做什么」——工具标签可用 `DSH_BOTPLUGIN_PROGRESS_TOOLS=0` 关掉；
+   *  连着两条一样的不重复上屏。副作用：排一次进度消息编辑。 */
+  addNote(note, 类型 = '工具') {
+    if (类型 === '工具' && !显示工具标签) return;
+    const 文本 = truncate(note, PROGRESS_NOTE_MAX);
+    if (!文本) return;
+    const 行 = 类型 === '进度' ? `📌 ${文本}` : 文本;
+    if (this.notes[this.notes.length - 1] === 行) return;
+    this.notes.push(行);
     if (this.notes.length > 12) this.notes.splice(0, this.notes.length - 12);
     this.#scheduleEdit();
   }
@@ -262,7 +282,7 @@ export class LiveStatus {
       header += `\n🚀 ≈${tps.rate.toFixed(1)} 字/秒 · 已生成 ${tps.chars} 字`;
     }
     const recent = this.notes.slice(-3);
-    return recent.length === 0 ? header : `${header}\n\n${recent.join('\n\n')}`;
+    return recent.length === 0 ? header : `${header}\n\n${recent.join('\n')}`;
   }
 
   #scheduleEdit() {
