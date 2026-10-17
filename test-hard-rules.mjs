@@ -97,6 +97,33 @@ try {
     () => 'NEXT3',
   );
   check(readonly === 'NEXT3', '读/搜类命令不触发教训钩子');
+
+  // ⑥ 教训档在、但是空的：文案要说「里没有第 N 条」，不能说「读不到」
+  const wsEmpty = join(TMP, 'ws-empty');
+  mkdirSync(join(wsEmpty, 'memory'), { recursive: true });
+  writeFileSync(join(wsEmpty, 'memory', 'lessons-bot.md'), '');
+  const h2 = {};
+  installHardRules({ on(e, f) { h2[e] = f; } }, { cwd: wsEmpty, hitLog: join(TMP, 'hits2.log') });
+  const r4 = h2['tools/post-execute'](
+    { name: 'bash', arguments: { command: 'rm -rf /tmp/x' } },
+    { content: [] },
+    () => 'NEXT4',
+  );
+  const body4 = r4?.additionalContexts?.[0]?.content?.[0]?.text ?? '';
+  check(body4.includes('里没有 第 8 条') && !body4.includes('读不到'), '空教训档说「里没有第 N 条」，不说「读不到」');
+
+  // ⑦ 教训档真不在：这时才说「读不到」
+  const wsMissing = join(TMP, 'ws-missing');
+  mkdirSync(wsMissing, { recursive: true });
+  const h3 = {};
+  installHardRules({ on(e, f) { h3[e] = f; } }, { cwd: wsMissing, hitLog: join(TMP, 'hits3.log') });
+  const r5 = h3['tools/post-execute'](
+    { name: 'bash', arguments: { command: 'rm -rf /tmp/x' } },
+    { content: [] },
+    () => 'NEXT5',
+  );
+  const body5 = r5?.additionalContexts?.[0]?.content?.[0]?.text ?? '';
+  check(body5.includes('教训档读不到'), '文件不在时才说「读不到」');
 } finally {
   rmSync(TMP, { recursive: true, force: true });
 }

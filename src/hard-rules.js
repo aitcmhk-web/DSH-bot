@@ -19,7 +19,7 @@
  * ⚠️ 只挂「动手」类工具；read / grep / glob 之类不挂，省 token。
  */
 
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -295,7 +295,10 @@ export function installHardRules(ctx, config = {}) {
     additionalContexts: [contextMessage(body, kind)],
   });
 
-  /** 拼注入正文：头部说明 + 提示 + 教训原文（教训档读不到就只给提示）。 */
+  /**
+   * 拼注入正文：头部说明 + 提示 + 教训原文。
+   * ⚠️ 「文件不在」和「文件在但没这一条」是两句不同的话：空占位不能让文案说成读不到。
+   */
   const renderLesson = (rule) => {
     const md = rule.lessons.length > 0 ? loadRules(lessonsPath) : '';
     const bodies = [];
@@ -304,10 +307,13 @@ export function installHardRules(ctx, config = {}) {
       const body = lessonBody(md, n);
       if (body) bodies.push(`── 教训档 第 ${n} 条 ──\n${body}`);
     }
+    const which = rule.lessons.join('、');
     const tail = bodies.length > 0
       ? `\n\n${trimTotal(bodies.join('\n\n'), rule.lessons)}`
       : (rule.lessons.length > 0
-        ? `\n\n（教训档读不到：${lessonsPath} —— 请自己去看 第 ${rule.lessons.join('、')} 条）`
+        ? (existsSync(lessonsPath)
+          ? `\n\n（教训档 ${lessonsPath} 里没有 第 ${which} 条 的正文）`
+          : `\n\n（教训档读不到：${lessonsPath} —— 请自己去看 第 ${which} 条）`)
         : '');
     return [
       `【教训钩子 · 命中特征「${rule.label}」】`,
