@@ -167,6 +167,11 @@ DSH 的审批服务用 waterfall 广播 `approval/request`，插件把它桥接�
 ## 已知限制
 
 - 微信扫码工具用 macOS 原生 CoreImage 渲染二维码（零依赖），Windows/Linux 机器上会退化为只打印链接。
+- **Telegram 限流（429）不丢答案**：收尾交付会照 Telegram 给的 `retry_after` 排队重发（单次最多等 90s、一轮最多 3 分钟）；
+  编辑占位消息与整条重发都发不出去时，整篇回答落盘到 `DSH_BOT_DIR/未送达/`（可用 `DSH_BOTPLUGIN_UNDELIVERED_DIR` 指定别的目录），
+  同时把占位消息改成「❌ 回答未送达…已存到 <路径>」——旧版遇限流会留下永远的「⏳ 正在处理…」并丢掉答案。
+  等待总预算可用 `DSH_BOTPLUGIN_RATE_LIMIT_BUDGET_MS` 调整（默认 180000）。
+- 进度占位消息每 4s 编辑一次（旧版 2s）；长回合里编辑太频会撞限流。
 
 ## 许可
 
