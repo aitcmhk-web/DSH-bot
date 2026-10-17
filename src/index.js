@@ -43,6 +43,7 @@ import { createTaskTriggers } from './triggers.js';
 import { createMailboxWatcher } from './mailbox.js';
 import { createFinalReview } from './final-review.mjs'; // 终审卡：DSH 侧宿主接线
 import { installHardRules } from './hard-rules.js';
+import { ensureWorkspaceMemoryFiles } from './workspace-files.js';
 
 /** Cordis 插件名。 */
 export const name = 'botplugin';
@@ -1023,6 +1024,9 @@ export function apply(ctx, config) {
   // 最高指令 + 失败特征教训注入：实现随插件走（src/hard-rules.js），
   // 规则文本 = 包根 HARD-RULES.md（相对模块解析，不依赖绝对路径）。
   // 各机器不再另外挂一个 file:// 插件，避免同一份指令一回合进两次。
+  // 工作区记忆占位：AGENTS.md / memory/lessons-bot.md 缺了就建空的，已有的一律不碰。
+  // 放插件里是因为机器上的升级只走插件（TG 菜单升级 / setupdsh），不重跑安装问答。
+  ensureWorkspaceMemoryFiles(config.cwd || process.cwd(), (m) => error(m));
   installHardRules(ctx, { cwd: config.cwd || process.cwd() });
 
 

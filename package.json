@@ -1,6 +1,6 @@
 {
   "name": "dsh-botplugin",
-  "version": "1.0.78",
+  "version": "1.0.79",
   "description": "Telegram and WeChat bridges plus handoff continuity for DeepSeek Harness (DSH)",
   "keywords": [
     "dsh-plugin",
@@ -53,6 +53,7 @@
     "test-hard-rules.mjs",
     "test-hardrules-retire.mjs",
     "test-systemd-unit-repair.mjs",
+    "test-workspace-files.mjs",
     "HARD-RULES.md",
     "!src/*.bak.*",
     "!src/*.bak-*",

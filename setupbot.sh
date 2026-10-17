@@ -34,7 +34,7 @@ ARG_PROFILE="${1:-}"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-16.8"
+SELF_VERSION="2026-10-16.9"
 
 SETUPBOT_URL="${SETUPBOT_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh}"
 SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot}"
@@ -1548,12 +1548,6 @@ write_launchers() {
       fi
     done
   fi
-
-  # 工作区记忆占位：只在文件不存在时建空的 —— 已存在的（有内容或是空的）一律不碰，
-  # 所以重装 / 升级都不会覆盖机器上自己写的记忆；往里写内容是各机器自己的事。
-  mkdir -p "$WS/memory" 2>/dev/null || true
-  if [ ! -e "$WS/AGENTS.md" ]; then : > "$WS/AGENTS.md" 2>/dev/null || true; fi
-  if [ ! -e "$WS/memory/lessons-bot.md" ]; then : > "$WS/memory/lessons-bot.md" 2>/dev/null || true; fi
 
   LAUNCH_OK=1
   return 0
