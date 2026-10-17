@@ -243,3 +243,34 @@ test('⑭ 包体契约：sync-model-blocks.mjs 必须在 files 白名单里（�
   assert.ok(pkg.files.includes('sync-model-blocks.mjs'), 'sync-model-blocks.mjs 必须在 files 里');
   assert.ok(existsSync(new URL('./sync-model-blocks.mjs', import.meta.url)));
 });
+
+test('⑮ 账户档（llm-deepseek-account）也是托管块：web 声明什么就搬进本 profile', () => {
+  // 为什么单列一条：账户档原来不在 MANAGED_BLOCKS 里 → 桌面版改了它、web/bot 那份不动，
+  //    菜单这一档就跟「两端显示什么」对不上（曾整档消失）。
+  const root = mkdtempSync(join(tmpdir(), 'pluginsync-account-'));
+  const webDir = join(root, 'profiles', 'web');
+  const selfDir = join(root, 'profiles', 'dshbot');
+  mkdirSync(webDir, { recursive: true });
+  mkdirSync(selfDir, { recursive: true });
+  const webPatch = `${WEB_PATCH}- id: llm-deepseek-account
+  name: '@deepseek-ai/dsh-llm-deepseek-account'
+  config:
+    models:
+      - id: deepseek-flash
+        name: DeepSeek-V41-Flash
+`;
+  writeFileSync(join(webDir, 'cordis.patch.yml'), webPatch);
+  writeFileSync(join(selfDir, 'cordis.patch.yml'), SELF_PATCH);
+  const r = syncOwnProfileFromWeb({
+    profileDir: selfDir,
+    webPath: join(webDir, 'cordis.patch.yml'),
+    env: { HOME: root, DSH_HOME: root },
+  });
+  assert.ok(
+    r.blocks.includes('llm-deepseek-account'),
+    `账户档必须算托管块（本轮搬了 ${r.blocks.join('、')}）`,
+  );
+  const after = readFileSync(join(selfDir, 'cordis.patch.yml'), 'utf8');
+  assert.match(after, /- id: llm-deepseek-account/, '账户档整块要落进本 profile');
+  assert.ok(after.includes('deepseek-flash'), '账户档里的模型要逐字带过来');
+});

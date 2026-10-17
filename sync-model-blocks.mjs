@@ -15,7 +15,8 @@
  * 桌面端原本一个模型块都没有 → 第一次必须是**整块复制**，不是增量。
  *
  * ## 同步什么 / 不同步什么
- * - ✅ 托管块（= 权威源里有的块）：`llm-pi-ai`、`llm-deepseek`（模型清单本身）。
+ * - ✅ 托管块（= 权威源里有的块）：`llm-pi-ai`、`llm-deepseek`、`llm-deepseek-account`
+ *   （都是「模型清单」本身；账户档只写「登录账户里有哪些模型」，两边必须同一份）。
  * - ⛔ 不托管（各端自己的，广播时**原样保留、逐字不动**）：界面偏好（`ui-chat` 的
  *   compact/verbose、`ui-settings` 的 enabled）、`agent-default-model`（「当前选中哪一档」是
  *   各端自己的选择，不是清单）、各端手写的其它 `- insert:` 段。
@@ -49,7 +50,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 /** 托管块白名单：只有这些块会被搬运。 */
-export const MANAGED_BLOCKS = ['llm-pi-ai', 'llm-deepseek'];
+export const MANAGED_BLOCKS = ['llm-pi-ai', 'llm-deepseek', 'llm-deepseek-account'];
 const ENTRY_RE = /^- /;
 
 export function resolveTargets(env = process.env) {
