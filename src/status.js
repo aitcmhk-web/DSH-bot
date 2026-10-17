@@ -13,9 +13,10 @@
  * 事件从哪来：runtime.onSessionEvent() 的 tool/call 与 assistant/message，
  * 由 index.js 喂进来（addNote / trackProgress），本类不碰 runtime。
  *
- * 进度口径（2026-10-18 定）：进度消息**只回答「我正在做什么」**——正文里带 `[进度]` 标记的行，
- * 加认得出的工具中文标签。思考原文（reasoning 块）与工具参数（命令／文件路径／搜索词）一律不上屏：
- * 前者是模型内部过程，后者会把操作细节漏给用户。工具标签可用 DSH_BOTPLUGIN_PROGRESS_TOOLS=0 关掉。
+ * 进度口径（2026-10-18 定、同日修订）：进度消息**只回答「我正在做什么」**——正文里带 `[进度]` 标记的行，
+ * 加认得出的工具中文标签；标签后面接**具体在干什么**（跑哪条命令、看哪个文件），
+ * 否则「跑命令」四个字等于没说话。思考原文（reasoning 块）一律不上屏，口令类字面量打码（见 遮口令）。
+ * 工具标签可用 DSH_BOTPLUGIN_PROGRESS_TOOLS=0 关掉。
  */
 
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -24,10 +25,10 @@ import { join } from 'node:path';
 import { markdownToHtml, splitMessageHtml, sendRichTo } from './telegram.js';
 
 const TOOL_LABELS = {
-  bash: '💻 执行命令',
-  read: '📖 读取文件',
-  write: '📝 写入文件',
-  edit: '✏️ 修改文件',
+  bash: '💻 跑命令',
+  read: '📖 看文件',
+  write: '📝 写文件',
+  edit: '✏️ 改文件',
   glob: '🔍 查找文件',
   grep: '🔍 搜索内容',
   web_search: '🌐 联网搜索',
@@ -49,11 +50,74 @@ export function truncate(text, max) {
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
-/** 工具调用 → 一行人话。
- *  只出**中文动作标签**：⛔ 不拼命令／文件路径／搜索词／网址（2026-10-18 口径——那些属操作细节，不上屏）。
- *  入参：工具名（`rawArguments` 为历史参数，已不用）。出参：一行标签。副作用：无。 */
-export function describeTool(name) {
-  return TOOL_LABELS[name] ?? `🔧 ${String(name ?? '工具')}`;
+/** tool/call 的 `arguments` 是原始 JSON 字符串（也兼容已解析成对象的情形）。解析不出就给空对象。 */
+function 取参(入参) {
+  if (!入参) return {};
+  if (typeof 入参 === 'object') return 入参;
+  try {
+    const 值 = JSON.parse(String(入参));
+    return 值 && typeof 值 === 'object' ? 值 : {};
+  } catch {
+    return {};
+  }
+}
+
+/** 口令类字面量一律打码：进度消息要进聊天记录，口令不该留痕；其余内容照实显示。 */
+function 遮口令(文) {
+  return String(文)
+    .replace(/((?:PGPASSWORD|PASSWORD|PASSWD|TOKEN|SECRET|APIKEY|API_KEY)[ \t]*[=:][ \t]*)(\S+)/gi, '$1***')
+    .replace(/(Bearer[ \t]+)(\S+)/gi, '$1***');
+}
+
+/** 只留文件名：目录前缀对「在干什么」没有信息量，还占满一行。 */
+function 文件名(路) {
+  const 文 = String(路 ?? '').replace(/\s+/g, ' ').trim();
+  if (!文) return '';
+  const 切 = Math.max(文.lastIndexOf('/'), 文.lastIndexOf('\\'));
+  return 切 >= 0 ? 文.slice(切 + 1) : 文;
+}
+
+/** 每个工具「具体在干什么」的那一句。给不出就返回空串（只剩标签）。 */
+function 摘要(name, 参) {
+  const 首行 = (文) => String(文 ?? '').split('\n').map((x) => x.trim()).filter(Boolean)[0] ?? '';
+  switch (name) {
+    case 'bash':
+      return truncate(遮口令(首行(参.command ?? 参.cmd)), 90);
+    case 'read':
+    case 'edit':
+    case 'write':
+    case 'present':
+      return 文件名(参.file_path ?? 参.path);
+    case 'glob':
+      return truncate(String(参.pattern ?? ''), 60);
+    case 'grep':
+      return truncate(String(参.pattern ?? ''), 60);
+    case 'web_search': {
+      const 问 = Array.isArray(参.queries) ? 参.queries[0] : 参.query;
+      return truncate(String(问 ?? ''), 60);
+    }
+    case 'web_fetch':
+      return truncate(String(参.url ?? ''), 80);
+    case 'subagent':
+    case 'subagent_fork':
+      return truncate(String(参.description ?? ''), 40);
+    case 'job_output':
+    case 'job_kill':
+      return truncate(String(参.job_id ?? ''), 20);
+    default:
+      return '';
+  }
+}
+
+/** 工具调用 → 一行人话：`动作标签：具体在干什么`。
+ *  入参：工具名 ＋ tool/call 的 `arguments`（原始 JSON 字符串或对象，可缺）。
+ *  出参：一行文本；抠不出细节时只回标签，⛔ 不编占位词。
+ *  口径（2026-10-18 修订）：老板要看**真命令、真文件名**，否则「跑命令」等于没说；
+ *  口令类字面量打码（见 遮口令），思考原文仍不上屏。副作用：无。 */
+export function describeTool(name, 入参) {
+  const 标 = TOOL_LABELS[name] ?? `🔧 ${String(name ?? '工具')}`;
+  const 尾 = 摘要(name, 取参(入参));
+  return 尾 ? `${标}：${尾}` : 标;
 }
 
 /** 单条进度动态的字数上限。 */

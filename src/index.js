@@ -1258,7 +1258,7 @@ export function apply(ctx, config) {
           if (sid === null || payload?.sessionId !== sid) return;
           const { event } = payload ?? {};
           if (event?.type === 'tool/call') {
-            status.addNote(describeTool(event.data?.name), '工具');
+            status.addNote(describeTool(event.data?.name, event.data?.arguments), '工具');
             return;
           }
           if (event?.type === 'assistant/message') {
