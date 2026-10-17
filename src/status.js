@@ -25,10 +25,10 @@ import { join } from 'node:path';
 import { markdownToHtml, splitMessageHtml, sendRichTo } from './telegram.js';
 
 const TOOL_LABELS = {
-  bash: '💻 跑命令',
+  bash: '🏃 跑命令',
   read: '📖 看文件',
-  write: '📝 写文件',
-  edit: '✏️ 改文件',
+  write: '🖊 写文件',
+  edit: '🛠 改文件',
   glob: '🔍 查找文件',
   grep: '🔍 搜索内容',
   web_search: '🌐 联网搜索',

@@ -59,11 +59,11 @@ console.log('③ 单条掐到 120 字');
 console.log('④ 工具行＝动作标签：具体在干什么（真命令／真文件名）');
 {
   const 标 = describeTool('bash', { command: 'grep -rn notes src/index.js' });
-  断言(标 === '💻 跑命令：grep -rn notes src/index.js', `bash → ${标}`);
-  断言(describeTool('bash', JSON.stringify({ command: 'ls -la\ncd /tmp' })) === '💻 跑命令：ls -la', 'JSON 串入参与多行命令取首行');
+  断言(标 === '🏃 跑命令：grep -rn notes src/index.js', `bash → ${标}`);
+  断言(describeTool('bash', JSON.stringify({ command: 'ls -la\ncd /tmp' })) === '🏃 跑命令：ls -la', 'JSON 串入参与多行命令取首行');
   断言(describeTool('read', { file_path: '/Users/tcm/DSH/dshbot/建表.sql' }) === '📖 看文件：建表.sql', 'read 只留文件名');
-  断言(describeTool('edit', { file_path: 'a/b/c/服务.mjs' }) === '✏️ 改文件：服务.mjs', 'edit 只留文件名');
-  断言(describeTool('write', { file_path: '/x/y.md' }) === '📝 写文件：y.md', 'write 只留文件名');
+  断言(describeTool('edit', { file_path: 'a/b/c/服务.mjs' }) === '🛠 改文件：服务.mjs', 'edit 只留文件名');
+  断言(describeTool('write', { file_path: '/x/y.md' }) === '🖊 写文件：y.md', 'write 只留文件名');
   断言(describeTool('grep', { pattern: 'prescriptions' }) === '🔍 搜索内容：prescriptions', 'grep 带搜索词');
   断言(describeTool('glob', { pattern: '**/*.md' }) === '🔍 查找文件：**/*.md', 'glob 带模式');
   断言(describeTool('web_fetch', { url: 'https://example.com/a' }).includes('example.com'), 'web_fetch 带网址');
@@ -77,8 +77,8 @@ console.log('⑤ 口令打码、抠不出细节就只留标签');
   断言(!标.includes('aitcm_dev_pw'), `口令不进进度行 → ${标}`);
   断言(标.includes('PGPASSWORD=***'), '口令位换成 ***，仍看得出在连库');
   断言(!describeTool('bash', { command: 'curl -H "Authorization: Bearer abc123" u' }).includes('abc123'), 'Bearer 票也打码');
-  断言(describeTool('bash', {}) === '💻 跑命令', '没命令就只留标签，⛔ 不编占位词');
-  断言(describeTool('bash', '{坏JSON') === '💻 跑命令', '入参解析不出也不炸');
+  断言(describeTool('bash', {}) === '🏃 跑命令', '没命令就只留标签，⛔ 不编占位词');
+  断言(describeTool('bash', '{坏JSON') === '🏃 跑命令', '入参解析不出也不炸');
   断言(describeTool('todo_write', { todos: [] }) === '📋 更新任务清单', '没有可显示的细节就只留标签');
   断言(describeTool('some_new_tool') === '🔧 some_new_tool', '原样给名字');
   断言(describeTool(undefined) === '🔧 工具', '名字缺了也给个不含糊的标签');
@@ -89,10 +89,10 @@ console.log('⑥ addNote 口径');
   const s = new LiveStatus({ kind: 'tg' });
   s.addNote('正在改建表脚本', '进度');
   s.addNote('正在改建表脚本', '进度');   // 连着重复：不重复上屏
-  s.addNote('💻 跑命令：ls -la', '工具');
+  s.addNote('🏃 跑命令：ls -la', '工具');
   断言(s.notes.length === 2, `连着重复只留一条（实得 ${s.notes.length}）`);
   断言(s.notes[0] === '📌 正在改建表脚本', '进度行带 📌');
-  断言(s.notes[1] === '💻 跑命令：ls -la', '工具行原样（标签＋细节）');
+  断言(s.notes[1] === '🏃 跑命令：ls -la', '工具行原样（标签＋细节）');
   for (let i = 0; i < 20; i += 1) s.addNote(`第 ${i} 步`, '进度');
   断言(s.notes.length === 12, '最多留 12 条');
 }
@@ -117,7 +117,7 @@ console.log('⑧ DSH_BOTPLUGIN_PROGRESS_TOOLS=0 时工具标签不上屏');
     import { LiveStatus } from './src/status.js';
     const s = new LiveStatus({ kind: 'tg' });
     s.addNote('正在改建表脚本', '进度');
-    s.addNote('💻 跑命令：ls -la', '工具');
+    s.addNote('🏃 跑命令：ls -la', '工具');
     if (s.notes.length !== 1 || !s.notes[0].startsWith('📌')) { console.error('FAIL', JSON.stringify(s.notes)); process.exit(1); }
     console.log('OK');
   `;
