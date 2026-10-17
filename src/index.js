@@ -42,6 +42,7 @@ import { progressReportTick } from './progress-report.js';
 import { createTaskTriggers } from './triggers.js';
 import { createMailboxWatcher } from './mailbox.js';
 import { createFinalReview } from './final-review.mjs'; // 终审卡：DSH 侧宿主接线
+import { installHardRules } from './hard-rules.js';
 
 /** Cordis 插件名。 */
 export const name = 'botplugin';
@@ -1019,10 +1020,10 @@ export function apply(ctx, config) {
   });
 
 
-  // 最高指令注入不在本包内实现：
-  //    与 file:// 挂载的 /Users/tcm/DSH/hard-rules/index.mjs 重复注入会让同一条
-  //    最高指令一回合进两次。唯一实现 = 那个 file:// 挂载（各 profile patch 都指向它），
-  //    缺块的 profile 由 setupdsh.sh 幂等补挂。
+  // 最高指令 + 失败特征教训注入：实现随插件走（src/hard-rules.js），
+  // 规则文本 = 包根 HARD-RULES.md（相对模块解析，不依赖绝对路径）。
+  // 各机器不再另外挂一个 file:// 插件，避免同一份指令一回合进两次。
+  installHardRules(ctx, { cwd: config.cwd || process.cwd() });
 
 
 

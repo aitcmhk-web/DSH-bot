@@ -29,7 +29,7 @@ SRC_PATH="$0"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-16.6"
+SELF_VERSION="2026-10-16.7"
 
 SETUPDSH_URL="${SETUPDSH_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh}"
 SELF_DIR="$HOME/.dsh/setupdsh"
@@ -227,7 +227,7 @@ ensure_dsh() {
 # ⚠️ 这里写死的 tag 必须是**本次发布自己的 tag**（发新版本时同步改，别漏）。
 #    走 TG 菜单那条路会先上网拉最新这份脚本再跑，所以实际生效的永远是网上最新的 tag；
 #    没网时才退回包里这份 —— 那时它也只能装这个 tag。
-SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.74}"
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.75}"
 # ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
 #    ⛔ 绝不拿日期或路径冒充版本号。
 plugin_version() {
@@ -296,17 +296,14 @@ upgrade_plugins() {
   rm -f "$PLUGLIST_FILE" 2>/dev/null || true
 }
 
-# ensure_hardrules_block — 给缺「最高指令」块的 profile 幂等补挂 file:// 挂载的插件。
-# 权威源 = /Users/tcm/DSH/hard-rules/index.mjs（含教训注入），由各 profile 的
-# cordis.patch.yml 以 file:// 挂载。缺块的 profile 补上，已有的原样不动（幂等）；
+# strip_legacy_hardrules — 退役 profile patch 里的 hard-rules file:// 挂载块。
+# 「最高指令 + 失败特征教训注入」现在随插件提供（dsh-botplugin/src/hard-rules.js，
+# 规则文本 = 包根 HARD-RULES.md），不再需要各 profile 另挂一个 file:// 插件：
+# 那份源只在开发机上存在，别的机器上是死引用，装回来的机器还会与插件重复注入。
+# 只删「id: hard-rules」且近邻带 file:// 的条目，整块删除（含其上注释与 - insert: 壳）；
 # 改前逐份备份，临时文件 + mv 原子替换（bot 运行时 HMR 会热重载 patch，不能留中间态）。
-# ⚠️ sync-from-web.mjs 只重写 llm 托管块、其余原样搬运，补的块不会被冲。
 HARD_RULES_MARK='id: hard-rules'
-HARD_RULES_SRC='/Users/tcm/DSH/hard-rules/index.mjs'
-# strip_dead_hardrules — 清掉「指向的规则源根本不在本机」的 hard-rules 块。
-# 别的机器（Linux 服务器等）没有那份 file:// 源文件，块挂上去永远加载不了，
-# 是一段纯粹的脏引用。只删「源文件确实不存在」的块：开发机上规则源在，一个字不动。
-strip_dead_hardrules() {
+strip_legacy_hardrules() {
   PF="$1"
   grep -q "$HARD_RULES_MARK" "$PF" 2>/dev/null || return 0
   # 认块：先找条目行（排除注释掉的），再在它下面几行里找 file:// 引用
@@ -316,7 +313,6 @@ strip_dead_hardrules() {
   [ -n "$REF_LINE" ] || return 0
   REF="$(sed -n "${REF_LINE}p" "$PF" | sed -e 's/.*file:\/\///' -e 's/".*//' -e 's/[[:space:]]*$//')"
   [ -n "$REF" ] || return 0
-  if [ -f "$REF" ]; then return 0; fi
   # 算出整块的起止行：起 = 条目行 + 它上面那串提到 hard-rules 的注释（含 - insert: 壳）
   # 止 = 缩进比条目行更深的续行（name: 及其它子键）
   RANGE="$(awk -v id="$ID_LINE" '
@@ -347,60 +343,35 @@ strip_dead_hardrules() {
   case "$S" in ''|*[!0-9]*) return 0;; esac
   case "$E" in ''|*[!0-9]*) return 0;; esac
   STAMP="$(date +%Y%m%d-%H%M%S)"
-  cp "$PF" "${PF}.bak-hardrules-dead-${STAMP}" || { say "⚠️ ${PF} 备份失败，死块没清"; return 0; }
+  cp "$PF" "${PF}.bak-hardrules-retired-${STAMP}" || { say "⚠️ ${PF} 备份失败，退役块没清"; return 0; }
   if awk -v s="$S" -v e="$E" 'NR < s || NR > e' "$PF" > "${PF}.setupdsh-tmp" 2>/dev/null; then
-    # 删完一条条目都不剩就补一行 `[]`（空 patch 的规范写法），别留个解析不出的空文件
-    if ! grep -qE '^[[:space:]]*-[[:space:]]' "${PF}.setupdsh-tmp" 2>/dev/null; then
+    # 删完没有任何条目了：文件不能空着（dsh 解析不了），补一行 `[]`（空 patch 的规范写法）。
+    # ⚠️ 文件里本来就有 `[]` / `{}` 时不能再补 —— 两行空文档叠在一起没有 `---` 分隔，
+    #    YAML 直接拒绝，bot 起不来。
+    if ! grep -qE '^[[:space:]]*-[[:space:]]' "${PF}.setupdsh-tmp" 2>/dev/null \
+      && ! grep -qE '^[[:space:]]*(\[\][[:space:]]*|\{\}[[:space:]]*)$' "${PF}.setupdsh-tmp" 2>/dev/null; then
       printf '%s\n' '[]' >> "${PF}.setupdsh-tmp"
     fi
     if mv "${PF}.setupdsh-tmp" "$PF"; then
-      say "🧹 清掉 hard-rules 死块（它指向的 ${REF} 在这台机器上不存在）：$(basename "$(dirname "$PF")")（备份 .bak-hardrules-dead-${STAMP}）"
+      say "🧹 退役 hard-rules 挂载块（最高指令已随插件提供；原指向 ${REF}）：$(basename "$(dirname "$PF")")（备份 .bak-hardrules-retired-${STAMP}）"
     else
       rm -f "${PF}.setupdsh-tmp" 2>/dev/null || true
-      say "⚠️ ${PF} 死块清理失败（保留原文件）"
+      say "⚠️ ${PF} 退役失败（保留原文件）"
     fi
   else
     rm -f "${PF}.setupdsh-tmp" 2>/dev/null || true
-    say "⚠️ ${PF} 死块清理失败（保留原文件）"
+    say "⚠️ ${PF} 退役失败（保留原文件）"
   fi
 }
 
-ensure_hardrules_block() {
-  # ⚠️ 本机没有规则源（别人的机器）也要往下走 —— 得把历史留下的死块清掉，
-  #    清完再决定补不补；源不在就只清不补。
-  HARD_BLOCK='
-# ── 最高指令：每次动手类工具（bash/edit/write）跑完，把规则原文重新顶进上下文 ──
-#    实现 /Users/tcm/DSH/hard-rules/index.mjs，规则 /Users/tcm/DSH/BOT/HARD-RULES.md
-#    本块由 setupdsh.sh 幂等补挂（2026-10-08 v1.0.42 收口）；sync-from-web.mjs 不托管它。
-- insert:
-    - id: hard-rules
-      name: "file:///Users/tcm/DSH/hard-rules/index.mjs"
-'
+retire_legacy_hardrules() {
   PATCHLIST="$(find "${DSH_HOME:-$HOME/.dsh}/profiles" -maxdepth 2 -name cordis.patch.yml 2>/dev/null || true)"
   [ -n "$PATCHLIST" ] || return 0
   PATCHLIST_FILE="${TMPDIR:-/tmp}/setupdsh-patchlist.$$"
   printf '%s\n' "$PATCHLIST" > "$PATCHLIST_FILE" 2>/dev/null || return 0
   while IFS= read -r PF; do
     [ -n "$PF" ] || continue
-    # ① 先清历史死块；② 本机没有规则源就只清不补；③ 本机有源且已有块就不重复补。
-    strip_dead_hardrules "$PF"
-    [ -f "$HARD_RULES_SRC" ] || continue
-    if grep -q "$HARD_RULES_MARK" "$PF" 2>/dev/null; then continue; fi
-    STAMP="$(date +%Y%m%d-%H%M%S)"
-    cp "$PF" "${PF}.bak-hardrules-${STAMP}" || { say "⚠️ ${PF} 备份失败，跳过补挂"; continue; }
-    # 空 patch 里那行 `[]` 是一个已经结束的 YAML 文档；直接往后追加等于写出「第二个文档
-    # 却没有 --- 分隔」，dsh 解析时直接拒绝启动（实测）。已有条目的文件同属一个序列，照旧追加。
-    if grep -qE '^[[:space:]]*-[[:space:]]' "$PF" 2>/dev/null; then
-      cp "$PF" "${PF}.setupdsh-tmp"
-    else
-      { grep -vE '^[[:space:]]*(\[\][[:space:]]*|\{\}[[:space:]]*)$' "$PF" 2>/dev/null || true; } > "${PF}.setupdsh-tmp"
-    fi
-    if printf '%s\n' "$HARD_BLOCK" >> "${PF}.setupdsh-tmp" && mv "${PF}.setupdsh-tmp" "$PF"; then
-      say "✅ 最高指令块已补挂：$(basename "$(dirname "$PF")")（备份 ${PF}.bak-hardrules-${STAMP}）"
-    else
-      rm -f "${PF}.setupdsh-tmp" 2>/dev/null || true
-      say "⚠️ ${PF} 补挂失败（保留原文件），可重跑本脚本重试"
-    fi
+    strip_legacy_hardrules "$PF"
   done < "$PATCHLIST_FILE"
   rm -f "$PATCHLIST_FILE" 2>/dev/null || true
 }
@@ -419,7 +390,7 @@ ensure_git
 ensure_node
 ensure_dsh
 upgrade_plugins
-ensure_hardrules_block
+retire_legacy_hardrules
 
 say ""
 say "============ 机器环境安装完成 ============"

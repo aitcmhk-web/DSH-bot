@@ -18,7 +18,7 @@
  * - ✅ 托管块（= 权威源里有的块）：`llm-pi-ai`、`llm-deepseek`（模型清单本身）。
  * - ⛔ 不托管（各端自己的，广播时**原样保留、逐字不动**）：界面偏好（`ui-chat` 的
  *   compact/verbose、`ui-settings` 的 enabled）、`agent-default-model`（「当前选中哪一档」是
- *   各端自己的选择，不是清单）、桌面端手写的 `- insert: hard-rules` 段。
+ *   各端自己的选择，不是清单）、各端手写的其它 `- insert:` 段。
  *
  * ## 规则（可预测优先）
  * - 某端该块的内容 ≠ 权威源 **且** 该文件 mtime 比权威源新 → 视为「这次编辑」，成为新权威源。
