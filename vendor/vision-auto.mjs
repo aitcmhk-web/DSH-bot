@@ -411,19 +411,37 @@ async function processTarget(target) {
   //   ⚠️ 缩进按 baseURL 行的实际缩进推算（defaultInput 与 baseURL 同级，其列表项再深 2），
   //      不写死 6 空格 —— patch 文件里是 8，写死就注错层、YAML 直接坏掉。
   let changed = repaired > 0;
+  //   锚点必须限定在**该服务商自己的块**里找：两家服务商共用同一个 baseURL 时，全文件取第一处
+  //   会把 defaultInput 注进**上一家**的块 —— 那家每跑一次多一条重复键，要补的这家永远补不上。
+  //   块里已有 defaultInput（哪怕已是重复键的坏形状）一律一字不动。
+  const escPat = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const providerBlock = (name) => {
+    const start = lines.findIndex((l) => new RegExp(`^(\\s*)${escPat(name)}:\\s*$`).test(l));
+    if (start === -1) return null;
+    const pad = lines[start].match(/^(\s*)/)[1];
+    const sibling = new RegExp(`^${pad}[^\\s#][^:]*:`);
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (sibling.test(lines[i])) { end = i; break; }
+    }
+    return { start, end, pad, text: lines.slice(start, end).join('\n') };
+  };
   for (const [name, p] of Object.entries(providers)) {
-    if (p?.defaultInput?.includes('image')) continue;
-    const esc = String(p.baseURL ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const blk = providerBlock(name);
+    if (!blk) { say(`⚠️ ${name}: 找不到服务商块，跳过 defaultInput`); continue; }
+    if (/^\s*defaultInput\s*:/m.test(blk.text) || p?.defaultInput?.includes('image')) continue;
+    const esc = escPat(p.baseURL ?? '');
     if (!esc) { say(`⚠️ ${name}: 无 baseURL，跳过 defaultInput`); continue; }
-    const anchorRe = new RegExp(`^(\\s*)baseURL: ["']?${esc}["']?\\s*$`, 'm');
-    const anchor = src.match(anchorRe);
-    if (!anchor) { say(`⚠️ ${name}: 找不到 baseURL 锚点，跳过 defaultInput`); continue; }
+    const at = lines
+      .slice(blk.start, blk.end)
+      .findIndex((l) => new RegExp(`^\\s*baseURL: ["']?${esc}["']?\\s*$`).test(l));
+    if (at === -1) { say(`⚠️ ${name}: 找不到 baseURL 锚点，跳过 defaultInput`); continue; }
     if (CHECK) { say(`（将给 ${name} 补 defaultInput）`); continue; }
-    const pad = anchor[1];
-    const INJECT = [`${pad}defaultInput:`, `${pad}  - text`, `${pad}  - image`];
-    const at = lines.findIndex((l) => new RegExp(`^${pad}baseURL: ["']?${esc}["']?\\s*$`).test(l));
-    if (at === -1) { say(`⚠️ ${name}: 行定位失败，跳过 defaultInput`); continue; }
-    lines.splice(at + 1, 0, ...INJECT);
+    //   缩进按 **baseURL 行**的实际缩进推算（defaultInput 与 baseURL 同级），
+    //   ⛔ 不能用服务商名那行的缩进 —— 名在 providers 下、键还要再深一级，写错就注成别人的兄弟键。
+    const basePad = lines[blk.start + at].match(/^(\s*)/)[1];
+    const INJECT = [`${basePad}defaultInput:`, `${basePad}  - text`, `${basePad}  - image`];
+    lines.splice(blk.start + at + 1, 0, ...INJECT);
     changed = true;
     say(`✅ ${name}: 已补 defaultInput [text, image]`);
   }

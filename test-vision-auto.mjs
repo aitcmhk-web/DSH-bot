@@ -263,6 +263,52 @@ const readPatch = (home, name) =>
   rmSync(home, { recursive: true, force: true });
 }
 
+// ── 用例 9：两家服务商共用同一个 baseURL → 标记必须补进**缺的那家自己的块** ──
+//    旧代码在全文件找第一处 baseURL 当锚点：标记全注进前一家（每次多一组重复键），
+//    后一家永远补不上 —— 这条用例在旧代码上必红。
+{
+  const home = mkdtempSync(join(tmpdir(), 'vision-auto-shared-url-'));
+  const dir = join(home, '.dsh', 'profiles', 'mybot');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'cordis.patch.yml'), `- id: llm-pi-ai
+  config:
+    providers:
+      shared-a:
+        apiKeyEnv: A_KEY
+        api: openai-completions
+        baseURL: ${BASE_URL}
+        defaultInput:
+          - text
+          - image
+        models:
+          - id: model-a
+            name: model-a
+      shared-b:
+        apiKeyEnv: B_KEY
+        api: openai-completions
+        baseURL: ${BASE_URL}
+        models:
+          - id: model-b
+            name: model-b
+`);
+  const blockOf = (text, name) => {
+    const m = new RegExp(`\n      ${name}:\\n([\\s\\S]*?)(?=\n      [A-Za-z0-9_.-]+:\\n|$)`).exec(text);
+    return m ? m[1] : '';
+  };
+  mode = 'ok';
+  const r = await run(home);
+  const once = readPatch(home, 'mybot');
+  ok(r.status === 0, `共用 baseURL 的配置跑通（退出码 ${r.status}）`);
+  ok(blockOf(once, 'shared-a').split('defaultInput:').length - 1 === 1,
+    '第一家（本来就有标记）没被多加一组重复键');
+  ok(blockOf(once, 'shared-b').split('defaultInput:').length - 1 === 1,
+    '第二家（共用同一网址）补上了自己的 defaultInput');
+  ok(!/^ {6}defaultInput:/m.test(once), '⛔ 没把 defaultInput 注成服务商的兄弟键（那个位置等于凭空的假服务商）');
+  await run(home);
+  ok(readPatch(home, 'mybot') === once, '再跑一遍一个字都不变（幂等）');
+  rmSync(home, { recursive: true, force: true });
+}
+
 server.close();
 console.log(failed === 0 ? '\n全部通过' : `\n${failed} 项失败`);
 process.exit(failed === 0 ? 0 : 1);
