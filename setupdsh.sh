@@ -29,7 +29,7 @@ SRC_PATH="$0"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-16.7"
+SELF_VERSION="2026-10-16.8"
 
 SETUPDSH_URL="${SETUPDSH_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh}"
 SELF_DIR="$HOME/.dsh/setupdsh"
@@ -227,7 +227,7 @@ ensure_dsh() {
 # ⚠️ 这里写死的 tag 必须是**本次发布自己的 tag**（发新版本时同步改，别漏）。
 #    走 TG 菜单那条路会先上网拉最新这份脚本再跑，所以实际生效的永远是网上最新的 tag；
 #    没网时才退回包里这份 —— 那时它也只能装这个 tag。
-SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.75}"
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.76}"
 # ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
 #    ⛔ 绝不拿日期或路径冒充版本号。
 plugin_version() {
@@ -319,7 +319,11 @@ strip_legacy_hardrules() {
     { L[NR] = $0 }
     END {
       s = id
-      if (id > 1 && L[id-1] ~ /^[[:space:]]*-[[:space:]]*insert:[[:space:]]*$/) s = id - 1
+      # `- insert:` 和条目之间可能夹空行 —— 跳过空行再认这个壳，
+      # 否则只删条目、留下一个没有内容的 `- insert:`，YAML 直接不合法。
+      k = id - 1
+      while (k >= 1 && L[k] ~ /^[[:space:]]*$/) k = k - 1
+      if (k >= 1 && L[k] ~ /^[[:space:]]*-[[:space:]]*insert:[[:space:]]*$/) s = k
       j = s - 1; found = 0; start = s; cnt = 0
       while (j >= 1 && cnt < 6) {
         if (L[j] !~ /^[[:space:]]*#/) break
@@ -351,6 +355,23 @@ strip_legacy_hardrules() {
     if ! grep -qE '^[[:space:]]*-[[:space:]]' "${PF}.setupdsh-tmp" 2>/dev/null \
       && ! grep -qE '^[[:space:]]*(\[\][[:space:]]*|\{\}[[:space:]]*)$' "${PF}.setupdsh-tmp" 2>/dev/null; then
       printf '%s\n' '[]' >> "${PF}.setupdsh-tmp"
+    fi
+    # 结构自检：不许留下「空壳 - insert:」（后面没有条目的 insert）—— 那是无效 YAML，
+    # dsh 会拒绝启动。发现就放弃这次改动，原文件一个字节不动。
+    if awk '
+      { L[NR] = $0 }
+      END {
+        for (i = 1; i <= NR; i++) {
+          if (L[i] ~ /^[[:space:]]*-[[:space:]]*insert:[[:space:]]*$/) {
+            j = i + 1
+            while (j <= NR && L[j] ~ /^[[:space:]]*$/) j = j + 1
+            if (j > NR || L[j] !~ /^[[:space:]]*-[[:space:]]/) { print "BAD"; exit }
+          }
+        }
+      }' "${PF}.setupdsh-tmp" 2>/dev/null | grep -q BAD; then
+      rm -f "${PF}.setupdsh-tmp" 2>/dev/null || true
+      say "⚠️ ${PF} 退役后结构自检没过（会留下空壳 insert），已放弃改动，原文件未动"
+      return 0
     fi
     if mv "${PF}.setupdsh-tmp" "$PF"; then
       say "🧹 退役 hard-rules 挂载块（最高指令已随插件提供；原指向 ${REF}）：$(basename "$(dirname "$PF")")（备份 .bak-hardrules-retired-${STAMP}）"
