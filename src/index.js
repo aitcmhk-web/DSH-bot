@@ -2193,6 +2193,9 @@ export function apply(ctx, config) {
           // 否则「已启动」和「成功」分不清。
           child.on('exit', (code, signal) => {
             if (code === 0) log('识图探测完成');
+            // 3 = 脚本约定「没找到可探测的模型配置，什么都没做」。
+            // 之前跳过和真跑完都退 0，日志一律写「探测完成」—— 那就是假成功。
+            else if (code === 3) log('识图探测跳过（没找到声明模型的配置），本次未改动任何文件');
             else error(`识图探测失败（${signal ? `信号 ${signal}` : `退出码 ${code}`}），详见 ${logPath}`);
           });
           log('识图自动探测已在后台启动（输出: vision-auto.log）');

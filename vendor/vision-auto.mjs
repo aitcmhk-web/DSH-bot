@@ -18,32 +18,61 @@
  *   node vision-auto.mjs --force         # 已标记的模型也重新探测（不自动删旧标记，仅报告）
  *   node vision-auto.mjs --quiet         # 静默（bot 启动钩子用），只报错误
  *   node vision-auto.mjs <file>          # 指定目标文件（副本试跑）
+ *
+ * 默认目标 = 所有声明过 `llm-pi-ai` / `llm-deepseek` 的 `profiles/<档名>/cordis.patch.yml`
+ * （老版 DSH 才用 home 级 settings.yaml）。
+ * 退出码：0 = 已处理；3 = 没找到可处理的配置（跳过）；1 = 失败。
  */
-import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, existsSync, readdirSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const HOME = homedir();
 /**
- * 目标文件（默认）：web 端「设置 → 模型」的真实落盘。
+ * 要处理的文件（默认）：**所有声明过模型**的 profile patch。
  *
- * ⚠️ 路径变迁：
- *   - 0.2.0 起 home 级 `~/.dsh/settings.yaml` 被升级流程**搬走**
- *     （只剩 `settings.yaml.imported`），web 端配置改落
- *     `profiles/web/cordis.patch.yml`；
- *   - 老代码默认写死 settings.yaml → 每次都走「未找到 → 跳过探测」，
- *     识图标记永远补不上。
- *   ⇒ 默认优先 patch，不存在再退回 settings.yaml（老版本 DSH 仍可用）。
- *   显式传参（副本试跑）优先级最高，不受影响。
+ * ⚠️ 只认 `profiles/web` 那份是不够的：`llm-pi-ai` 的模型块要落两份 ——
+ *    本 profile 那份决定 provider 注册（真正管「图发不发得出去」的是它），
+ *    web 那份只管菜单。只改 web ⇒ bot 用的那份还带着「纯文字」旧标记，
+ *    识图照样不通。所以这里逐个 profile 扫，谁的 patch 里有
+ *    `- id: llm-pi-ai` / `llm-deepseek` 段就处理谁。
+ *
+ * ⚠️ 0.2.0 起 home 级 `~/.dsh/settings.yaml` 被升级流程搬走，只在老版本 DSH 上
+ *    还作后备（上面一份都没找到时才用它）。
+ *
+ * ⚠️ 一个都没有时**不能报成功**：调用方按退出码记日志，退出码 3 = 跳过。
+ * 显式传参（副本试跑）优先级最高，只处理那一个文件。
  */
-const CANDIDATES = [
-  `${HOME}/.dsh/profiles/web/cordis.patch.yml`,
-  `${HOME}/.dsh/settings.yaml`,
-];
+const LEGACY_SETTINGS = `${HOME}/.dsh/settings.yaml`;
+const MODEL_BLOCK_RE = /^\s*-\s*id:\s*llm-(pi-ai|deepseek)\s*$/m;
+
+/** `profiles/<name>/cordis.patch.yml` 里声明过模型的那些文件。 */
+function discoverTargets() {
+  const dir = `${HOME}/.dsh/profiles`;
+  const found = [];
+  let names = [];
+  try {
+    names = readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort();
+  } catch {
+    names = [];
+  }
+  for (const name of names) {
+    const p = join(dir, name, 'cordis.patch.yml');
+    try {
+      if (MODEL_BLOCK_RE.test(readFileSync(p, 'utf8'))) found.push(p);
+    } catch {
+      // 没有这个文件 / 读不到：跳过
+    }
+  }
+  if (found.length > 0) return found;
+  return existsSync(LEGACY_SETTINGS) ? [LEGACY_SETTINGS] : [];
+}
+
 const argTarget = process.argv.slice(2).find((a) => !a.startsWith('-'));
-const target = argTarget
-  || CANDIDATES.find((p) => { try { return existsSync(p); } catch { return false; } })
-  || CANDIDATES[0];
+const targets = argTarget ? [argTarget] : discoverTargets();
 const CHECK = process.argv.includes('--check');
 const FORCE = process.argv.includes('--force');
 const QUIET = process.argv.includes('--quiet');
@@ -172,6 +201,10 @@ function loadKeys() {
 
 /** 探测单个模型是否接受图片。返回 'vision' | 'no' | 'unknown'。 */
 async function probe(baseURL, apiKeyEnv, modelId, keys) {
+  // 服务商没写 baseURL（本地 llama.cpp 一类）→ 没得探；不挡的话 .replace 会把整轮探测炸掉。
+  if (typeof baseURL !== 'string' || baseURL === '') {
+    return { verdict: 'unknown', why: '服务商没写 baseURL' };
+  }
   const url = baseURL.replace(/\/+$/, '') + '/chat/completions';
   const key = keys[apiKeyEnv];
   const headers = { 'Content-Type': 'application/json' };
@@ -195,8 +228,18 @@ async function probe(baseURL, apiKeyEnv, modelId, keys) {
       method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (res.ok) return { verdict: 'vision' };
-    if ([400, 404, 422].includes(res.status)) return { verdict: 'no', why: `HTTP ${res.status}` };
-    return { verdict: 'unknown', why: `HTTP ${res.status}` };
+    // ⚠️ 只有报错**明确提到图片**才判「不支持识图」，其余一律 unknown（不动标记）。
+    //    老写法把任何 400/404/422 都当不支持：模型名写错、max_tokens 不认、端点形状不同，
+    //    都会被插上 `input: [text]`，而标记是粘的 —— 一次误判 = 识图被永久关掉。
+    const text = await res.text().catch(() => '');
+    const imageRelated = /image|vision|multimodal|图片|多模态/i.test(text);
+    if (imageRelated && [400, 404, 422].includes(res.status)) {
+      return { verdict: 'no', why: `HTTP ${res.status}` };
+    }
+    return {
+      verdict: 'unknown',
+      why: `HTTP ${res.status}${imageRelated ? '' : '（报错没提图片，不判定为不支持）'}`,
+    };
   } catch (e) {
     return { verdict: 'unknown', why: e.name === 'TimeoutError' ? '超时' : e.message };
   }
@@ -236,12 +279,19 @@ function removeMark(lines, r) {
   }
 }
 
-async function main() {
+/**
+ * 探测结果缓存（进程级，跨 profile 共用）：key = `baseURL\0模型 id`。
+ * 同一台机器的多个 profile 常是同一份模型配置的副本 —— 不共用缓存就会把
+ * 同一个模型问 N 遍（每个 profile 一遍）。
+ */
+const verdicts = new Map();
+
+async function processTarget(target) {
   let src;
   try {
     src = readFileSync(target, 'utf8');
   } catch {
-    console.log(`⏭ 未找到 ${target}（web 端未配模型）—— 跳过识图探测。`);
+    say(`⏭ 未找到 ${target} —— 跳过。`);
     return;
   }
   const doc = parseYaml(src);
@@ -281,18 +331,42 @@ async function main() {
   const work = lines;
 
   // ── 第 2 步：逐模型探测（并发）──
+  //   同一台机器上多个 profile 常是同一份模型配置的副本，同一个
+  //   `服务商+模型` 只探一次（结果按 key 复用），否则一份配置 × N 个 profile
+  //   会在每次启动时把同一个问题问 N 遍。
   const jobs = [];
   for (const [name, p] of Object.entries(providers)) {
     for (const m of p?.models ?? []) {
       const r = findEntry(work, m.id);
       if (!r) { jobs.push({ name, id: m.id, run: null, note: '找不到条目' }); continue; }
-      if (entryHasInput(work, r) && !FORCE) {
+      // 本地/免配服务商（没 baseURL）不探测：探测函数会抛异常，整轮探测直接崩。
+      if (typeof p?.baseURL !== 'string' || p.baseURL === '') {
+        jobs.push({ name, id: m.id, run: null, note: '服务商没写 baseURL，不探测' });
+        continue;
+      }
+      const marked = entryHasInput(work, r);
+      // 服务商声明了识图，而模型条目上还盖着「纯文字」旧标记 —— 这对矛盾必须复测：
+      // 标记是粘的，不复测就是一次误判永久关掉识图（本机的实际翻车方式）。
+      const providerSaysVision = Array.isArray(p?.defaultInput) && p.defaultInput.includes('image');
+      if (marked && !FORCE && !providerSaysVision) {
         jobs.push({ name, id: m.id, run: null, note: '已有标记，跳过（--force 重测）' });
         continue;
       }
-      jobs.push({ name, id: m.id, entry: r, run: probe(p.baseURL, p.apiKeyEnv, m.id, keys) });
+      const probeKey = `${p.baseURL}\u0000${m.id}`;
+      if (!verdicts.has(probeKey)) verdicts.set(probeKey, probe(p.baseURL, p.apiKeyEnv, m.id, keys));
+      jobs.push({ name, id: m.id, entry: r, retest: marked, run: verdicts.get(probeKey) });
     }
   }
+  //  内置 DeepSeek 档（`llm-deepseek`）单独点个名：它的 models 直接挂在 config 下、
+  //  接口常不是 OpenAI 兼容形状（`/anthropic`），所以**不猜、不标记**，只如实报一句。
+  //  老版本这里一个字都不提 —— 用户看到「探测完成」，其实这档从没被碰过。
+  const dsEntry = Array.isArray(doc) ? doc.find((e) => e?.id === 'llm-deepseek') : doc?.['llm-deepseek'];
+  const dsModels = dsEntry?.config?.models ?? dsEntry?.models ?? [];
+  for (const m of Array.isArray(dsModels) ? dsModels : []) {
+    const id = m?.id ?? m;
+    if (id) say(`ℹ️ 官方 DeepSeek 档/${id}: 未探测（脚本只探 OpenAI 兼容的 pi-ai 档，不猜）`);
+  }
+
   await Promise.all(jobs.map(async (j) => {
     if (!j.run) return;
     j.result = await j.run;
@@ -305,7 +379,7 @@ async function main() {
     const v = j.result.verdict;
     const hasMark = j.entry ? entryHasInput(work, j.entry) : false;
     if (v === 'vision') {
-      if (hasMark && FORCE) {
+      if (hasMark && (FORCE || j.retest)) {
         // 复测翻案：原来标了纯文字、现在通了 —— 不摘旧标记就永远用不上识图。
         ops.push({ pos: j.entry.end, entry: j.entry, kind: 'remove' });
         say(`🔄 ${j.name}/${j.id}: 复测识图正常 → 摘除旧纯文字标记`);
@@ -348,4 +422,15 @@ async function main() {
   say(`\n✅ 已写回 ${target}（备份：${backup}）。重启 bot 后生效。`);
 }
 
+async function main() {
+  if (targets.length === 0) {
+    console.error('⏭ 跳过识图探测：没有找到声明模型的配置（profiles/*/cordis.patch.yml、settings.yaml 都没有）。');
+    // 退出码 3 = 「没干活」。调用方据此记「跳过」，不再把跳过写成「探测完成」。
+    process.exit(3);
+  }
+  for (const target of targets) {
+    say(`──── ${target} ────`);
+    await processTarget(target);
+  }
+}
 main().catch((e) => { console.error('⛔ vision-auto 失败:', e.message); process.exit(1); });
