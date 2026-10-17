@@ -143,6 +143,59 @@ const readPatch = (home, name) =>
   rmSync(home, { recursive: true, force: true });
 }
 
+// ── 用例 5：官方 DeepSeek 档缺「能看图」标记 → 探到能看就补进 inputModalities ──
+//   这档原来被脚本「不猜、不碰」，于是模型条目只有 id/name —— DSH 就当它只收文字，
+//   图在最后一站被换成占位符（云端那次翻车就是这个）。
+{
+  const home = mkdtempSync(join(tmpdir(), 'vision-auto-ds-'));
+  const dir = join(home, '.dsh', 'profiles', 'mybot');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, 'cordis.patch.yml'),
+    `- id: llm-deepseek
+  name: "@deepseek-ai/dsh-llm-deepseek-api-key"
+  config:
+    baseURL: ${BASE_URL}
+    apiKeyEnv: ZHIPU_API_KEY
+    models:
+      - id: deepseek-flash
+        name: DeepSeek-V41-Flash
+`,
+  );
+  writeFileSync(join(home, '.dsh', '.credentials.yaml'), 'refs:\n  ZHIPU_API_KEY: dummy\n');
+  mode = 'ok';
+  const r = await run(home);
+  const text = readPatch(home, 'mybot');
+  ok(r.stdout.includes('已补 inputModalities [text, image]'), '官方 DeepSeek 档探到能看图 → 补标记');
+  ok(/inputModalities:\s*\n\s+- text\s*\n\s+- image/.test(text), 'inputModalities 里确实有 text + image');
+  rmSync(home, { recursive: true, force: true });
+}
+
+// ── 用例 6：DeepSeek 档探不到识图 → 一个字都不改（⛔ 不猜） ────────────────
+{
+  const home = mkdtempSync(join(tmpdir(), 'vision-auto-ds-no-'));
+  const dir = join(home, '.dsh', 'profiles', 'mybot');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, 'cordis.patch.yml'),
+    `- id: llm-deepseek
+  config:
+    baseURL: ${BASE_URL}
+    apiKeyEnv: ZHIPU_API_KEY
+    models:
+      - id: deepseek-flash
+        name: DeepSeek-V41-Flash
+`,
+  );
+  writeFileSync(join(home, '.dsh', '.credentials.yaml'), 'refs:\n  ZHIPU_API_KEY: dummy\n');
+  mode = 'textoops';
+  const before = readPatch(home, 'mybot');
+  await run(home);
+  ok(readPatch(home, 'mybot') === before, 'DeepSeek 档探测失败时原文件一字未动');
+  mode = 'ok';
+  rmSync(home, { recursive: true, force: true });
+}
+
 server.close();
 console.log(failed === 0 ? '\n全部通过' : `\n${failed} 项失败`);
 process.exit(failed === 0 ? 0 : 1);

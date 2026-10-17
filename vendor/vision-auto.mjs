@@ -270,6 +270,29 @@ function findEntry(lines, modelId) {
 
 const entryHasInput = (lines, r) => lines.slice(r.start, r.end + 1).some((l) => /^\s*input:/.test(l));
 
+/**
+ * 把条目内的 `inputModalities` 设成给定清单；没有这个键就插到 id 行下面。
+ * 缩进按条目行 (`- id:`) 的实际缩进 +2 推算，⛔ 不写死——patch 与 settings.yaml 的层深不同。
+ * @returns {boolean} 是否真的改了行
+ */
+function setInputModalities(lines, r, want) {
+  const pad = ' '.repeat(r.indent + 2);
+  const head = new RegExp(`^${pad}inputModalities:\\s*$`);
+  const item = new RegExp(`^${pad}  - `);
+  const block = [`${pad}inputModalities:`, ...want.map((x) => `${pad}  - ${x}`)];
+  for (let i = r.start + 1; i <= r.end; i += 1) {
+    if (!head.test(lines[i])) continue;
+    let j = i + 1;
+    while (j <= r.end && item.test(lines[j])) j += 1;
+    const same = j - i - 1 === want.length && want.every((x, k) => lines[i + 1 + k].trim() === `- ${x}`);
+    if (same) return false;
+    lines.splice(i, j - i, ...block);
+    return true;
+  }
+  lines.splice(r.start + 1, 0, ...block);
+  return true;
+}
+
 /** 摘掉条目里的纯文字标记（input: 行 + 紧随的 - text 行）。从区间尾部往前删，行号不失效。 */
 function removeMark(lines, r) {
   for (let i = r.end; i >= r.start; i--) {
@@ -357,17 +380,28 @@ async function processTarget(target) {
       jobs.push({ name, id: m.id, entry: r, retest: marked, run: verdicts.get(probeKey) });
     }
   }
-  //  内置 DeepSeek 档（`llm-deepseek`）单独点个名：它的 models 直接挂在 config 下、
-  //  接口常不是 OpenAI 兼容形状（`/anthropic`），所以**不猜、不标记**，只如实报一句。
-  //  老版本这里一个字都不提 —— 用户看到「探测完成」，其实这档从没被碰过。
+  //  内置 DeepSeek 档（`llm-deepseek`）也真探：
+  //    · 这档的 models 直接挂在 config 下，接口常是 `/anthropic` 形状 —— OpenAI 兼容
+  //      口子在 `/v1`，所以探之前把结尾的 `/anthropic` 换成 `/v1`（别的地址原样用）。
+  //    · 模型条目缺 `inputModalities`（或只写 text）时，DSH 就当它「只收文字」，
+  //      图在最后一站被换成占位符 —— 探到能看图就把 image 补进清单。
+  //    · 探不到 / 不确认 ⇒ 一个字都不改（⛔ 不猜）。
   const dsEntry = Array.isArray(doc) ? doc.find((e) => e?.id === 'llm-deepseek') : doc?.['llm-deepseek'];
-  const dsModels = dsEntry?.config?.models ?? dsEntry?.models ?? [];
-  for (const m of Array.isArray(dsModels) ? dsModels : []) {
+  const dsCfg = dsEntry?.config ?? dsEntry ?? {};
+  const dsBase = typeof dsCfg?.baseURL === 'string' && dsCfg.baseURL
+    ? dsCfg.baseURL.replace(/\/anthropic\/?$/, '/v1')
+    : 'https://api.deepseek.com/v1';
+  const dsKeyEnv = dsCfg?.apiKeyEnv || 'DEEPSEEK_API_KEY';
+  const dsJobs = [];
+  for (const m of Array.isArray(dsCfg?.models) ? dsCfg.models : []) {
     const id = m?.id ?? m;
-    if (id) say(`ℹ️ 官方 DeepSeek 档/${id}: 未探测（脚本只探 OpenAI 兼容的 pi-ai 档，不猜）`);
+    if (!id) continue;
+    const probeKey = `${dsBase}\u0000${id}`;
+    if (!verdicts.has(probeKey)) verdicts.set(probeKey, probe(dsBase, dsKeyEnv, id, keys));
+    dsJobs.push({ id, run: verdicts.get(probeKey) });
   }
 
-  await Promise.all(jobs.map(async (j) => {
+  await Promise.all([...jobs, ...dsJobs].map(async (j) => {
     if (!j.run) return;
     j.result = await j.run;
   }));
@@ -403,6 +437,28 @@ async function processTarget(target) {
     if (op.kind === 'insert') work.splice(op.pos, 0, `${op.pad}input:`, `${op.pad}  - text`);
     else removeMark(work, op.entry);
     changed = true;
+  }
+
+  // ── 官方 DeepSeek 档：能看图就把 image 补进 inputModalities ──
+  //   为什么必须补：DSH 把「模型条目没有 image」当成只收文字，图会被换成占位符；
+  //   而这份清单常常只写了 id/name，能力就丢失了。
+  for (const j of dsJobs) {
+    const v = j.result?.verdict;
+    if (v !== 'vision') {
+      if (j.run) {
+        say(
+          `ℹ️ 官方 DeepSeek 档/${j.id}: ${v === 'no' ? `不支持识图（${j.result.why}）` : `未确认（${j.result.why}）`} —— 配置不动`,
+        );
+      }
+      continue;
+    }
+    const r = findEntry(work, j.id);
+    if (!r) { say(`⚠️ 官方 DeepSeek 档/${j.id}: 找不到条目，跳过`); continue; }
+    if (CHECK) { say(`（将给官方 DeepSeek 档/${j.id} 补 inputModalities [text, image]）`); continue; }
+    if (setInputModalities(work, r, ['text', 'image'])) {
+      changed = true;
+      say(`✅ 官方 DeepSeek 档/${j.id}: 已补 inputModalities [text, image]`);
+    }
   }
 
   if (CHECK) { say('（--check 未写文件）'); return; }
