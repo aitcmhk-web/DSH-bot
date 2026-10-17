@@ -196,6 +196,73 @@ const readPatch = (home, name) =>
   rmSync(home, { recursive: true, force: true });
 }
 
+// ── 用例 7：条目声明的是 text + image（不是「纯文字」标记）→ 复测通过也不许删 ──
+//   旧写法只要看到 `input:` 就连着删两行，把 `- image` 留成悬空项；YAML 把它折进上一行的值，
+//   解析不报错、DSH 校验不过 → 整段 provider 作废（本机 2026-10-17 的实际翻车方式）。
+{
+  const home = mkdtempSync(join(tmpdir(), 'vision-auto-keep-'));
+  const dir = join(home, '.dsh', 'profiles', 'mybot');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'cordis.patch.yml'), `- id: llm-pi-ai
+  config:
+    providers:
+      zhipu:
+        apiKeyEnv: ZHIPU_API_KEY
+        api: openai-completions
+        baseURL: ${BASE_URL}
+        defaultInput:
+          - text
+          - image
+        models:
+          - id: glm-4.7-flash
+            name: glm-4.7-flash
+            input:
+              - text
+              - image
+`);
+  mode = 'ok';
+  const r = await run(home);
+  const text = readPatch(home, 'mybot');
+  ok(/input:\s*\n\s+- text\s*\n\s+- image/.test(text), 'text + image 清单原样保留（没被当成旧标记删掉）');
+  ok(r.stdout.includes('不摘'), '明确报「不摘」而不是照旧删掉（旧代码这里必红）');
+  rmSync(home, { recursive: true, force: true });
+}
+
+// ── 用例 8：历史坏行（`- image` 丢了它的 `input:` 键行）→ 自动补回、可重复跑 ──
+{
+  const home = mkdtempSync(join(tmpdir(), 'vision-auto-repair-'));
+  const dir = join(home, '.dsh', 'profiles', 'mybot');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'cordis.patch.yml'), `- id: llm-pi-ai
+  config:
+    providers:
+      vq:
+        apiKeyEnv: QWEN36VQ_API_KEY
+        api: openai-completions
+        baseURL: ${BASE_URL}
+        defaultInput:
+          - text
+          - image
+        models:
+          - id: vq-local
+            name: VQ-4.6bpw
+            maxTokens: 16384
+            contextWindow: 65536
+              - image
+`);
+  mode = 'ok';
+  const r = await run(home);
+  const fixed = readPatch(home, 'mybot');
+  ok(r.stdout.includes('补回 1 处被删坏的 input: 键行'), '认出来并报了「补回 1 处」');
+  ok(/contextWindow: 65536\s*\n\s+input:\s*\n\s+- text\s*\n\s+- image/.test(fixed),
+    '悬空的 image 项补回了 input: 键行和 text 项');
+  ok(readdirSync(dir).some((f) => f.includes('.bak.visionauto-')), '写回前留了备份');
+  const again = await run(home);
+  ok(readPatch(home, 'mybot') === fixed, '再跑一遍不重复改（幂等）');
+  ok(!again.stdout.includes('补回'), '第二遍不再报「补回」');
+  rmSync(home, { recursive: true, force: true });
+}
+
 server.close();
 console.log(failed === 0 ? '\n全部通过' : `\n${failed} 项失败`);
 process.exit(failed === 0 ? 0 : 1);

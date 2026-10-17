@@ -293,13 +293,83 @@ function setInputModalities(lines, r, want) {
   return true;
 }
 
-/** 摘掉条目里的纯文字标记（input: 行 + 紧随的 - text 行）。从区间尾部往前删，行号不失效。 */
+/**
+ * 摘掉条目里的「纯文字」标记（`input:` 行 + 它唯一的 `- text` 项）。从区间尾部往前删，行号不失效。
+ * ⛔ 只在清单确实只有 text 时才删：清单里还有 image 时删掉 `input:` 行，会把 image 项留成悬空行，
+ *   YAML 把它折进上一行的值（`contextWindow: 65536 - image`）—— 解析不报错，但模型配置对 DSH
+ *   是非法值，整段 provider 作废、一个适配器都注册不上（报「no adapter registered」）。
+ * @returns {boolean} 是否真的删了行
+ */
 function removeMark(lines, r) {
-  for (let i = r.end; i >= r.start; i--) {
-    if (/^\s*input:/.test(lines[i])) {
-      lines.splice(i, /^\s*- /.test(lines[i + 1] ?? '') ? 2 : 1);
+  const pad = ' '.repeat(r.indent + 2);
+  const head = new RegExp(`^${pad}input:\\s*$`);
+  const item = new RegExp(`^${pad}  - (\\S+)\\s*$`);
+  for (let i = r.end; i >= r.start; i -= 1) {
+    if (!head.test(lines[i])) continue;
+    const items = [];
+    for (let j = i + 1; j <= r.end; j += 1) {
+      const m = lines[j].match(item);
+      if (!m) break;
+      items.push(m[1]);
     }
+    if (items.length !== 1 || items[0] !== 'text') return false;
+    lines.splice(i, 2);
+    return true;
   }
+  return false;
+}
+
+/** 往上找第一条非空、非注释行；找不到返回 -1。 */
+function prevContentLine(lines, from) {
+  for (let i = from; i >= 0; i -= 1) {
+    if (lines[i].trim() === '' || /^\s*#/.test(lines[i])) continue;
+    return i;
+  }
+  return -1;
+}
+
+/**
+ * 补回「键行被删掉」的 `- text` / `- image` 项：它们直接跟在 `key: 数值` 后面。
+ *   ⚠️ 这种形状 YAML 照样解析（折进上一行的值），所以「写回前重新解析」那道闸拦不住它 ——
+ *      只能按形状认出来单独修，否则坏配置一直留着，整段 provider 全部没有适配器。
+ *   只认「比上一条内容行缩进更深」的 text/image 项：模型列表里缩进更浅的兄弟项不受影响。
+ * @returns {number} 修好的处数
+ */
+function repairDanglingInput(lines) {
+  let fixed = 0;
+  for (let i = lines.length - 1; i >= 1; i -= 1) {
+    const m = lines[i].match(/^(\s*)-\s+(text|image)\s*$/);
+    if (!m) continue;
+    const prev = lines[prevContentLine(lines, i - 1)] ?? '';
+    const key = prev.match(/^(\s*)[A-Za-z][\w-]*:\s*(\S.*)$/);
+    if (!key || m[1].length <= key[1].length) continue;
+    const pad = ' '.repeat(m[1].length - 2);
+    let end = i;
+    const item = new RegExp(`^${pad}  - (text|image)\\s*$`);
+    while (end + 1 < lines.length && item.test(lines[end + 1])) end += 1;
+    const items = lines.slice(i, end + 1).map((l) => l.trim().replace(/^-\s+/, ''));
+    if (!items.includes('text')) items.unshift('text'); // 被删掉的正是 `- text` 那一行
+    lines.splice(i, end - i + 1, `${pad}input:`, ...items.map((x) => `${pad}  - ${x}`));
+    fixed += 1;
+  }
+  return fixed;
+}
+
+/**
+ * 写回前的结构闸：`- xxx` 项比上一条内容行缩进更深、而上一条是「键: 值」，YAML 就会把它折进那个值。
+ * 解析不报错，但那行值变字符串 —— DSH 校验不过、整段 provider 作废，所以这种形状一律不许写回。
+ * @returns {number[]} 可疑行的行号（1 基）；空数组 = 通过
+ */
+function findDanglingItems(lines) {
+  const bad = [];
+  for (let i = 1; i < lines.length; i += 1) {
+    const m = lines[i].match(/^(\s*)-\s+\S/);
+    if (!m) continue;
+    const prev = lines[prevContentLine(lines, i - 1)] ?? '';
+    const key = prev.match(/^(\s*)[A-Za-z][\w-]*:\s*(\S.*)$/);
+    if (key && m[1].length > key[1].length) bad.push(i + 1);
+  }
+  return bad;
 }
 
 /**
@@ -317,7 +387,15 @@ async function processTarget(target) {
     say(`⏭ 未找到 ${target} —— 跳过。`);
     return;
   }
-  const doc = parseYaml(src);
+  const lines = src.split('\n');
+
+  // ── 第 0 步：补回历史坏行（见 repairDanglingInput）──
+  //   ⚠️ 必须在取 providers **之前**：坏行会改变上一行键的解析结果，
+  //      先修再解析，providers 才是真实形状。
+  const repaired = repairDanglingInput(lines);
+  if (repaired > 0) say(`🔧 补回 ${repaired} 处被删坏的 input: 键行`);
+
+  const doc = parseYaml(lines.join('\n'));
   // ── 取 providers：两种顶层结构都要认 ──────────────────────────────
   //   settings.yaml   → 顶层 map，`llm-pi-ai` 是顶层键；
   //   cordis.patch.yml→ 顶层 **数组**，llm-pi-ai 是其中一条 `- id: llm-pi-ai`
@@ -328,12 +406,11 @@ async function processTarget(target) {
     : doc?.['llm-pi-ai'];
   const providers = piEntry?.config?.providers ?? piEntry?.providers ?? {};
   const keys = loadKeys();
-  const lines = src.split('\n');
 
   // ── 第 1 步：确保每个服务商都有 defaultInput（「假设都有识图」层）──
   //   ⚠️ 缩进按 baseURL 行的实际缩进推算（defaultInput 与 baseURL 同级，其列表项再深 2），
   //      不写死 6 空格 —— patch 文件里是 8，写死就注错层、YAML 直接坏掉。
-  let changed = false;
+  let changed = repaired > 0;
   for (const [name, p] of Object.entries(providers)) {
     if (p?.defaultInput?.includes('image')) continue;
     const esc = String(p.baseURL ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -415,7 +492,7 @@ async function processTarget(target) {
     if (v === 'vision') {
       if (hasMark && (FORCE || j.retest)) {
         // 复测翻案：原来标了纯文字、现在通了 —— 不摘旧标记就永远用不上识图。
-        ops.push({ pos: j.entry.end, entry: j.entry, kind: 'remove' });
+        ops.push({ pos: j.entry.end, entry: j.entry, kind: 'remove', name: j.name, id: j.id });
         say(`🔄 ${j.name}/${j.id}: 复测识图正常 → 摘除旧纯文字标记`);
       } else say(`✅ ${j.name}/${j.id}: 识图正常`);
     } else if (v === 'no') {
@@ -434,9 +511,15 @@ async function processTarget(target) {
   ops.sort((a, b) => b.pos - a.pos); // 从后往前，行号不失效
   for (const op of ops) {
     if (CHECK) continue;
-    if (op.kind === 'insert') work.splice(op.pos, 0, `${op.pad}input:`, `${op.pad}  - text`);
-    else removeMark(work, op.entry);
-    changed = true;
+    if (op.kind === 'insert') {
+      work.splice(op.pos, 0, `${op.pad}input:`, `${op.pad}  - text`);
+      changed = true;
+    } else if (removeMark(work, op.entry)) {
+      changed = true;
+    } else {
+      // 标记清单里还有 image：删 `input:` 会留下悬空的 image 项、整段配置作废。
+      say(`⏭ ${op.name}/${op.id}: 标记清单里不止 text —— 不摘（摘了会留悬空项）`);
+    }
   }
 
   // ── 官方 DeepSeek 档：能看图就把 image 补进 inputModalities ──
@@ -469,6 +552,13 @@ async function processTarget(target) {
     parseYaml(work.join('\n'));
   } catch (err) {
     console.error(`⛔ 生成的 YAML 解析失败（${err.message}）—— 已放弃写回，原文件未动。`);
+    process.exit(1);
+  }
+  // ⛔ 第二道闸：解析通过 ≠ 能用 —— 悬空列表项（见 findDanglingItems）解析得出来，
+  //   但 DSH 校验不过、整段 provider 作废，一样是一字不写。
+  const dangling = findDanglingItems(work);
+  if (dangling.length > 0) {
+    console.error(`⛔ 生成的 YAML 有悬空列表项（第 ${dangling.join('、')} 行）—— 已放弃写回，原文件未动。`);
     process.exit(1);
   }
   const ts = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
