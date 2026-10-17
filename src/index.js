@@ -515,7 +515,7 @@ export function apply(ctx, config) {
   //    key 规则：单模型 provider 用别名，多模型 `<别名>:<模型id>`。
   // `dsa` = DeepSeek 账户档（桌面版登录后 Web 端多出来的那一档）。
   //    和 `ds`（API key 档）模型名完全一样，只能靠 provider 区分，别想靠名字区分。
-  const KEY_ALIAS = { alibailian: 'ali', 'deepseek-official': 'ds', 'deepseek-account': 'dsa', qwen36vq: 'local', qwen36iq4xs: 'iq4' };
+  const KEY_ALIAS = { alibailian: 'ali', 'deepseek-official': 'ds', 'deepseek-account': 'dsa', qwen36iq4xs: 'iq4' };
   const menuKey = (pid) => KEY_ALIAS[pid] ?? pid;
   const routeKeyFor = (pid, modelId, isOnlyModel) => {
     const alias = menuKey(pid);
