@@ -227,7 +227,7 @@ ensure_dsh() {
 # ⚠️ 这里写死的 tag 必须是**本次发布自己的 tag**（发新版本时同步改，别漏）。
 #    走 TG 菜单那条路会先上网拉最新这份脚本再跑，所以实际生效的永远是网上最新的 tag；
 #    没网时才退回包里这份 —— 那时它也只能装这个 tag。
-SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.83}"
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.84}"
 # ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
 #    ⛔ 绝不拿日期或路径冒充版本号。
 plugin_version() {
@@ -346,6 +346,16 @@ strip_legacy_hardrules() {
   S="${RANGE%% *}"; E="${RANGE##* }"
   case "$S" in ''|*[!0-9]*) return 0;; esac
   case "$E" in ''|*[!0-9]*) return 0;; esac
+  # 删的范围里带着 `- insert:` 壳时，先看同一块里还有没有别的子项（比如 legacy-polyfill / web-logs）。
+  # 有 → 壳必须留着，否则那些兄弟项会变成挂错缩进的孤儿，YAML 直接非法。
+  if [ "$S" -lt "$ID_LINE" ]; then
+    BLOCK_END="$(awk -v k="$ID_LINE" 'NR > k && /^-[[:space:]]/ { print NR; exit }' "$PF" 2>/dev/null)"
+    [ -n "$BLOCK_END" ] || BLOCK_END="$(wc -l < "$PF" | tr -d ' ')"
+    IND0="$(sed -n "${ID_LINE}p" "$PF" | sed 's/[^ ].*//')"
+    SIB="$(awk -v e="$E" -v b="$BLOCK_END" -v ind="$IND0" \
+      'NR > e && NR <= b && index($0, ind "- ") == 1 { print "Y"; exit }' "$PF" 2>/dev/null)"
+    [ -n "$SIB" ] && S="$ID_LINE"
+  fi
   STAMP="$(date +%Y%m%d-%H%M%S)"
   cp "$PF" "${PF}.bak-hardrules-retired-${STAMP}" || { say "⚠️ ${PF} 备份失败，退役块没清"; return 0; }
   if awk -v s="$S" -v e="$E" 'NR < s || NR > e' "$PF" > "${PF}.setupdsh-tmp" 2>/dev/null; then
@@ -371,6 +381,22 @@ strip_legacy_hardrules() {
       }' "${PF}.setupdsh-tmp" 2>/dev/null | grep -q BAD; then
       rm -f "${PF}.setupdsh-tmp" 2>/dev/null || true
       say "⚠️ ${PF} 退役后结构自检没过（会留下空壳 insert），已放弃改动，原文件未动"
+      return 0
+    fi
+    # 反向自检：子项必须有 `- insert:` 祖先。没有 = 孤儿（挂错缩进），YAML 非法，同样放弃。
+    if awk '
+      { L[NR] = $0 }
+      END {
+        for (i = 1; i <= NR; i++) {
+          if (L[i] ~ /^[[:space:]]+-[[:space:]]+id:/) {
+            j = i - 1
+            while (j >= 1 && L[j] !~ /^[^[:space:]]/) j--
+            if (j >= 1 && L[j] !~ /^-[[:space:]]*insert:[[:space:]]*$/) { print "ORPHAN"; exit }
+          }
+        }
+      }' "${PF}.setupdsh-tmp" 2>/dev/null | grep -q ORPHAN; then
+      rm -f "${PF}.setupdsh-tmp" 2>/dev/null || true
+      say "⚠️ ${PF} 退役后自检发现孤儿子项（缺 - insert: 壳），已放弃改动，原文件未动"
       return 0
     fi
     if mv "${PF}.setupdsh-tmp" "$PF"; then
