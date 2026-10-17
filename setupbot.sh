@@ -34,7 +34,7 @@ ARG_PROFILE="${1:-}"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-16.6"
+SELF_VERSION="2026-10-16.7"
 
 SETUPBOT_URL="${SETUPBOT_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupbot.sh}"
 SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot}"
@@ -1040,6 +1040,11 @@ write_launchers() {
   # ⚠️ 写入 PROFILE（setupbot 运行时的值），同时加兜底：如果为空从工作区目录名推断
   put "$CTL" "PROFILE=\"${PROFILE}\""
   put "$CTL" '[ -z "${PROFILE:-}" ] && PROFILE="$(basename "$WS")"'
+  # unit 用 Restart=always：直接 kill 进程会被 systemd 拉回来 → 起停必须交给 systemd，
+  # 自己再 nohup 一份也会变成两个实例抢同一个 bot token。没有 unit 时才走按 PID 的旧路。
+  put "$CTL" 'SVC="dsh-bot-${PROFILE}"'
+  put "$CTL" 'svc_unit() { [ -f "/etc/systemd/system/${SVC}.service" ]; }'
+  put "$CTL" 'svc_active() { command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SVC" 2>/dev/null; }'
   put "$CTL" 'PIDFILE="$WS/.bot.pid"'
   put "$CTL" 'LOG="$WS/bot.log"'
   put "$CTL" ''
@@ -1057,6 +1062,16 @@ write_launchers() {
   put "$CTL" ''
   put "$CTL" 'do_start() {'
   put "$CTL" '  p="$(running_pid)" && { echo "已经在跑（PID ${p}），没有重复启动。"; return 0; }'
+  put "$CTL" '  # 有 unit 就交给 systemd：自己 nohup 拉起来的进程不受托管，且会和它抢 token。'
+  put "$CTL" '  if svc_unit && command -v systemctl >/dev/null 2>&1; then'
+  put "$CTL" '    echo "启动中（systemd：${SVC}）…"'
+  put "$CTL" '    if systemctl start "$SVC" 2>/dev/null; then'
+  put "$CTL" '      sleep 3'
+  put "$CTL" '      p="$(running_pid)" && { echo "✅ 已启动（PID ${p}，systemd 管理）。日志：$LOG"; return 0; }'
+  put "$CTL" '      echo "⛔ systemd 起了但没找到进程。日志最后几行："; tail -n 8 "$LOG" 2>/dev/null; return 1'
+  put "$CTL" '    fi'
+  put "$CTL" '    echo "⚠️ systemctl start 失败（可能没权限），退回 nohup 拉起。"'
+  put "$CTL" '  fi'
   put "$CTL" '  echo "启动中…（日志：${LOG}）"'
   put "$CTL" '  ( cd "$WS" && nohup "$DSH" --profile "$PROFILE" >>"$LOG" 2>&1 </dev/null & echo $! >"$PIDFILE" )'
   put "$CTL" '  sleep 3'
@@ -1065,6 +1080,17 @@ write_launchers() {
   put "$CTL" '}'
   put "$CTL" ''
   put "$CTL" 'do_stop() {'
+  put "$CTL" '  # systemd 托管时只能让它停：直接 kill 会被 Restart=always 立刻拉回来（还可能算成崩溃）。'
+  put "$CTL" '  if svc_active; then'
+  put "$CTL" '    echo "停止中（systemd：${SVC}）…"'
+  put "$CTL" '    if systemctl stop "$SVC" 2>/dev/null; then'
+  put "$CTL" '      rm -f "$PIDFILE" 2>/dev/null'
+  put "$CTL" '      echo "✅ 已停止（systemd 管理；要连开机自启一起取消：./uninstall-autostart.sh）"'
+  put "$CTL" '      return 0'
+  put "$CTL" '    fi'
+  put "$CTL" '    echo "⛔ systemctl stop 失败（可能没权限）—— 别用 kill，会被拉回来；请用 sudo systemctl stop ${SVC}"'
+  put "$CTL" '    return 1'
+  put "$CTL" '  fi'
   put "$CTL" '  p="$(running_pid)" || { echo "现在没在跑。"; rm -f "$PIDFILE" 2>/dev/null; return 0; }'
   put "$CTL" '  echo "停止中（PID ${p}）…"'
   put "$CTL" '  kill "$p" 2>/dev/null || true'
@@ -1081,7 +1107,7 @@ write_launchers() {
   put "$CTL" '  start)   do_start ;;'
   put "$CTL" '  stop)    do_stop ;;'
   put "$CTL" '  restart) do_stop; echo; do_start ;;'
-  put "$CTL" '  status)  if p="$(running_pid)"; then echo "在跑（PID ${p}）"; else echo "没在跑"; fi ;;'
+  put "$CTL" '  status)  if svc_active; then p="$(running_pid)"; echo "在跑（PID ${p:-?}，systemd 管理）"; elif p="$(running_pid)"; then echo "在跑（PID ${p}）"; else echo "没在跑"; fi ;;'
   put "$CTL" '  *) echo "用法：$0 start|stop|restart|status"; exit 2 ;;'
   put "$CTL" 'esac'
   chmod +x "$CTL" 2>/dev/null
@@ -1296,9 +1322,9 @@ write_launchers() {
       put "$f" '#!/bin/sh'
       put "$f" "# ${2}「${PROFILE}」。此文件由 setupbot 生成，可以重复生成。"
       put "$f" 'cd "$(dirname "$0")" || exit 1'
-      put "$f" 'echo "${2}「${PROFILE}」"'
+      put "$f" "echo \"${2}「${PROFILE}」\""
       put "$f" 'echo "──────────────"'
-      put "$f" '"$(pwd)/.botctl.sh" $3'
+      put "$f" "\"\$(pwd)/.botctl.sh\" $3"
       put "$f" 'exit $?'
       chmod +x "$f" 2>/dev/null
     }
@@ -1344,7 +1370,9 @@ write_launchers() {
       put "$f" "User=${USER:-root}"
       put "$f" 'WorkingDirectory=${WS}'
       put "$f" "ExecStart=${DSHBIN} --profile ${PROFILE}"
-      put "$f" 'Restart=on-failure'
+      # dsh 吃 SIGTERM 是干净退出（exit 0）：on-failure 下 systemd 不会拉，
+      # 一次 /restart（重启助手只杀宿主、拉新交给 systemd）之后就一直躺着。
+      put "$f" 'Restart=always'
       put "$f" 'RestartSec=5'
       put "$f" 'StandardOutput=append:${WS}/bot.log'
       put "$f" 'StandardError=append:${WS}/bot.log'
@@ -1429,7 +1457,9 @@ write_launchers() {
       put "$f" 'WorkingDirectory=${WS}'
       # --no-open：headless 机器没有图形界面，不带这个参数它会去调 xdg-open 失败
       put "$f" "ExecStart=${DSHBIN} --profile web --no-open"
-      put "$f" 'Restart=on-failure'
+      # dsh 吃 SIGTERM 是干净退出（exit 0）：on-failure 下 systemd 不会拉，
+      # 一次 /restart（重启助手只杀宿主、拉新交给 systemd）之后就一直躺着。
+      put "$f" 'Restart=always'
       put "$f" 'RestartSec=5'
       put "$f" 'StandardOutput=append:${WS}/web.log'
       put "$f" 'StandardError=append:${WS}/web.log'

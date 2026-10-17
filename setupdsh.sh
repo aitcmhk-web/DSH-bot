@@ -29,7 +29,7 @@ SRC_PATH="$0"
 
 # ⚠️ 脚本自己的版本号：改了本文件就把它一起改。
 #    跑起来先报版本，才看得出本机这份脚本是新是旧。
-SELF_VERSION="2026-10-16.8"
+SELF_VERSION="2026-10-16.9"
 
 SETUPDSH_URL="${SETUPDSH_URL:-https://raw.githubusercontent.com/aitcmhk-web/DSH-bot/main/setupdsh.sh}"
 SELF_DIR="$HOME/.dsh/setupdsh"
@@ -227,7 +227,7 @@ ensure_dsh() {
 # ⚠️ 这里写死的 tag 必须是**本次发布自己的 tag**（发新版本时同步改，别漏）。
 #    走 TG 菜单那条路会先上网拉最新这份脚本再跑，所以实际生效的永远是网上最新的 tag；
 #    没网时才退回包里这份 —— 那时它也只能装这个 tag。
-SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.76}"
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.0.77}"
 # ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
 #    ⛔ 绝不拿日期或路径冒充版本号。
 plugin_version() {
@@ -397,6 +397,49 @@ retire_legacy_hardrules() {
   rm -f "$PATCHLIST_FILE" 2>/dev/null || true
 }
 
+# ⚠️ unit 目录可被 SYSTEMD_UNIT_DIR 覆盖 —— 测试时指到临时目录，别动真 /etc。
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+
+# repair_systemd_units — 把老版本生成的 systemd unit 修成 Restart=always。
+# 老 unit 是 Restart=on-failure，而 dsh 吃 SIGTERM 是干净退出（exit 0）→ systemd 不拉，
+# 一次 /restart（重启助手只杀宿主、拉新交给 systemd）之后 bot 就一直躺着。
+# 只在 unit 存在且仍是 on-failure 时改：先备份 → 改写 → daemon-reload；
+# 原来在跑的重新拉一次，没跑的不动（不替用户决定要不要开起来）。
+repair_systemd_units() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  FIXED=0
+  NEED_RELOAD=0
+  for U in "${SYSTEMD_UNIT_DIR}"/dsh-bot-*.service "${SYSTEMD_UNIT_DIR}"/dsh-web.service; do
+    [ -f "$U" ] || continue
+    grep -q '^Restart=on-failure' "$U" 2>/dev/null || continue
+    SVC="$(basename "$U" .service)"
+    WAS_ACTIVE=0
+    if systemctl is-active --quiet "$SVC" 2>/dev/null; then WAS_ACTIVE=1; fi
+    STAMP="$(date +%Y%m%d-%H%M%S)"
+    if ! cp -p "$U" "${U}.bak-restart-always-${STAMP}" 2>/dev/null; then
+      say "⚠️ ${U} 备份失败，这个 unit 没改"
+      continue
+    fi
+    if awk '{ if ($0 == "Restart=on-failure") print "Restart=always"; else print }' "$U" > "${U}.repair-tmp" 2>/dev/null \
+      && mv "${U}.repair-tmp" "$U"; then
+      FIXED=$((FIXED + 1))
+      NEED_RELOAD=1
+      say "🔧 ${SVC}：Restart=on-failure → always（备份 ${U}.bak-restart-always-${STAMP}）"
+      if [ "$WAS_ACTIVE" = "1" ]; then
+        systemctl restart "$SVC" 2>/dev/null || say "⚠️ ${SVC} 重启失败，手动看一眼：systemctl status ${SVC}"
+      fi
+    else
+      rm -f "${U}.repair-tmp" 2>/dev/null || true
+      say "⚠️ ${U} 改写失败，保留原样"
+    fi
+  done
+  if [ "$NEED_RELOAD" = "1" ]; then
+    systemctl daemon-reload 2>/dev/null || say "⚠️ systemctl daemon-reload 失败"
+    if [ "$FIXED" -gt 0 ]; then say "✅ systemd unit 修好 ${FIXED} 个"; fi
+  fi
+  return 0
+}
+
 # ============ 主流程 ============
 say ""
 say "=================================="
@@ -411,6 +454,7 @@ ensure_git
 ensure_node
 ensure_dsh
 upgrade_plugins
+repair_systemd_units
 retire_legacy_hardrules
 
 say ""
