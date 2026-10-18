@@ -44,6 +44,7 @@ import { createMailboxWatcher } from './mailbox.js';
 import { createFinalReview } from './final-review.mjs'; // 终审卡：DSH 侧宿主接线
 import { installHardRules } from './hard-rules.js';
 import { ensureWorkspaceMemoryFiles } from './workspace-files.js';
+import { 挂闸, 默认预算 } from './llm-budget.js';   // 模型流量的分钟预算闸（见本档头注释）
 
 /** Cordis 插件名。 */
 export const name = 'botplugin';
@@ -93,6 +94,20 @@ export const Config = Schema.object({
     .description('停机太久时，超过这个年龄的积压消息不再执行（默认 2 小时）'),
   turnTimeoutMs: Schema.number().default(30 * 60 * 1000)
     .description('等模型回答的超时（毫秒，默认 30 分钟）。超时后该会话的队列才会解锁'),
+
+  // ---- 模型流量闸（2026-10-19 加）----
+  llmBudget: Schema.object({
+    enabled: Schema.boolean().default(true)
+      .description('开关模型流量的分钟预算闸（关掉 = 不限流，出问题时可一键停）'),
+    tpm: Schema.number().default(默认预算.tpm)
+      .description('滚动 60 秒内 token 上限（默认 80 万 = 按老板口径压在供应商 TPM 限额之下）'),
+    rpm: Schema.number().default(默认预算.rpm)
+      .description('滚动 60 秒内模型请求数上限（默认 50 次）'),
+    输出预留: Schema.number().default(默认预算.输出预留)
+      .description('每次调用先按这么多输出 token 占位，拿到实际用量后校正（默认 8000）'),
+    最长等待毫秒: Schema.number().default(默认预算.最长等待毫秒)
+      .description('单次调用最多为等额度排多久（默认 10 分钟）；等满就放行并告警（不让整台卡死）'),
+  }).description('模型流量闸：滚动 60 秒内请求数与 token 数封顶，超了排队等（见 src/llm-budget.js）'),
   logLabel: Schema.string().default('').description('日志前缀（留空 = 不加前缀，跟软件版格式对齐）'),
 
   // ---- 语音转文字 ----
@@ -435,6 +450,24 @@ export function createInstanceLock({ lockPath, log, error }) {
  */
 export function apply(ctx, config) {
   const { log, error } = makeLog(config.logLabel);
+
+  // -------------------------------------------------------------------------
+  // 模型流量的分钟预算闸（2026-10-19 加）
+  // -------------------------------------------------------------------------
+  // 挂宿主 llm 的 `llm/stream` waterfall：进程内**所有**模型调用（含工具循环与子代理）
+  // 都从这儿过，一处就能管住整机流量。口径与记账细节见 `src/llm-budget.js` 头注释。
+  // 失败不影响插件启动 —— 闸挂了就退回「不限流」，别让 bot 起不来。
+  try {
+    const 预算配 = config?.llmBudget ?? {};
+    if (预算配.enabled !== false) {
+      挂闸(ctx, 预算配, (m) => log(String(m)));
+      log(`[llmbudget] 模型流量闸已挂上：滚动 60 秒内 ≤ ${预算配.rpm ?? 默认预算.rpm} 次请求、≤ ${预算配.tpm ?? 默认预算.tpm} token`);
+    } else {
+      log('[llmbudget] 模型流量闸按配置关闭（enabled=false）');
+    }
+  } catch (err) {
+    error(`[llmbudget] 挂闸失败（已忽略，退回不限流）：${(err && err.message) || err}`);
+  }
 
   // -------------------------------------------------------------------------
   // 插件版自愈：把 web 的模型块并集补齐进本 profile

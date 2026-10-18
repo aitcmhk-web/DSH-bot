@@ -103,6 +103,21 @@ dsh plugin --profile mybot add file:$HOME/DSH/BOT/botplugin
 | `restartCommand` | 重启用的启动器 .command 路径；不填默认找工作目录里的 `start.command`（兼容老的 `启动-<工作区名>.command` / `启动-mybot.command`） |
 | `turnTimeoutMs` | 单轮超时，默认 30 分钟 |
 | `asrBackend` / `asrWhisperBin` / `asrPythonBin` | 语音转文字。默认 **sensevoice**（阿里 FunASR，中文准），不填路径就自动找 `/opt/homebrew/bin/python3.11`；本机没装时，安装收尾和发语音都会回一条可粘贴的安装命令（⛔ 不自动装）。`whisper` 中文差，只有显式填 `asrBackend: whisper` 才用 |
+| `llmBudget` | 模型流量闸：滚动 60 秒内请求数与 token 数封顶（默认 **50 次 / 80 万 token**），超了排队等，别撞供应商的 TPM 限额。字段：`enabled`（默认 true，关掉=不限流）/ `tpm` / `rpm` / `输出预留`（每次先占多少输出 token，默认 8000）/ `最长等待毫秒`（默认 10 分钟，等满就放行并打告警） |
+
+## 模型流量闸（每分钟限额，2026-10-19 加）
+
+一回合里跑工具、开子代理都会**反复**发模型请求，一分钟里的累计很容易顶到供应商的
+TPM/RPM 限额（撞上就是 429）。插件在宿主 llm 的 `llm/stream` 上挂了一道闸
+（`src/llm-budget.js`）：**滚动 60 秒窗口内 请求数 ≤ `rpm`、token 合计 ≤ `tpm`**，
+快满时让下一次调用**排队等**到窗口腾位，⛔ 不丢请求、⛔ 不改流里的内容。
+
+- **记账口径**：调前按请求体的可读字符量**预估**（中文 1 token/字、其余 1/4，另加输出预留），
+  流里收到宿主 `usage` 块后换成**实际用量**（替换，不叠加）；失败/中断的那次仍按预估留在账上（保守）。
+- **fail-open**：单次最多等 `最长等待毫秒`（默认 10 分钟），等满仍无额度就**放行一次并打告警**——
+  宁可偶尔超一次，也不让整台 bot 卡死。
+- **子代理与工具循环一样算**：它们都走同一条 waterfall，所以一处就管住全机流量。
+- **关掉**：配置里 `llmBudget.enabled: false`（出问题时可一键停，不影响启动）。
 
 ## 远程审批（手机点按钮，不用守着电脑）
 
