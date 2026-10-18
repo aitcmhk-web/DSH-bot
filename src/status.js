@@ -145,9 +145,10 @@ export function 挑进度行(text) {
 /**
  * 吐字速度采样器（TG / 微信共用同一套算法）。
  *
- * SDK 没有逐 token 流式，只有整段 assistant/message 事件，所以拿不到真实
- * 速率，只能采样估算。这里的计时方式每一处都有原因（见 window() 内注释），
- * 别「简化」。
+ * 速率口径 = 模型真正吐正文的时间，不含工具调用、等网络、思考停顿：
+ * 调用方从每条 `assistant/message` 的 `stream` 里量出正文块的跨度（`text-chunks`
+ * 的 dt 之和）一并传进来，按轮累加。拿不到流时间（老事件、整段一次到达）时
+ * 才退回整轮墙钟估算，并在日志里标明口径。
  */
 export class SpeedSampler {
   constructor(label) {
@@ -158,6 +159,8 @@ export class SpeedSampler {
     /** 本轮已吐字数（累加）。 */
     this.lastCharCount = 0;
     this.lastCharAt = null;
+    /** 本轮正文流实测毫秒（累加，只算块间隔，不含工具与停顿）。 */
+    this.activeMs = 0;
     /** 整轮起点 = 消息进来 / prompt 发出那一刻，用作兜底计时。 */
     this.turnStartedAt = null;
   }
@@ -167,30 +170,40 @@ export class SpeedSampler {
     this.firstCharAt = null;
     this.lastCharCount = 0;
     this.lastCharAt = null;
+    this.activeMs = 0;
     this.turnStartedAt = Date.now();
   }
 
   /**
-   * 记录一次「已经吐了多少字」的快照（整段文本长度，非增量）。
+   * 记录一次吐字快照（整段文本长度，非增量）。
    * firstCharAt 只在本轮第一次吐字时落定；字数累加不是覆盖——
    * 一轮可能推多条 assistant/message（思考→工具→再思考），覆盖会抹掉前面的。
+   *
+   * @param {number} charCount 本条正文的字数
+   * @param {number} [activeMs] 本条正文的实测生成毫秒（stream 里 text-chunks 的 dt 之和）；
+   *   缺省 0 表示这次事件没带流时间，只能走兜底计时。
    */
-  track(charCount) {
+  track(charCount, activeMs = 0) {
     const now = Date.now();
     if (!charCount) return;
     if (this.firstCharAt === null) this.firstCharAt = now;
     this.lastCharAt = now;
     this.lastCharCount += charCount;
+    this.activeMs += Math.max(0, Number(activeMs) || 0);
   }
 
   /**
-   * 均速的计时段落。起点 = firstCharAt；算出来 <1s 就回退到整轮起点
-   * （SDK 整段一次性到达，首字时刻≈结束时刻，不回退会出 Infinity）。
+   * 均速。优先用实测口径（activeMs）；不足 1s（短回复、或单个块一次到达，
+   * 算出来会剧烈跳甚至 Infinity）回退到整轮墙钟，并标记 `measured: false`。
    */
   window() {
     if (!this.lastCharCount) return null;
     const now = Date.now();
     const MIN_ELAPSED = 1; // 秒；低于这个数的均速会剧烈跳，没有展示意义
+    const measured = this.activeMs / 1000;
+    if (measured >= MIN_ELAPSED) {
+      return { chars: this.lastCharCount, elapsed: measured, rate: this.lastCharCount / measured, measured: true };
+    }
     let from = this.firstCharAt ?? this.turnStartedAt;
     if (from === null) return null;
     let elapsed = (now - from) / 1000;
@@ -202,7 +215,7 @@ export class SpeedSampler {
       }
     }
     if (!(elapsed > 0)) return null; // 兜底：除零/负值一律不显示，绝不吐 Infinity
-    return { chars: this.lastCharCount, elapsed, rate: this.lastCharCount / elapsed };
+    return { chars: this.lastCharCount, elapsed, rate: this.lastCharCount / elapsed, measured: false };
   }
 
   /**
@@ -213,9 +226,9 @@ export class SpeedSampler {
     const w = this.window();
     const reason = !this.lastCharCount ? 'no-chars' : this.firstCharAt === null ? 'no-first-char' : 'ok';
     log(
-      `[tps] chat=${this.label} ${reason} 首字=${
+      `[tps] chat=${this.label} ${reason} 口径=${w ? (w.measured ? '实测' : '估算') : 'none'} 首字=${
         this.firstCharAt ? new Date(this.firstCharAt).toISOString() : 'null'
-      } 结束=${new Date(endedAt).toISOString()} 耗时=${
+      } 结束=${new Date(endedAt).toISOString()} 吐字耗时=${
         w ? w.elapsed.toFixed(2) : 'null'
       }s 字数=${this.lastCharCount} 速率=${w ? w.rate.toFixed(1) : 'null'}`,
     );

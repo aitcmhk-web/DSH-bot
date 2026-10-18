@@ -138,6 +138,23 @@ function makeLog(label) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * 从一条 `assistant/message` 的 `stream` 记录里量出正文真正在吐的毫秒数：
+ * 只累加 `text-chunks` 各段内部的块间隔（dt），段与段之间的工具调用、网络等待
+ * 与思考停顿都不计；`reasoning-chunks` 也不计——它不是发出去的正文。
+ * @param {unknown} stream 事件里的 stream 记录数组
+ * @returns {number} 毫秒；没有可用记录时为 0
+ */
+function 正文流毫秒(stream) {
+  if (!Array.isArray(stream)) return 0;
+  let ms = 0;
+  for (const r of stream) {
+    if (r?.type !== 'text-chunks' || !Array.isArray(r.dt)) continue;
+    for (const d of r.dt) ms += Math.max(0, Number(d) || 0);
+  }
+  return ms;
+}
+
+/**
  * 可被 abort 打断的 sleep。
  *
  * 为什么不用裸 sleep：拿不到单实例锁时要等 60 秒再重试，而宿主可能正好在这段
@@ -1272,7 +1289,7 @@ export function apply(ctx, config) {
               .map((b) => String(b.text ?? ''))
               .join('');
             if (!t.trim()) return;
-            status.trackProgress(t.length);
+            status.trackProgress(t.length, 正文流毫秒(event.data?.stream));
             for (const 行 of 挑进度行(t)) status.addNote(行, '进度');
           }
         })
