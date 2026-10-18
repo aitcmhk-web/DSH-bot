@@ -33,7 +33,7 @@ import { Hub, makeMessage, markAsHubOutput } from './hub.js';
 import { buildRoutes, routeByKey, routeFor, describeRoute, isRouteFailure, reasoningEffortFor } from './models.js';
 import { readWebLlmPiAi, readWebLlmDeepseek, readWebLlmDeepseekAccount, webPatchPath } from './web-patch.js';
 import { syncOwnProfileFromWeb } from './model-sync.js';
-import { LiveStatus, describeTool, 挑进度行 } from './status.js';
+import { LiveStatus, describeTool, 挑进度行, 落盘未送达 } from './status.js';
 import { transcribe, configure as configureAsr, currentBackend } from './asr.js';
 import { installApprovalBridge } from './approval-bridge.js';
 import { createHerdWatchdog, HERD_GROUP_FALLBACK } from './herd.js';
@@ -1383,27 +1383,25 @@ export function apply(ctx, config) {
     // 流水账记不带小尾巴的回答原文（速度尾巴是采样元数据，不是对话）。
     memory?.ledgerRecord('assistant', body, chatKey);
 
-    // TG 端交付需要带 [DSH] 前缀（与主程序 bot.js:1143 对齐）：
-    // status.finish() 把回答编辑进 TG 占位消息，必须带前缀；
-    // 微信端不走 ep.send() 时也会收到无前缀的 body，但微信有自己的广播路径。
-    const prefixReply = (text) => {
-      const t = String(text ?? '').trim();
-      return t ? '[DSH] ' + t : t;
-    };
-    const deliverBody = msg.source === 'tg' ? prefixReply(body) : body;
+    // ---------------------------------------------------------------------
+    // 收尾交付（2026-10-19 定）：大模型 → 节点（hub）→ **广播到所有端点**（含来源通道）。
+    //
+    // ⛔ 不要再让 status.finish() 把回答编辑进 TG 那条占位消息：那样同一条消息上有
+    //    两个写者（进度编辑 / 收尾回答），迟到的进度编辑会把回答盖回去，而日志里
+    //    看不出任何异常 —— 2026-10-19 线上丢件就是这么丢的。现在的分工：
+    //    占位消息只报进度（收尾留一行「✅ 已回复」），回答只有节点这一个出口。
+    // ⛔ 也不要在这里对来源端单独 ep.send()：出口只有一个，否则同一条回答会发两遍。
+    // [DSH] 前缀与主程序 bot.js:1143 对齐，由本处加上（节点只转发，不改正文）。
+    // ---------------------------------------------------------------------
+    const tail = status ? await status.finish() : null;
+    const outText = tail ? `${body}\n\n${tail}` : body;
+    const 投递 = await hub.outbound(`[DSH] ${outText}`, { label: 'DSH 输出' });
 
-    // 收尾交付：TG 由 status.finish 把回答（含速度小尾巴）编辑进占位消息（返回 null）；
-    // 微信由 status 取消「正在输入」并返回小尾巴，回答照常走端点发送、小尾巴拼在后面。
-    const tail = status ? await status.finish(deliverBody) : null;
-    if (!(status && msg.source === 'tg')) {
-      const outText = tail ? `${body}\n\n${tail}` : body;
-      await ep.send({ text: prefixReply(outText) }).catch((err) => error(`发送失败（${chatKey}）: ${err?.message}`));
+    // 回答没能进 TG（我看消息的那条通道）→ 落盘兜底，⛔ 不许答案凭空消失（2026-10-18 口径）。
+    if (投递.failed.some((f) => f.id === 'tg')) {
+      const 文件 = await 落盘未送达(outText, '广播到 tg 失败', { 记日志: error, 渠道: 'tg' });
+      await status?.标未送达('广播到 tg 失败', 文件);
     }
-
-    // 广播回答到所有端点（DSH → 节点 → 所有端点）
-    // 不要单独加前缀：hub.outbound 会广播到所有端点，发起端也会收到
-    //    前缀统一在 hub.outbound 里加，与主程序版保持一致
-    await hub.outbound(`[DSH] ${body}`, { exclude: msg.source, label: 'DSH 输出' });
     return { ok: true };
   }
 

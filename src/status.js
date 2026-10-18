@@ -6,12 +6,15 @@
  *             **顶行 ＝ 我最新说的那句**（我还没开口时才是「⏳ 正在处理…」占位语，⛔ 不显示已耗时），
  *             底下滚动的是**操作**（工具标签 / 📌 进度行），两下互不影响；有实测吐字时顶行下缀一行速度
  *          ② sendChatAction('typing') 每 4.5s 续期
- *          ③ 最终回答编辑进占位消息（markdown→HTML，超长自动分段补发）
- *          ④ 任何一步撞 Telegram 限流（429）都**按它给的 retry_after 排队重发**；
- *             编辑与整条重发都走不通时，整篇回答落盘兜底（见 finish 的口径）
+ *          ③ 收尾在原文下留一行「✅ 已回复」——**占位消息只报进度，⛔ 不承载最终回答**。
+ *             回答统一由节点广播到所有端点（见 index.js 收尾交付）。一条消息只许一个写者：
+ *             同一轮里「进度编辑」与「收尾回答」抢同一条消息时，迟到的进度编辑会把回答盖回去，
+ *             日志里还看不出异常——2026-10-19 线上丢件就是这么丢的。
+ *          ④ 收尾行写不动只记日志（⛔ 不影响回答的广播）；回答自己送不到时另走落盘兜底
+ *             （见导出的 落盘未送达）
  *   微信 ：微信没有编辑消息接口，只有「正在输入」状态：
  *          getConfig 拿 typing_ticket → sendTyping(1) 每 4.5s 续期 → 结束时 sendTyping(2)
- *          最终回答由调用方照常发送，本类只返回吐字速度小尾巴。
+ *          最终回答由调用方广播发出，本类只返回吐字速度小尾巴。
  *
  * 事件从哪来：runtime.onSessionEvent() 的 tool/call 与 assistant/message，
  * 由 index.js 喂进来（addNote / 推正文 / trackProgress），本类不碰 runtime。
@@ -28,7 +31,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { markdownToHtml, splitMessageHtml, sendRichTo } from './telegram.js';
+import { RATE_LIMIT_BUDGET_MS, rateLimitWaitMs } from './telegram.js';
 
 const TOOL_LABELS = {
   bash: '🏃 跑命令',
@@ -231,20 +234,9 @@ const TYPING_RENEW_MS = 4500; // 4.5s：微信 status=1 约 11s 自动消失，�
 // 进度消息不再定时刷新：有新动态（新话 / 新工具标签）时 addNote 自己排一次编辑。
 // 旧版每 2s（后改 4s）刷一次，头部秒数与速率一变就编辑，内容其实没变，白占限流额度。
 const EDIT_DEBOUNCE_MS = 2000; // 同一批动态合并成一次编辑的去抖窗口
-const RATE_LIMIT_WAIT_MAX_MS = 90_000; // 单次限流最多等这么久（TG 有时让等 60s 以上）
-// 一轮收尾排队重发的等待总预算，超了就走落盘兜底。可用 DSH_BOTPLUGIN_RATE_LIMIT_BUDGET_MS 覆盖（自测与现场救急用）。
-const RATE_LIMIT_BUDGET_MS = Number(process.env.DSH_BOTPLUGIN_RATE_LIMIT_BUDGET_MS ?? '') || 180_000;
-
-/**
- * 429 的等待毫秒：照 Telegram 给的 `retry_after` 等，单次封顶 RATE_LIMIT_WAIT_MAX_MS。
- * @param {any} err Telegram 客户端抛出的错误（业务错误带 errorCode / parameters）
- * @returns {number|null} 等待毫秒；不是限流（429）时回 null
- */
-function rateLimitWaitMs(err) {
-  if (Number(err?.errorCode) !== 429) return null;
-  const seconds = Math.max(1, Number(err?.parameters?.retry_after ?? 5));
-  return Math.min(seconds * 1000, RATE_LIMIT_WAIT_MAX_MS);
-}
+/** 占位消息的占位语与收尾语：顶行还没话时说前者，收尾时在原文下留后者。 */
+const 占位语 = '⏳ 正在处理…';
+const 收尾语 = '✅ 已回复';
 
 /** 睡一会儿（定时器 unref：不影响进程退出）。 */
 function sleep(ms) {
@@ -268,6 +260,28 @@ function undeliveredDir() {
   if (explicit) return explicit;
   const base = process.env.DSH_BOT_DIR || join(homedir(), '.dsh');
   return join(base, '未送达');
+}
+
+/**
+ * 兜底：把整篇正文落盘（⛔ 宁可留文件也不丢内容）。
+ * 调用点：回答广播到某通道失败时（见 index.js 收尾交付）。
+ * @param {string} 正文 完整正文
+ * @param {string} 原因 未送达原因（写进日志）
+ * @param {{记日志?: (m: string) => void, 渠道?: string}} [选项] 日志口与文件名里的渠道标识
+ * @returns {Promise<string|null>} 落盘文件路径；落盘也失败时 null
+ */
+export async function 落盘未送达(正文, 原因, { 记日志 = () => {}, 渠道 = 'unknown' } = {}) {
+  const dir = undeliveredDir();
+  try {
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, `${stamp()}-${String(渠道).replace(/[^\w-]/g, '')}.md`);
+    await writeFile(file, String(正文 ?? ''), 'utf8');
+    记日志(`回答未送达（${原因}），已落盘: ${file}`);
+    return file;
+  } catch (err) {
+    记日志(`回答未送达（${原因}），落盘也失败: ${err.message}`);
+    return null;
+  }
 }
 
 export class LiveStatus {
@@ -303,6 +317,11 @@ export class LiveStatus {
     this.最新一句 = '';
     /** Epoch ms before which Telegram has asked us not to edit again. */
     this.editBlockedUntil = 0;
+    /**
+     * 「已经在飞」的那次进度编辑（Promise）。收尾前要等它落地：
+     * 它晚一步返回就会把收尾行盖回进度文本（同一条消息上的写者顺序问题）。
+     */
+    this.在飞编辑 = null;
     this.closed = false;
     this.sampler = new SpeedSampler(kind);
     this.sampler.reset();
@@ -395,8 +414,9 @@ export class LiveStatus {
     // 顶行＝我最新说的那句（老板口径 2026-10-19：我的话顶掉「正在处理」那几个字，⛔ 不显示已耗时）；
     // 我还没开口时顶行才是占位语。下面滚动的只放「操作」，两下互不影响。
     const tps = this.sampler.window();
-    let 文 = this.最新一句 || '⏳ 正在处理…';
-    if (tps) {
+    let 文 = this.最新一句 || 占位语;
+    // 收尾后不再显示速度：速度小尾巴跟回答走（回答由节点广播发出），气泡上留着是重复。
+    if (tps && !this.closed) {
       文 += `\n🚀 ≈${tps.rate.toFixed(1)} 字/秒 · 已生成 ${tps.chars} 字`;
     }
     const recent = this.notes.slice(-3);
@@ -418,10 +438,17 @@ export class LiveStatus {
     if (Date.now() < this.editBlockedUntil) return;
     const text = this.render();
     if (text === this.lastRendered) return;
+    // 「在飞」留痕：收尾要等这一次落地（见 finish），否则它晚一步返回会把收尾行盖回进度文本。
+    const 在飞 = this.#safeEdit(text);
+    this.在飞编辑 = 在飞;
     // 只有真的编辑上去了才记住，否则一次被拒的编辑会让进度消息永远停在旧文本。
     // ⚠️ 进度文本按纯文本编辑（不带 parse_mode）：动态里有工具输出的尖括号
-    //    之类，按 HTML 解析会被 Telegram 拒掉。只有 finish() 的最终回答才转 HTML。
-    if (await this.#safeEdit(text)) this.lastRendered = text;
+    //    之类，按 HTML 解析会被 Telegram 拒掉（最终回答走广播，不经这里排版）。
+    const ok = await 在飞;
+    if (this.在飞编辑 === 在飞) this.在飞编辑 = null;
+    if (ok) this.lastRendered = text;
+    // 兜底：回来时已经收尾 → 把收尾行补回去（迟到的进度编辑⛔不得盖掉收尾行）。
+    if (this.closed) await this.#写收尾行();
   }
 
   /** @returns {Promise<boolean>} 是否编辑成功。 */
@@ -445,76 +472,45 @@ export class LiveStatus {
   }
 
   /**
-   * 收尾并交付（kind='tg'）：把最终回答编辑进占位消息
-   * （markdown→HTML，第一段编辑进去，超出的分段照常补发），返回 null。
-   * kind='wx'：取消「正在输入」，返回吐字速度小尾巴（由调用方拼在回答后发出）。
-   *
-   * 交付口径（2026-10-18 修，起因：线上出现过「占位消息永远停在『正在处理』、答案丢掉」）：
-   *   ① 任何一步撞 Telegram 限流（429）都**按它给的 retry_after 排队重发**，一轮最多等 RATE_LIMIT_BUDGET_MS；
-   *   ② 分段补发失败**不再静默吞掉**（旧版是 `.catch(() => {})`），同样排队重试并记日志；
-   *   ③ 编辑与整条重发都走不通时，**整篇回答落盘兜底**（见 #dumpUndelivered），⛔ 绝不让答案凭空消失。
-   * 其余失败（占位消息被删、过期等）照旧降级为整条 sendRich 重发 —— 宁可重复也不能丢回答。
+   * 收尾（kind='tg'）：占位消息只报进度，收尾在原文下留一行「✅ 已回复」——
+   *   ⛔ 不再接管最终回答（回答统一由节点广播到所有端点，见 index.js 收尾交付）。
+   *   一条消息只许一个写者：收尾与迟到的进度编辑抢同一条消息时，回答会被盖回去
+   *   （2026-10-19 线上丢件的成因）。顺序由「先等在飞编辑落地」保证。
+   * kind='wx'：取消「正在输入」。
+   * @returns {Promise<string|null>} 吐字速度小尾巴，由调用方拼在回答后一起广播
    */
-  async finish(answerText) {
+  async finish() {
     const tail = this.sampler.finish(this.log);
     if (this.kind === 'wx') {
       await this.#stopWxTyping();
       return tail;
     }
     this.#clearTimers();
+    // 先等已经在飞的那次进度编辑落地：收尾行永远是这条消息的最后一次写入。
+    if (this.在飞编辑) await this.在飞编辑.catch(() => {});
     this.closed = true;
-    const body = tail ? `${answerText}\n\n${tail}` : String(answerText ?? '');
-    const deadline = Date.now() + RATE_LIMIT_BUDGET_MS;
-
-    // 排版失败只降级成本轮纯文本，⛔ 不能因为排版发不出去就不发答案。
-    let parts = [body];
-    let extra = {};
-    try {
-      parts = splitMessageHtml(markdownToHtml(body));
-      extra = { parse_mode: 'HTML' };
-    } catch (err) {
-      this.error(`最终回答排版失败，按纯文本发送: ${err.message}`);
-    }
-
-    let edited = false;
-    if (this.messageId) {
-      const first = parts[0];
-      edited = await this.#deliverWithRetry(
-        () => this.telegram.editMessageText(this.chatId, this.messageId, first, extra),
-        deadline,
-      );
-      if (edited) this.lastRendered = first;
-    }
-
-    if (edited) {
-      // 第一段已进占位消息，其余分段补发；某段彻底发不出去就落盘，⛔ 不留半篇在聊天里还不吭声。
-      for (let i = 1; i < parts.length; i++) {
-        const ok = await this.#deliverWithRetry(
-          () => this.telegram.sendMessage(this.chatId, parts[i], extra),
-          deadline,
-        );
-        if (!ok) {
-          await this.#dumpUndelivered(body, `第 ${i + 1}/${parts.length} 段未送达`);
-          break;
-        }
-      }
-      return null;
-    }
-
-    // 占位消息这条路走不通（被删 / 过期 / 限流耗尽）—— 整条重发兜底。
-    const resent = await this.#deliverWithRetry(
-      () => sendRichTo(this.telegram, this.chatId, body),
-      deadline,
-    );
-    if (!resent) await this.#dumpUndelivered(body, '编辑与整条重发都没送达');
-    return null;
+    await this.#写收尾行();
+    return tail;
   }
 
   /**
-   * 带排队重试地执行一次交付动作：撞 429 就按 retry_after 等，等够了再试。
-   * @param {() => Promise<any>} action 交付动作（编辑占位消息 / 发新消息 / 整条重发）
+   * 把占位消息写成「进度原文 ＋ 一行收尾语」；失败只记日志。
+   * ⛔ 失败不影响回答：回答由节点广播发出，与这条气泡是两回事。
+   */
+  async #写收尾行() {
+    if (!this.messageId) return;
+    const 原文 = this.render();
+    const 文本 = 原文 && 原文 !== 占位语 ? `${原文}\n\n${收尾语}` : 收尾语;
+    if (文本 === this.lastRendered) return;
+    if (await this.#safeEdit(文本)) this.lastRendered = 文本;
+    else this.error('收尾行没写上（回答仍由节点广播，不受影响）');
+  }
+
+  /**
+   * 带排队重试地执行一次收尾动作（改占位消息 / 另发一条）：撞 429 就按 retry_after 等，等够了再试。
+   * @param {() => Promise<any>} action 收尾动作
    * @param {number} deadline 允许等待到什么时候（epoch ms）；再等就超预算了
-   * @returns {Promise<boolean>} 送达为 true；不是限流、或预算不够，立即回 false（由调用方兜底）
+   * @returns {Promise<boolean>} 成功为 true；不是限流、或预算不够，立即回 false（由调用方兜底）
    */
   async #deliverWithRetry(action, deadline) {
     for (;;) {
@@ -524,7 +520,7 @@ export class LiveStatus {
       } catch (err) {
         const wait = rateLimitWaitMs(err);
         if (wait === null || Date.now() + wait > deadline) {
-          this.error(`回答交付未成: ${err.message}`);
+          this.error(`收尾消息未成: ${err.message}`);
           return false;
         }
         const seconds = Math.round(wait / 1000);
@@ -550,24 +546,15 @@ export class LiveStatus {
   }
 
   /**
-   * 兜底：整篇回答落盘（⛔ 宁可留文件也不丢答案），并把占位消息改成「未送达 + 文件路径」。
-   * 目录：`DSH_BOTPLUGIN_UNDELIVERED_DIR`，未设时用 `DSH_BOT_DIR/未送达`（再退 `~/.dsh/未送达`）。
+   * 把占位消息标成「回答未送达 ＋ 落盘路径」（收尾行之后仍可改；失败只记日志）。
+   * 调用点：调用方发现回答没送达到本通道时（见 index.js 收尾交付）。
+   * @param {string} 原因 未送达原因
+   * @param {string|null} 文件 落盘路径（落盘也失败时传 null）
    */
-  async #dumpUndelivered(body, why) {
-    const dir = undeliveredDir();
-    try {
-      await mkdir(dir, { recursive: true });
-      const file = join(dir, `${stamp()}-${String(this.chatId ?? 'unknown').replace(/[^\w-]/g, '')}.md`);
-      await writeFile(file, body, 'utf8');
-      if (this.messageId) {
-        await this.telegram
-          .editMessageText(this.chatId, this.messageId, `❌ 回答未送达（${why}），已存到 ${file}`)
-          .catch(() => {});
-      }
-      this.error(`回答未送达（${why}），已落盘: ${file}`);
-    } catch (err) {
-      this.error(`回答未送达（${why}），落盘也失败: ${err.message}`);
-    }
+  async 标未送达(原因, 文件) {
+    if (!this.messageId) return;
+    const 文本 = `❌ 回答未送达（${原因}），${文件 ? `已存到 ${文件}` : '落盘也失败'}`;
+    if (await this.#safeEdit(文本)) this.lastRendered = 文本;
   }
 
   /** 异常收尾：占位消息改成错误提示（微信则只取消正在输入）。 */

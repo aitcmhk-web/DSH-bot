@@ -1,13 +1,18 @@
-// test-status-delivery.mjs — 回合收尾交付的限流重发与落盘兜底自测（离线，不碰网络 / DSH / 真会话）
+// test-status-delivery.mjs — 回合收尾交付自测（离线，不碰网络 / DSH / 真会话）
 //
 // 跑法：node test-status-delivery.mjs
 //
+// 口径（2026-10-19 定）：占位消息**只报进度**，收尾在原文下留一行「✅ 已回复」；
+// 最终回答统一由节点广播到所有端点（见 src/index.js 收尾交付），⛔ 不进占位消息。
+//
 // 覆盖：
-//   ① 编辑占位消息被限流一次 → 按 retry_after 等待后重发成功，占位消息最终是正式回答
-//   ② 编辑与整条重发都被限流到预算耗尽 → 整篇回答落盘 + 占位消息改成「未送达」，⛔ 不许答案消失
-//   ③ 超长回答分段补发、某段被限流一次 → 重试送达，既不留半篇也不误落盘
-//   ④ 正常一轮（无 429）→ 行为与旧版一致：一次编辑、不落盘、不重发
-//   ⑤ 非限流失败（占位消息被删/过期）→ 立即整条重发，不白等限流窗口
+//   ① 收尾 = 进度原文 ＋ 一行收尾语；回答正文一个字都不进气泡（回归锁）
+//   ② 迟到的进度编辑不得盖掉收尾行（收尾先等「在飞编辑」落地）
+//   ③ 收尾行写不动：只记日志、不抛
+//   ④ 落盘兜底：正文落盘、目录自动建、气泡改标「未送达」
+//   ⑤ 广播链路 sendRich：撞 429 按 retry_after 重发后送达
+//   ⑥ 排版被拒（400）→ 只从失败那块起降级纯文本
+//   ⑦ 429 等不起（超预算）→ 抛出，交调用方兜底
 //
 // 环境：预算压到 3s（DSH_BOTPLUGIN_RATE_LIMIT_BUDGET_MS）、落盘目录指到临时目录
 //       （DSH_BOTPLUGIN_UNDELIVERED_DIR，故意选一个还不存在的子路径，顺带验自动建目录）。
@@ -19,11 +24,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const 临时根 = mkdtempSync(join(tmpdir(), 'status-delivery-'));
-const 落盘目录 = join(临时根, '未送达'); // 故意不存在：验 #dumpUndelivered 自己建目录
+const 落盘目录 = join(临时根, '未送达'); // 故意不存在：验「落盘未送达」自己建目录
 process.env.DSH_BOTPLUGIN_UNDELIVERED_DIR = 落盘目录;
 process.env.DSH_BOTPLUGIN_RATE_LIMIT_BUDGET_MS = '3000';
 
-const { LiveStatus } = await import('./src/status.js');
+const { LiveStatus, 落盘未送达 } = await import('./src/status.js');
+const { Telegram } = await import('./src/telegram.js');
 
 // 插件里的等待定时器统一 unref（不影响线上进程退出），故自测要自己保活，否则进程会提前退出。
 const 保活 = setInterval(() => {}, 1000);
@@ -44,22 +50,15 @@ function 限流(秒) {
   });
 }
 
-/**
- * 假 Telegram：只记调用、按脚本抛错，不发网络。
- * 脚本字段：编辑 / 发送 / 重发 三条队列（元素为 Error 表示这一步抛错，队列空了默认成功）；
- *          编辑恒限流 / 发送恒限流 / 重发恒限流 = 该动作每次都抛这个错。
- */
+/** 假 Telegram：只记调用、按脚本抛错，不发网络。 */
 function 假TG(脚本 = {}) {
-  const 队 = { 编辑: [...(脚本.编辑 ?? [])], 发送: [...(脚本.发送 ?? [])], 重发: [...(脚本.重发 ?? [])] };
-  const 记录 = { 编辑: [], 发送: [], 重发: [], typing: 0 };
-  const 取步 = (名) => {
-    if (脚本[`${名}恒限流`]) return 脚本[`${名}恒限流`];
-    return 队[名].length ? 队[名].shift() : null;
-  };
+  const 队 = { 编辑: [...(脚本.编辑 ?? [])], 发送: [...(脚本.发送 ?? [])] };
+  const 记录 = { 编辑: [], 发送: [], typing: 0 };
+  const 取步 = (名) => (队[名].length ? 队[名].shift() : null);
   return {
     记录,
-    async sendMessage(chat, text) {
-      记录.发送.push(text);
+    async sendMessage(chat, text, extra) {
+      记录.发送.push({ text, extra });
       const 步 = 取步('发送');
       if (步 instanceof Error) throw 步;
       return { message_id: 900 + 记录.发送.length };
@@ -74,21 +73,13 @@ function 假TG(脚本 = {}) {
       记录.typing += 1;
       return true;
     },
-    async sendRich(chat, markdown) {
-      记录.重发.push(markdown);
-      const 步 = 取步('重发');
-      if (步 instanceof Error) throw 步;
-      return true;
-    },
   };
 }
 
 const 数落盘 = () => (existsSync(落盘目录) ? readdirSync(落盘目录).filter((f) => f.endsWith('.md')) : []);
 
-/** 跑一轮收尾：假 TG + 已发出的占位消息（begin() 的网络动作不在本自测范围内）。 */
-async function 收尾一轮(脚本, 答案) {
-  const tg = 假TG(脚本);
-  const 错 = [];
+/** 造一个「占位消息已发出」的 TG 活状态（begin() 的网络动作不在本自测范围内）。 */
+function 造状态(tg, 错 = []) {
   const 状态 = new LiveStatus({
     kind: 'tg',
     telegram: tg,
@@ -97,59 +88,117 @@ async function 收尾一轮(脚本, 答案) {
     error: (m) => 错.push(String(m)),
   });
   状态.messageId = 555;
-  await 状态.finish(答案);
-  return { tg, 错 };
+  return 状态;
 }
 
-console.log('— ① 限流一次后重发成功 —');
+console.log('— ① 收尾 = 进度原文 ＋ 收尾行；回答不进气泡 —');
 {
-  const { tg, 错 } = await 收尾一轮({ 编辑: [限流(1)] }, '答案一');
-  断言(tg.记录.编辑.at(-1).includes('答案一'), '① 占位消息最终是正式回答');
-  断言(tg.记录.编辑.some((t) => t.includes('限流中')), '① 等待期间占位消息说明了「限流中，约 N 秒」');
-  断言(错.some((m) => m.includes('被 Telegram 限流')), '① 日志记下被限流与重发');
-  断言(数落盘().length === 0, '① 不该落盘');
+  const 错 = [];
+  const tg = 假TG();
+  const 状态 = 造状态(tg, 错);
+  状态.推正文('我先摸四样：服务的健康口、待办清单、台账、插件版本。');
+  状态.addNote('🏃 跑命令: for p in 7788:数据机 7789:消息窗口 …');
+  状态.trackProgress(100, 2000); // 2 秒吐 100 字 → 有实测速度，小尾巴才出得来
+  const 尾巴 = await 状态.finish();
+  const 气泡 = tg.记录.编辑.at(-1) ?? '';
+  断言(tg.记录.编辑.length === 1, '① 收尾只动一次占位消息（还没到点的进度编辑被取消）');
+  断言(气泡.includes('跑命令') && 气泡.endsWith('✅ 已回复'), '① 气泡 = 进度原文 ＋ 一行收尾语');
+  断言(!气泡.includes('这份报告'), '① 回答正文一个字都不在气泡里（回归锁）');
+  断言(typeof 尾巴 === 'string' && 尾巴.includes('字/秒'), '① 小尾巴交回调用方（跟回答一起广播）');
+  断言(错.length === 0, '① 无错误日志');
 }
 
-console.log('— ② 限流到预算耗尽 → 落盘兜底 —');
+console.log('— ② 迟到的进度编辑不得盖掉收尾行 —');
 {
-  const { tg, 错 } = await 收尾一轮({ 编辑恒限流: 限流(1), 重发恒限流: 限流(1) }, '答案二·整篇不许丢');
-  const 文件 = 数落盘();
-  断言(文件.length === 1, '② 整篇回答落盘一份（目录是自动建出来的）');
-  断言(
-    readFileSync(join(落盘目录, 文件[0]), 'utf8').includes('答案二·整篇不许丢'),
-    '② 落盘内容就是整篇回答',
-  );
-  断言(tg.记录.编辑.some((t) => t.includes('未送达')), '② 占位消息改成「未送达 + 路径」，不再停在「正在处理」');
-  断言(错.some((m) => m.includes('已落盘')), '② 日志给出落盘路径');
-  rmSync(join(落盘目录, 文件[0])); // 清掉本步落的盘，免得污染后面的「不落盘」断言
+  const 错 = [];
+  const tg = 假TG();
+  let 放行 = () => {};
+  const 闸 = new Promise((r) => { 放行 = r; });
+  const 原编辑 = tg.editMessageText;
+  tg.editMessageText = async (chat, id, text) => {
+    const 果 = await 原编辑(chat, id, text);
+    if (tg.记录.编辑.length === 1) await 闸; // 第一次进度编辑卡在路上
+    return 果;
+  };
+  const 状态 = 造状态(tg, 错);
+  状态.推正文('我先摸四样。');
+  状态.addNote('🏃 跑命令: ls');
+  await new Promise((r) => setTimeout(r, 2200)); // 等去抖到点，让那次编辑发出去并卡住
+  断言(tg.记录.编辑.length === 1, '② 第一次进度编辑已发出（卡在路上）');
+  const 收尾 = 状态.finish();
+  await new Promise((r) => setTimeout(r, 20));
+  放行();
+  await 收尾;
+  断言(tg.记录.编辑.at(-1).includes('✅ 已回复'), '② 收尾行是这条消息最后一次写入（没被盖掉）');
+  断言(tg.记录.编辑.length === 2, '② 收尾只补一次编辑');
 }
 
-console.log('— ③ 超长回答分段补发被限流一次 —');
+console.log('— ③ 收尾行写不动：只记日志、不抛 —');
 {
-  const 长答案 = '甲乙丙丁戊己庚辛'.repeat(600); // 4800 字 → 分段
-  const { tg } = await 收尾一轮({ 发送: [限流(1)] }, 长答案);
-  断言(tg.记录.发送.length === 2, '③ 分段被限流一次后重试送达（2 次尝试）');
-  断言(tg.记录.发送.at(-1).includes('甲乙丙丁'), '③ 补发的确实是后半篇内容');
-  断言(数落盘().length === 0, '③ 全部送达，不落盘');
+  const 错 = [];
+  const tg = 假TG({ 编辑: [new Error('Bad Request: message to edit not found')] });
+  const 状态 = 造状态(tg, 错);
+  状态.推正文('我开始了。');
+  let 抛了 = null;
+  try {
+    await 状态.finish();
+  } catch (err) {
+    抛了 = err;
+  }
+  断言(抛了 === null, '③ 收尾行写不动也不抛（回答走广播，不受影响）');
+  断言(错.some((m) => m.includes('收尾行没写上')), '③ 日志记下收尾行没写上');
 }
 
-console.log('— ④ 正常一轮行为不变 —');
+console.log('— ④ 落盘兜底 —');
 {
-  const { tg, 错 } = await 收尾一轮({}, '正常答案');
-  断言(tg.记录.编辑.length === 1 && tg.记录.编辑[0].includes('正常答案'), '④ 只编辑一次占位消息，内容就是回答');
-  断言(tg.记录.发送.length === 0 && tg.记录.重发.length === 0, '④ 无重发、无补发');
-  断言(错.length === 0, '④ 无错误日志');
-  断言(数落盘().length === 0, '④ 不落盘');
+  const 错 = [];
+  const 文件 = await 落盘未送达('整篇回答·不许丢', '广播到 tg 失败', { 记日志: (m) => 错.push(String(m)), 渠道: 'tg' });
+  断言(typeof 文件 === 'string' && 文件.endsWith('.md'), '④ 落盘返回文件路径（目录是自动建出来的）');
+  断言(readFileSync(文件, 'utf8').includes('整篇回答·不许丢'), '④ 落盘内容就是整篇正文');
+  断言(错.some((m) => m.includes('已落盘')), '④ 日志给出落盘路径');
+
+  const tg = 假TG();
+  const 状态 = 造状态(tg, 错);
+  await 状态.标未送达('广播到 tg 失败', 文件);
+  断言(tg.记录.编辑.at(-1).includes('未送达'), '④ 气泡改标「未送达」，不再停在收尾语');
+  for (const f of 数落盘()) rmSync(join(落盘目录, f)); // 清干净，免得污染后面的断言
 }
 
-console.log('— ⑤ 非限流失败立即整条重发，不白等 —');
+console.log('— ⑤ 广播链路：撞 429 按 retry_after 重发 —');
 {
-  const 起 = Date.now();
-  const { tg } = await 收尾一轮({ 编辑: [new Error('Bad Request: message to edit not found')] }, '答案五');
-  const 耗时 = Date.now() - 起;
-  断言(tg.记录.重发.length === 1, '⑤ 占位消息发不动 → 立即整条重发');
-  断言(耗时 < 1000, `⑤ 不是限流就不等（实测 ${耗时}ms）`);
-  断言(数落盘().length === 0, '⑤ 整条重发成功，不落盘');
+  const t = new Telegram('测试令牌');
+  let 次 = 0;
+  t.sendMessage = async () => {
+    次 += 1;
+    if (次 === 1) throw 限流(1);
+    return { message_id: 1 };
+  };
+  const 果 = await t.sendRich(1, '你好');
+  断言(次 === 2, '⑤ 限流一次后重发（共 2 次调用）');
+  断言(果.mode === 'html' && 果.chunks === 1, '⑤ 重发后带格式送达');
+}
+
+console.log('— ⑥ 排版被拒（400）→ 只从失败那块起降级纯文本 —');
+{
+  const t = new Telegram('测试令牌');
+  const 发 = [];
+  t.sendMessage = async (chat, text, extra) => {
+    发.push({ text, extra });
+    if (extra?.parse_mode) throw new Error('Bad Request: parse entities failed');
+    return { message_id: 2 };
+  };
+  const 果 = await t.sendRich(1, '**加粗**');
+  断言(果.mode === 'plain', '⑥ 结果标为纯文本送达');
+  断言(发.length === 2 && !发[1].extra.parse_mode, '⑥ 降级那条不带 parse_mode');
+}
+
+console.log('— ⑦ 429 等不起（超预算）→ 抛出交调用方兜底 —');
+{
+  const t = new Telegram('测试令牌');
+  t.sendMessage = async () => { throw 限流(60); }; // 60s 远超 3s 预算
+  await assert.rejects(() => t.sendRich(1, '你好'), /Too Many Requests/);
+  过 += 1;
+  console.log('  ✅ ⑦ 限流等不起就抛出（节点会记失败，回答另走落盘兜底）');
 }
 
 clearInterval(保活);

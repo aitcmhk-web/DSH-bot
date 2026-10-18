@@ -40,6 +40,31 @@ function isTransientNetworkError(err) {
   return /fetch failed|socket hang up|other side closed|terminated/i.test(String(err?.message ?? ''));
 }
 
+// 限流（429）口径：单次等待封顶 90s（Telegram 有时让等 60s 以上），
+// 一轮交付的等待总预算默认 180s，可用 DSH_BOTPLUGIN_RATE_LIMIT_BUDGET_MS 覆盖（自测与现场救急）。
+const RATE_LIMIT_WAIT_MAX_MS = 90_000;
+export const RATE_LIMIT_BUDGET_MS = Number(process.env.DSH_BOTPLUGIN_RATE_LIMIT_BUDGET_MS ?? '') || 180_000;
+
+/**
+ * 429 的等待毫秒：照 Telegram 给的 `retry_after` 等，单次封顶 RATE_LIMIT_WAIT_MAX_MS。
+ * 放在协议层而不是各调用点：编辑消息与发送消息用的是同一套限流口径。
+ * @param {any} err Telegram 客户端抛出的错误（业务错误带 errorCode / parameters）
+ * @returns {number|null} 等待毫秒；不是限流（429）时回 null
+ */
+export function rateLimitWaitMs(err) {
+  if (Number(err?.errorCode) !== 429) return null;
+  const seconds = Math.max(1, Number(err?.parameters?.retry_after ?? 5));
+  return Math.min(seconds * 1000, RATE_LIMIT_WAIT_MAX_MS);
+}
+
+/** 睡一会儿（定时器 unref：不影响进程退出）。 */
+function sleep(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
 export class Telegram {
   /**
    * @param {string} token BotFather 给的 token（每个 bot 自己的）
@@ -139,28 +164,51 @@ export class Telegram {
     const html = markdownToHtml(markdown);
     const parts = splitMessageHtml(html);
     const { parse_mode: _drop, ...cleanExtra } = extra;
+    const deadline = Date.now() + RATE_LIMIT_BUDGET_MS;
 
     // 保险 2：任何一块标签不配对 → 整体走纯文本（宁可没格式，不可丢消息）
     if (!parts.every((p) => htmlIsBalanced(p))) {
       for (const p of splitMessage(String(markdown ?? ''))) {
-        await this.sendMessage(chatId, p, cleanExtra);
+        await this.#sendWithRateLimit(chatId, p, cleanExtra, deadline);
       }
       return { ok: true, mode: 'plain', chunks: parts.length };
     }
 
     for (let i = 0; i < parts.length; i++) {
       try {
-        await this.sendMessage(chatId, parts[i], { ...extra, parse_mode: 'HTML' });
+        await this.#sendWithRateLimit(chatId, parts[i], { ...extra, parse_mode: 'HTML' }, deadline);
       } catch (err) {
         // 保险 3：**只**把第 i 块起降级为纯文本（前 i 块已成功，绝不重发）
         const restPlain = splitMessageHtmlPlain(parts.slice(i));
         for (const p of restPlain) {
-          await this.sendMessage(chatId, p, cleanExtra);
+          await this.#sendWithRateLimit(chatId, p, cleanExtra, deadline);
         }
         return { ok: true, mode: 'plain', chunks: parts.length, fallback: err.message };
       }
     }
     return { ok: true, mode: 'html', chunks: parts.length };
+  }
+
+  /**
+   * 发一块，撞 Telegram 限流（429）就照它给的 retry_after 排队重发。
+   *
+   * 为什么放在协议层：最终回答统一由节点广播到各端点（2026-10-19 起），
+   * 端点发出的就是这一条；限流不在这里兜住，整条回答会失败——这正是
+   * 2026-10-18 那次「占位消息永远停在『正在处理』、答案丢掉」的同款成因。
+   *
+   * @param {number} deadline 允许等到什么时候（epoch ms）；超预算原样抛出，交由调用方兜底
+   */
+  async #sendWithRateLimit(chatId, text, extra, deadline) {
+    for (;;) {
+      try {
+        await this.sendMessage(chatId, text, extra);
+        return;
+      } catch (err) {
+        const wait = rateLimitWaitMs(err);
+        if (wait === null || Date.now() + wait > deadline) throw err;
+        await sleep(wait);
+      }
+    }
   }
 
   answerCallbackQuery(callbackQueryId, extra = {}) {
