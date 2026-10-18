@@ -127,4 +127,15 @@ console.log('⑧ DSH_BOTPLUGIN_PROGRESS_TOOLS=0 时工具标签不上屏');
   断言(出 === 'OK', '开关关掉后只剩进度行');
 }
 
+console.log('⑨ 实测耗时透传（trackProgress 必须把毫秒交给采样器）');
+{
+  const s = new LiveStatus({ kind: 'tg' });
+  s.sampler.reset();
+  s.trackProgress(600, 2000);   // 一条正文：600 字，实测 2s
+  const w = s.sampler.window();
+  断言(w !== null && w.measured === true, '有实测耗时时走实测口径');
+  断言(Math.abs(w.rate - 300) < 0.5, `速率按实测算（${w.rate.toFixed(1)}）`);
+  断言(s.sampler.activeMs === 2000, `毫秒累加正确（${s.sampler.activeMs}）`);
+}
+
 console.log(`\n全部通过：${过} 项`);

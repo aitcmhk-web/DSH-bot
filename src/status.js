@@ -346,9 +346,14 @@ export class LiveStatus {
     this.#scheduleEdit();
   }
 
-  /** 记录一次吐字快照（整轮文本长度，委托 SpeedSampler）。 */
-  trackProgress(charCount) {
-    this.sampler.track(charCount);
+  /**
+   * 记录一次吐字快照（整轮文本长度 ＋ 本次正文实际耗时，委托 SpeedSampler）。
+   *
+   * @param {number} charCount 整轮累计正文长度
+   * @param {number} [activeMs] 本次文本块首块到末块的毫秒数（缺省 0）
+   */
+  trackProgress(charCount, activeMs = 0) {
+    this.sampler.track(charCount, activeMs);
   }
 
   render() {
