@@ -19,3 +19,29 @@
     - id: botplugin
       name: dsh-botplugin
       config: {}
+
+# ── 会话压缩口径：随插件版本下发，装上即生效。
+#
+#    覆盖哪一行：宿主 dsh-base 里的 - id: compaction-basic（出厂那行没写 config，走代码
+#    默认）。补丁顺序是「出厂 → 本插件（本文件）→ 用户 profile 的 cordis.patch.yml」，
+#    最后一个写的人赢 —— 所以用户想改仍然盖得住，这里只是把合理默认变成可分发的东西。
+#
+#    为什么必须改：宿主代码默认 thresholdRatio 0.8 + retainRatio 0.16，在百万窗口上
+#    等于 80 万 token 才压缩 —— 正常对话根本触发不到，历史近乎全量重发，越聊越慢。
+#
+#    为什么用比例而不是「绝对保留量」：模型策略里的 retainTokens 是绝对预算，宿主会
+#    校验「保留量必须小于触发线」。绝对值不随窗口缩放，小窗口模型（如 6.5 万窗口）
+#    配上几万的绝对值会被判非法并抛 TargetPressureConfigError —— 压缩整个失效、历史
+#    无限增长，直到上下文溢出。两个比例都随窗口缩放，任何窗口都自洽：
+#      thresholdRatio 0.15 → 百万窗口 15 万触发（够宽，不会隔几轮压一次）
+#      retainRatio    0.08 → 压缩后按窗口留约 8%（百万窗口 ≈ 5 万）
+#
+#    为什么动 headroomTokens：宿主默认预留 65536，比小窗口本身还大，压力预算被算成
+#    负数（messageBudget − headroom ≤ 0）→ 小窗口永远压不动。收紧到 8192 后小窗口才
+#    有预算；大窗口的触发线取「窗口比例」与「压力预算」的小者，8192 远不构成约束。
+- id: compaction-basic
+  name: '@deepseek-ai/dsh-compaction-basic'
+  config:
+    thresholdRatio: 0.15
+    retainRatio: 0.08
+    headroomTokens: 8192

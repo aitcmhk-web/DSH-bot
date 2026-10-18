@@ -119,6 +119,28 @@ TPM/RPM 限额（撞上就是 429）。插件在宿主 llm 的 `llm/stream` 上�
 - **子代理与工具循环一样算**：它们都走同一条 waterfall，所以一处就管住全机流量。
 - **关掉**：配置里 `llmBudget.enabled: false`（出问题时可一键停，不影响启动）。
 
+## 会话压缩口径（随版本下发，2026-10-19 加）
+
+插件作为 profile 层装上时，会顺手把**会话压缩**的口径打进 profile：本包的
+`cordis.patch.yml`（`package.json` 的 `dsh.bundle.patch`）多打一行 `compaction-basic`。
+宿主代码默认 `thresholdRatio 0.8` —— 在百万窗口上等于 **80 万 token 才压缩**，
+正常对话根本触发不到，历史只能近乎全量重发，越聊越慢。
+
+本包一律下发**比例制**（两个数都随窗口缩放，任何窗口都自洽）：
+
+| 键 | 值 | 作用 |
+| --- | --- | --- |
+| `thresholdRatio` | `0.15` | 窗口的 15% 触发压缩（百万窗口 = 15 万 token） |
+| `retainRatio` | `0.08` | 压缩后按窗口留约 8%（百万窗口 ≈ 5 万 token） |
+| `headroomTokens` | `8192` | 预留空间。出厂默认 65536 比小窗口本身还大，会把压力预算算成负数 |
+
+⛔ **不要再用 `retainTokens`（绝对保留量）**：它是绝对值、不随窗口缩放，宿主会校验
+「保留量必须小于触发线」，小窗口模型（如 6.5 万窗口）配上几万的绝对值会被判非法并抛
+`TargetPressureConfigError` —— 压缩整个失效、历史无限增长，直到上下文溢出。
+
+补丁顺序是「出厂 → 本插件 → 用户 profile 的 `cordis.patch.yml`」，最后一个写的人赢，
+所以用户 profile 想改仍盖得住本包，这里只是把合理默认变成**可分发**的东西。
+
 ## 远程审批（手机点按钮，不用守着电脑）
 
 DSH 的审批服务用 waterfall 广播 `approval/request`，插件把它桥接到 Telegram——
