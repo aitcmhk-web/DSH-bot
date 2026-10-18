@@ -138,4 +138,15 @@ console.log('⑨ 实测耗时透传（trackProgress 必须把毫秒交给采样�
   断言(s.sampler.activeMs === 2000, `毫秒累加正确（${s.sampler.activeMs}）`);
 }
 
+console.log('⑩ 实测不足 1 秒不显示速度行');
+{
+  const s = new LiveStatus({ kind: 'tg' });
+  s.sampler.reset();
+  s.trackProgress(180, 600);
+  断言(s.render().includes('🚀') === false, '进度头部不出现 🚀');
+  断言(s.sampler.window() === null, 'window() 返回 null');
+  const 尾巴 = s.sampler.finish(() => {});
+  断言(尾巴 === null, '收尾不拼小尾巴');
+}
+
 console.log(`\n全部通过：${过} 项`);
