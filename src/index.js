@@ -100,7 +100,7 @@ export const Config = Schema.object({
     enabled: Schema.boolean().default(true)
       .description('开关模型流量的分钟预算闸（关掉 = 不限流，出问题时可一键停）'),
     tpm: Schema.number().default(默认预算.tpm)
-      .description('滚动 60 秒内 token 上限（默认 300 万：一条请求就带十几万 token，放太紧会一直排队）'),
+      .description('滚动 60 秒内 token 上限（默认 90 万：供应商 TPM 限额 100 万，留一成余量；一条请求就带十几万 token，放太紧会一直排队）'),
     rpm: Schema.number().default(默认预算.rpm)
       .description('滚动 60 秒内模型请求数上限（默认 50 次）'),
     输出预留: Schema.number().default(默认预算.输出预留)
