@@ -1,8 +1,10 @@
 /**
  * 回合内的「活状态」：模型跑的时候把进度显示出来，不用干等。
  *
- *   TG   ：①「⏳ 正在处理…」占位消息：**只在我的新话出现时才编辑一次**（⛔ 不做定时刷新——
- *             内容没变也照刷，白撞 Telegram 限流）；上屏「已耗时 / ≈字每秒 / 最近动态」
+ *   TG   ：①「⏳ 正在处理…」占位消息：**只在我出新话 / 新操作时才编辑一次**（⛔ 不做定时刷新——
+ *             内容没变也照刷，白撞 Telegram 限流）。版式（2026-10-19 定）：
+ *             **顶行 ＝ 我最新说的那句**（我还没开口时才是「⏳ 正在处理…」占位语，⛔ 不显示已耗时），
+ *             底下滚动的是**操作**（工具标签 / 📌 进度行），两下互不影响；有实测吐字时顶行下缀一行速度
  *          ② sendChatAction('typing') 每 4.5s 续期
  *          ③ 最终回答编辑进占位消息（markdown→HTML，超长自动分段补发）
  *          ④ 任何一步撞 Telegram 限流（429）都**按它给的 retry_after 排队重发**；
@@ -14,10 +16,10 @@
  * 事件从哪来：runtime.onSessionEvent() 的 tool/call 与 assistant/message，
  * 由 index.js 喂进来（addNote / 推正文 / trackProgress），本类不碰 runtime。
  *
- * 进度口径（2026-10-18 定、同日两次修订）：进度消息回答「我正在做什么」——
- * ① **我在回合里说的话**（正文按行上屏：一条消息送一次，重复送达不重复上屏，代码块与空行不进，
- *    见 推正文）；
- * ② 正文里带 `[进度]` 标记的行（带 📌，与 ① 不重复上屏）；③ 认得出的工具中文标签；
+ * 进度口径（2026-10-18 定、2026-10-19 修订）：进度消息回答「我正在做什么」，分两路、互不影响——
+ * ① **顶行 ＝ 我在回合里说的话**（正文按行取最新那句顶上去；一条消息送一次、重复送达不重刷，
+ *    代码块与空行不进，见 推正文）；
+ * ② **下面滚动的是操作**：带 `[进度]` 标记的行（带 📌，⛔ 不在顶行重复）＋ 认得出的工具中文标签；
  * 标签后面接**具体在干什么**（跑哪条命令、看哪个文件），否则「跑命令」四个字等于没说话。
  * 思考原文（reasoning 块）一律不上屏，口令类字面量打码（见 遮口令）。
  * 工具标签可用 DSH_BOTPLUGIN_PROGRESS_TOOLS=0 关掉。
@@ -289,15 +291,16 @@ export class LiveStatus {
     this.error = error;
     this.messageId = null;
     this.notes = [];
-    this.startedAt = Date.now();
     this.typingTimer = null;
     this.editTimer = null;
     this.lastRendered = '';
-    /** 本条 `assistant/message` 已上屏的正文。流式事件会把同一条消息越长越全地重复送一遍，
-     *  靠它取增量，⛔ 不重复上屏。 */
+    /** 本条 `assistant/message` 已读过的正文（DSH 一条消息只送一次，这里主要防重复送达与前缀重复）。 */
     this.正文已读 = '';
     /** 正文三引号代码块的开关：块内不上屏（代码要看有最终回答）。 */
     this.在代码块里 = false;
+    /** 我最新说的那一句＝占位消息的**顶行**（还没开口时顶行是占位语，见 render）。
+     *  ⛔ 不进 notes——下面滚动的只放「操作」，两下互不影响。 */
+    this.最新一句 = '';
     /** Epoch ms before which Telegram has asked us not to edit again. */
     this.editBlockedUntil = 0;
     this.closed = false;
@@ -322,8 +325,9 @@ export class LiveStatus {
     this.telegram.sendChatAction(this.chatId, 'typing').catch(() => {});
   }
 
-  /** 加一条动态。入参：note（文本）、类型（`'进度'` = 带 📌 的显式进度行、`'正文'` = 我在回合里说的话，
-   *  其它＝工具标签）。
+  /** 加一条**操作**动态（下面滚动的那一路）。入参：note（文本）、
+   *  类型（`'进度'` = 带 📌 的显式进度行，其它＝工具标签）。
+   *  ⛔ 我说的话不走这里——它走 推正文，上屏在顶行。
    *  只留最近 12 条（上屏显示最近 3 条，见 render）。
    *  口径：只显示「正在做什么」——工具标签可用 `DSH_BOTPLUGIN_PROGRESS_TOOLS=0` 关掉；
    *  连着两条一样的不重复上屏。副作用：排一次进度消息编辑。 */
@@ -341,15 +345,17 @@ export class LiveStatus {
   /**
    * 把助手正文按行喂进进度消息。入参：本条 `assistant/message` 的整段正文（可空）。出参：无。
    *
-   * 为什么这么做（2026-10-18 口径二次修订）：进度消息回答「我正在做什么」，而我在回合里说的话
-   * 就是最直接的答案。此前只认 `[进度]` 标记行，结果「我每次操作前说的话」在网页端看得到、
-   * TG 那条占位消息里看不到。现在正文按行上屏，三条底线：
-   *   · **一条消息只上屏一次**——DSH 的正文是「一条 `assistant/message` 落定后送一次」
-   *     （流式 chunk 只走瞬时帧，不进会话事件），所以正常不会重复；`正文已读` 游标是兜底：
-   *     后一条消息的开头若正好就是前一条那句（前缀重复），只报多出来的那部分，⛔ 不重刷；
-   *   · 代码块（``` / ~~~ 包着的）与空行不上屏；
-   *   · 带 `[进度]` 标记的行不进这里（它们由 挑进度行 带 📌 上屏，⛔ 不重复）。
-   * 单行掐到 PROGRESS_NOTE_MAX 字。副作用：每条新行排一次进度消息编辑（addNote 把同批合并）。
+   * 为什么这么做（2026-10-18 定、2026-10-19 修订）：进度消息回答「我正在做什么」，而我在回合里
+   * 说的话就是最直接的答案。此前只认 `[进度]` 标记行，结果「我每次操作前说的话」在网页端看得到、
+   * TG 那条占位消息里看不到。现在的版式（老板口径）：
+   *   · **顶行 ＝ 我最新说的那句**——它顶掉原来「⏳ 正在处理…」那几个字，⛔ 不显示已耗时；
+   *     顶行只有一格，故新的一句把前一句顶掉；
+   *   · **下面滚动的只放「操作」**（工具标签 / 📌 进度行），与顶行互不影响；
+   *   · **一条消息只送一次**——DSH 的正文是「一条 `assistant/message` 落定后送一次」
+   *     （流式 chunk 只走瞬时帧，不进会话事件）；`正文已读` 游标兜住重复送达与前缀重复；
+   *   · 代码块（``` / ~~~ 包着的）与空行不占顶行；
+   *   · 带 `[进度]` 标记的行走 📌 那条路（进下面的操作区），⛔ 不在顶行重复。
+   * 一句掐到 PROGRESS_NOTE_MAX 字。副作用：换了顶行就排一次进度消息编辑。
    *
    * @param {string} 整段正文
    */
@@ -359,6 +365,7 @@ export class LiveStatus {
     const 增量 = 段.startsWith(this.正文已读) ? 段.slice(this.正文已读.length) : 段;
     this.正文已读 = 段;
     if (!增量) return;
+    let 换了 = false;
     for (const 原始 of 增量.split('\n')) {
       const 行 = 原始.trim();
       if (!行) continue;
@@ -368,8 +375,10 @@ export class LiveStatus {
       }
       if (this.在代码块里) continue;
       if (进度标记.test(行)) continue;
-      this.addNote(行, '正文');
+      this.最新一句 = truncate(行, PROGRESS_NOTE_MAX);   // 顶行只有一格：新的一句把前一句顶掉
+      换了 = true;
     }
+    if (换了) this.#scheduleEdit();
   }
 
   /**
@@ -383,14 +392,15 @@ export class LiveStatus {
   }
 
   render() {
-    const seconds = Math.round((Date.now() - this.startedAt) / 1000);
+    // 顶行＝我最新说的那句（老板口径 2026-10-19：我的话顶掉「正在处理」那几个字，⛔ 不显示已耗时）；
+    // 我还没开口时顶行才是占位语。下面滚动的只放「操作」，两下互不影响。
     const tps = this.sampler.window();
-    let header = `⏳ 正在处理… (${seconds}s)`;
+    let 文 = this.最新一句 || '⏳ 正在处理…';
     if (tps) {
-      header += `\n🚀 ≈${tps.rate.toFixed(1)} 字/秒 · 已生成 ${tps.chars} 字`;
+      文 += `\n🚀 ≈${tps.rate.toFixed(1)} 字/秒 · 已生成 ${tps.chars} 字`;
     }
     const recent = this.notes.slice(-3);
-    return recent.length === 0 ? header : `${header}\n\n${recent.join('\n')}`;
+    return recent.length === 0 ? 文 : `${文}\n\n${recent.join('\n')}`;
   }
 
   #scheduleEdit() {

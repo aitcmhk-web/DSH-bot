@@ -1281,11 +1281,10 @@ export function apply(ctx, config) {
           if (event?.type === 'assistant/message') {
             const content = event.data?.message?.content;
             if (!Array.isArray(content)) return;
-            // 进度回答「我正在做什么」（2026-10-18 口径，同日二次修订）：
+            // 进度回答「我正在做什么」（2026-10-18 定、2026-10-19 修订）：
             //   · ⛔ 不取 reasoning 块——思考是模型内部过程，中英文夹杂地刷屏没有意义；
-            //   · 正文里带 `[进度] …` 标记的行，带 📌 上屏；
-            //   · **其余正文按行上屏**（推正文：只报新说的那部分，代码块与空行不进）——
-            //     此前只认标记行，结果「我每次操作前说的话」只在网页端看得到、TG 上看不到。
+            //   · **我的话进顶行**（推正文：取最新那句顶掉「正在处理」几个字，代码块与空行不进）；
+            //   · 带 `[进度] …` 标记的行带 📌 进下面的操作区，与我的话互不影响。
             const t = content
               .filter((b) => b?.type === 'text')
               .map((b) => String(b.text ?? ''))
