@@ -1,7 +1,8 @@
 /**
  * 回合内的「活状态」：模型跑的时候把进度显示出来，不用干等。
  *
- *   TG   ：①「⏳ 正在处理…」占位消息，4s 一次编辑（已耗时 / ≈字每秒 / 最近动态）
+ *   TG   ：①「⏳ 正在处理…」占位消息：**只在我的新话出现时才编辑一次**（⛔ 不做定时刷新——
+ *             内容没变也照刷，白撞 Telegram 限流）；上屏「已耗时 / ≈字每秒 / 最近动态」
  *          ② sendChatAction('typing') 每 4.5s 续期
  *          ③ 最终回答编辑进占位消息（markdown→HTML，超长自动分段补发）
  *          ④ 任何一步撞 Telegram 限流（429）都**按它给的 retry_after 排队重发**；
@@ -11,11 +12,14 @@
  *          最终回答由调用方照常发送，本类只返回吐字速度小尾巴。
  *
  * 事件从哪来：runtime.onSessionEvent() 的 tool/call 与 assistant/message，
- * 由 index.js 喂进来（addNote / trackProgress），本类不碰 runtime。
+ * 由 index.js 喂进来（addNote / 推正文 / trackProgress），本类不碰 runtime。
  *
- * 进度口径（2026-10-18 定、同日修订）：进度消息**只回答「我正在做什么」**——正文里带 `[进度]` 标记的行，
- * 加认得出的工具中文标签；标签后面接**具体在干什么**（跑哪条命令、看哪个文件），
- * 否则「跑命令」四个字等于没说话。思考原文（reasoning 块）一律不上屏，口令类字面量打码（见 遮口令）。
+ * 进度口径（2026-10-18 定、同日两次修订）：进度消息回答「我正在做什么」——
+ * ① **我在回合里说的话**（正文按行上屏：一条消息送一次，重复送达不重复上屏，代码块与空行不进，
+ *    见 推正文）；
+ * ② 正文里带 `[进度]` 标记的行（带 📌，与 ① 不重复上屏）；③ 认得出的工具中文标签；
+ * 标签后面接**具体在干什么**（跑哪条命令、看哪个文件），否则「跑命令」四个字等于没说话。
+ * 思考原文（reasoning 块）一律不上屏，口令类字面量打码（见 遮口令）。
  * 工具标签可用 DSH_BOTPLUGIN_PROGRESS_TOOLS=0 关掉。
  */
 
@@ -222,7 +226,8 @@ export class SpeedSampler {
 }
 
 const TYPING_RENEW_MS = 4500; // 4.5s：微信 status=1 约 11s 自动消失，必须续期
-const PROGRESS_TICK_MS = 4000; // 进度消息编辑间隔。旧版 2s 太频，长回合里会撞 Telegram 限流
+// 进度消息不再定时刷新：有新动态（新话 / 新工具标签）时 addNote 自己排一次编辑。
+// 旧版每 2s（后改 4s）刷一次，头部秒数与速率一变就编辑，内容其实没变，白占限流额度。
 const EDIT_DEBOUNCE_MS = 2000; // 同一批动态合并成一次编辑的去抖窗口
 const RATE_LIMIT_WAIT_MAX_MS = 90_000; // 单次限流最多等这么久（TG 有时让等 60s 以上）
 // 一轮收尾排队重发的等待总预算，超了就走落盘兜底。可用 DSH_BOTPLUGIN_RATE_LIMIT_BUDGET_MS 覆盖（自测与现场救急用）。
@@ -286,9 +291,13 @@ export class LiveStatus {
     this.notes = [];
     this.startedAt = Date.now();
     this.typingTimer = null;
-    this.tickTimer = null;
     this.editTimer = null;
     this.lastRendered = '';
+    /** 本条 `assistant/message` 已上屏的正文。流式事件会把同一条消息越长越全地重复送一遍，
+     *  靠它取增量，⛔ 不重复上屏。 */
+    this.正文已读 = '';
+    /** 正文三引号代码块的开关：块内不上屏（代码要看有最终回答）。 */
+    this.在代码块里 = false;
     /** Epoch ms before which Telegram has asked us not to edit again. */
     this.editBlockedUntil = 0;
     this.closed = false;
@@ -310,12 +319,11 @@ export class LiveStatus {
       this.telegram.sendChatAction(this.chatId, 'typing').catch(() => {});
     }, TYPING_RENEW_MS);
     this.typingTimer.unref?.();
-    this.tickTimer = setInterval(() => this.#scheduleEdit(), PROGRESS_TICK_MS);
-    this.tickTimer.unref?.();
     this.telegram.sendChatAction(this.chatId, 'typing').catch(() => {});
   }
 
-  /** 加一条动态。入参：note（文本）、类型（`'进度'` = 我主动报的「正在做什么」，其它＝工具标签）。
+  /** 加一条动态。入参：note（文本）、类型（`'进度'` = 带 📌 的显式进度行、`'正文'` = 我在回合里说的话，
+   *  其它＝工具标签）。
    *  只留最近 12 条（上屏显示最近 3 条，见 render）。
    *  口径：只显示「正在做什么」——工具标签可用 `DSH_BOTPLUGIN_PROGRESS_TOOLS=0` 关掉；
    *  连着两条一样的不重复上屏。副作用：排一次进度消息编辑。 */
@@ -328,6 +336,40 @@ export class LiveStatus {
     this.notes.push(行);
     if (this.notes.length > 12) this.notes.splice(0, this.notes.length - 12);
     this.#scheduleEdit();
+  }
+
+  /**
+   * 把助手正文按行喂进进度消息。入参：本条 `assistant/message` 的整段正文（可空）。出参：无。
+   *
+   * 为什么这么做（2026-10-18 口径二次修订）：进度消息回答「我正在做什么」，而我在回合里说的话
+   * 就是最直接的答案。此前只认 `[进度]` 标记行，结果「我每次操作前说的话」在网页端看得到、
+   * TG 那条占位消息里看不到。现在正文按行上屏，三条底线：
+   *   · **一条消息只上屏一次**——DSH 的正文是「一条 `assistant/message` 落定后送一次」
+   *     （流式 chunk 只走瞬时帧，不进会话事件），所以正常不会重复；`正文已读` 游标是兜底：
+   *     后一条消息的开头若正好就是前一条那句（前缀重复），只报多出来的那部分，⛔ 不重刷；
+   *   · 代码块（``` / ~~~ 包着的）与空行不上屏；
+   *   · 带 `[进度]` 标记的行不进这里（它们由 挑进度行 带 📌 上屏，⛔ 不重复）。
+   * 单行掐到 PROGRESS_NOTE_MAX 字。副作用：每条新行排一次进度消息编辑（addNote 把同批合并）。
+   *
+   * @param {string} 整段正文
+   */
+  推正文(整段正文) {
+    const 段 = String(整段正文 ?? '');
+    if (!段) return;
+    const 增量 = 段.startsWith(this.正文已读) ? 段.slice(this.正文已读.length) : 段;
+    this.正文已读 = 段;
+    if (!增量) return;
+    for (const 原始 of 增量.split('\n')) {
+      const 行 = 原始.trim();
+      if (!行) continue;
+      if (行.startsWith('```') || 行.startsWith('~~~')) {
+        this.在代码块里 = !this.在代码块里;
+        continue;
+      }
+      if (this.在代码块里) continue;
+      if (进度标记.test(行)) continue;
+      this.addNote(行, '正文');
+    }
   }
 
   /**
@@ -542,9 +584,8 @@ export class LiveStatus {
 
   #clearTimers() {
     if (this.typingTimer) clearInterval(this.typingTimer);
-    if (this.tickTimer) clearInterval(this.tickTimer);
     if (this.editTimer) clearTimeout(this.editTimer);
-    this.typingTimer = this.tickTimer = this.editTimer = null;
+    this.typingTimer = this.editTimer = null;
   }
 
   // ------------------------------------------------------------------ WX --
