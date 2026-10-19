@@ -226,6 +226,12 @@ DSH 的审批服务用 waterfall 广播 `approval/request`，插件把它桥接�
   秒数一变就编辑，内容其实没变，白撞限流）。收尾时在原文下留一行「✅ 已回复」；吐字速度小尾巴跟**回答**走，
   气泡上不重复显示。收尾前会先等「已经在飞」的那次进度编辑落地，⛔ 不让它回头盖掉收尾行。
 
+## 发版规矩（2026-10-19 定）
+
+- **版本号末段最多到 99**：第 100 版起**直接进位** —— `1.0.99` → `1.1.1`，⛔ 不再出现 `1.0.100` 这种末段三位数。
+- 升版本号必须**同一个 commit** 里一起改**三处**：`package.json` 的 `version`、`package-lock.json`（两处）、`setupdsh.sh` 的 `BOTPLUGIN_SPEC` 默认 tag。本仓 pre-commit 闸（`.githooks/发版对账.sh`）会拦「只改一边」与「末段 > 99」。
+- 发完把提交与 `git tag v<版本>` 一起推到 `origin`；装到本机用 `npm install github:aitcmhk-web/DSH-bot#v<版本>`（⛔ 别用裸 `npm install`：旧锁文件会把版本带回上一个 tag）。
+
 ## 许可
 
 MIT License（全文见 [LICENSE](LICENSE)）：可以自由使用、修改、再发布，保留版权声明即可；软件不提供任何担保。
