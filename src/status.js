@@ -6,11 +6,12 @@
  *             **顶行 ＝ 我最新说的那句**（我还没开口时才是「⏳ 正在处理…」占位语，⛔ 不显示已耗时），
  *             底下滚动的是**操作**（工具标签 / 📌 进度行），两下互不影响；有实测吐字时顶行下缀一行速度
  *          ② sendChatAction('typing') 每 4.5s 续期
- *          ③ 收尾在原文下留一行「✅ 已回复」——**占位消息只报进度，⛔ 不承载最终回答**。
+ *          ③ 收尾**把占位气泡删掉**（2026-10-20 起：⛔ 不再留「✅ 已回复」那行）——
+ *             **占位消息只报进度，⛔ 不承载最终回答**。
  *             回答统一由节点广播到所有端点（见 index.js 收尾交付）。一条消息只许一个写者：
  *             同一轮里「进度编辑」与「收尾回答」抢同一条消息时，迟到的进度编辑会把回答盖回去，
  *             日志里还看不出异常——2026-10-19 线上丢件就是这么丢的。
- *          ④ 收尾行写不动只记日志（⛔ 不影响回答的广播）；回答自己送不到时另走落盘兜底
+ *          ④ 收尾删气泡删不动只记日志（⛔ 不影响回答的广播）；回答自己送不到时另走落盘兜底
  *             （见导出的 落盘未送达）
  *   微信 ：微信没有编辑消息接口，只有「正在输入」状态：
  *          getConfig 拿 typing_ticket → sendTyping(1) 每 4.5s 续期 → 结束时 sendTyping(2)
@@ -234,9 +235,8 @@ const TYPING_RENEW_MS = 4500; // 4.5s：微信 status=1 约 11s 自动消失，�
 // 进度消息不再定时刷新：有新动态（新话 / 新工具标签）时 addNote 自己排一次编辑。
 // 旧版每 2s（后改 4s）刷一次，头部秒数与速率一变就编辑，内容其实没变，白占限流额度。
 const EDIT_DEBOUNCE_MS = 2000; // 同一批动态合并成一次编辑的去抖窗口
-/** 占位消息的占位语与收尾语：顶行还没话时说前者，收尾时在原文下留后者。 */
+/** 占位消息的占位语：顶行还没话时说它。 */
 const 占位语 = '⏳ 正在处理…';
-const 收尾语 = '✅ 已回复';
 
 /** 睡一会儿（定时器 unref：不影响进程退出）。 */
 function sleep(ms) {
@@ -319,7 +319,7 @@ export class LiveStatus {
     this.editBlockedUntil = 0;
     /**
      * 「已经在飞」的那次进度编辑（Promise）。收尾前要等它落地：
-     * 它晚一步返回就会把收尾行盖回进度文本（同一条消息上的写者顺序问题）。
+     * 它晚一步返回就会在收尾之后又改一次气泡（同一条消息上的写者顺序问题）。
      */
     this.在飞编辑 = null;
     this.closed = false;
@@ -438,7 +438,7 @@ export class LiveStatus {
     if (Date.now() < this.editBlockedUntil) return;
     const text = this.render();
     if (text === this.lastRendered) return;
-    // 「在飞」留痕：收尾要等这一次落地（见 finish），否则它晚一步返回会把收尾行盖回进度文本。
+    // 「在飞」留痕：收尾要等这一次落地（见 finish），否则它晚一步返回会在收尾之后又改一次气泡。
     const 在飞 = this.#safeEdit(text);
     this.在飞编辑 = 在飞;
     // 只有真的编辑上去了才记住，否则一次被拒的编辑会让进度消息永远停在旧文本。
@@ -447,8 +447,8 @@ export class LiveStatus {
     const ok = await 在飞;
     if (this.在飞编辑 === 在飞) this.在飞编辑 = null;
     if (ok) this.lastRendered = text;
-    // 兜底：回来时已经收尾 → 把收尾行补回去（迟到的进度编辑⛔不得盖掉收尾行）。
-    if (this.closed) await this.#写收尾行();
+    // 兜底：回来时已经收尾 → 这次迟到的进度编辑不再上屏（收尾后气泡只可能被删或被标「未送达」）。
+    if (this.closed) return;
   }
 
   /** @returns {Promise<boolean>} 是否编辑成功。 */
@@ -472,10 +472,11 @@ export class LiveStatus {
   }
 
   /**
-   * 收尾（kind='tg'）：占位消息只报进度，收尾在原文下留一行「✅ 已回复」——
-   *   ⛔ 不再接管最终回答（回答统一由节点广播到所有端点，见 index.js 收尾交付）。
-   *   一条消息只许一个写者：收尾与迟到的进度编辑抢同一条消息时，回答会被盖回去
-   *   （2026-10-19 线上丢件的成因）。顺序由「先等在飞编辑落地」保证。
+   * 收尾（kind='tg'）：清定时器、等在飞编辑落地、打上「已收尾」标记；**⛔ 不动占位气泡**。
+   *   （2026-10-20 老板定「去掉气泡收尾」：不再写「✅ 已回复」那行——没意义，而且气泡顶行
+   *   是「我最新说的一句话」，会跟回答尾巴重复。气泡的去留在回答进窗口后由调用方定：
+   *   送达 → `清气泡()` 删掉；没送达 → `标未送达()` 留证。）
+   *   ⛔ 不接管最终回答（回答统一由节点广播到所有端点，见 index.js 收尾交付）。
    * kind='wx'：取消「正在输入」。
    * @returns {Promise<string|null>} 吐字速度小尾巴，由调用方拼在回答后一起广播
    */
@@ -486,25 +487,12 @@ export class LiveStatus {
       return tail;
     }
     this.#clearTimers();
-    // 先等已经在飞的那次进度编辑落地：收尾行永远是这条消息的最后一次写入。
+    // 先等已经在飞的那次进度编辑落地：收尾后这条气泡只可能被删、或被标「未送达」。
     if (this.在飞编辑) await this.在飞编辑.catch(() => {});
     this.closed = true;
-    await this.#写收尾行();
     return tail;
   }
 
-  /**
-   * 把占位消息写成「进度原文 ＋ 一行收尾语」；失败只记日志。
-   * ⛔ 失败不影响回答：回答由节点广播发出，与这条气泡是两回事。
-   */
-  async #写收尾行() {
-    if (!this.messageId) return;
-    const 原文 = this.render();
-    const 文本 = 原文 && 原文 !== 占位语 ? `${原文}\n\n${收尾语}` : 收尾语;
-    if (文本 === this.lastRendered) return;
-    if (await this.#safeEdit(文本)) this.lastRendered = 文本;
-    else this.error('收尾行没写上（回答仍由节点广播，不受影响）');
-  }
 
   /**
    * 带排队重试地执行一次收尾动作（改占位消息 / 另发一条）：撞 429 就按 retry_after 等，等够了再试。
@@ -546,7 +534,7 @@ export class LiveStatus {
   }
 
   /**
-   * 把占位消息标成「回答未送达 ＋ 落盘路径」（收尾行之后仍可改；失败只记日志）。
+   * 把占位消息标成「回答未送达 ＋ 落盘路径」（收尾之后仍可改；失败只记日志）。
    * 调用点：调用方发现回答没送达到本通道时（见 index.js 收尾交付）。
    * @param {string} 原因 未送达原因
    * @param {string|null} 文件 落盘路径（落盘也失败时传 null）
@@ -555,6 +543,25 @@ export class LiveStatus {
     if (!this.messageId) return;
     const 文本 = `❌ 回答未送达（${原因}），${文件 ? `已存到 ${文件}` : '落盘也失败'}`;
     if (await this.#safeEdit(文本)) this.lastRendered = 文本;
+  }
+
+  /**
+   * 收尾删掉占位进度气泡（2026-10-20 老板定「去掉气泡收尾」）。
+   *   为什么删：旧收尾在原文下补一行「✅ 已回复」，既没意义，又让气泡顶行那句
+   *   「我最新说的一句话」跟刚广播出去的回答尾巴重复。
+   * 调用点：回答**已进窗口**之后（见 index.js 收尾交付）；没送达时改走 `标未送达()`。
+   * 失败只记日志，⛔ 不影响回答（回答走节点广播，与这条气泡是两回事）。
+   * @returns {Promise<boolean>} 是否真删掉
+   */
+  async 清气泡() {
+    if (this.kind !== 'tg' || !this.messageId) return false;
+    try {
+      await this.telegram.deleteMessage(this.chatId, this.messageId);
+      return true;
+    } catch (err) {
+      this.error(`占位气泡没删掉（回答已进窗口，不影响）: ${err.message}`);
+      return false;
+    }
   }
 
   /** 异常收尾：占位消息改成错误提示（微信则只取消正在输入）。 */

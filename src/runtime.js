@@ -409,7 +409,7 @@ export class BotRuntime {
    * @param {number} timeoutMs
    * @returns {Promise<{ok:true, text:string} | {ok:false, error:string}>}
    */
-  waitForTurn(chatKey, timeoutMs = 30 * 60 * 1000) {
+  waitForTurn(chatKey, timeoutMs = 90 * 60 * 1000) {
     const rec = this.#sessions.get(chatKey);
     const sessionId = rec ? String(rec.handle.agent.id) : null;
 
@@ -425,7 +425,7 @@ export class BotRuntime {
       };
 
       const timer = setTimeout(
-        () => finish({ ok: false, error: '等待回复超时（30 分钟）' }),
+        () => finish({ ok: false, error: `等待回复超时（${Math.round(timeoutMs / 60000)} 分钟）` }),
         timeoutMs,
       );
 

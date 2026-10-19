@@ -45,7 +45,6 @@ import { createFinalReview } from './final-review.mjs'; // 终审卡：DSH 侧�
 import { installHardRules } from './hard-rules.js';
 import { ensureWorkspaceMemoryFiles } from './workspace-files.js';
 import { 挂闸, 默认预算 } from './llm-budget.js';   // 模型流量的分钟预算闸（见本档头注释）
-import { createProgressSentinel, SENTINEL_DEFAULT_INTERVAL_MINUTES } from './progress-sentinel.js'; // 回合起止自动起停进度哨兵
 
 /** Cordis 插件名。 */
 export const name = 'botplugin';
@@ -93,8 +92,8 @@ export const Config = Schema.object({
   // ---- 行为 ----
   backlogMaxAgeSeconds: Schema.number().default(2 * 60 * 60)
     .description('停机太久时，超过这个年龄的积压消息不再执行（默认 2 小时）'),
-  turnTimeoutMs: Schema.number().default(30 * 60 * 1000)
-    .description('等模型回答的超时（毫秒，默认 30 分钟）。超时后该会话的队列才会解锁'),
+  turnTimeoutMs: Schema.number().default(90 * 60 * 1000)
+    .description('等模型回答的超时（毫秒，默认 90 分钟；2026-10-20 由 30 抬到 90——满 30 分钟就丢这一轮答案）。超时后该会话的队列才会解锁'),
 
   // ---- 模型流量闸（2026-10-19 加）----
   llmBudget: Schema.object({
@@ -111,16 +110,6 @@ export const Config = Schema.object({
   }).description('模型流量闸：滚动 60 秒内请求数与 token 数封顶，超了排队等（见 src/llm-budget.js）'),
   logLabel: Schema.string().default('').description('日志前缀（留空 = 不加前缀，跟软件版格式对齐）'),
 
-  // ---- 进度哨兵（2026-10-19 加）----
-  // 背景：老板那条 TG 对话等一条回复满 30 分钟就超时，一超时主进程发什么都送不出去。
-  //       主进程干活是一整轮跑完才回话、中途没闹钟，故在进程外放个小哨兵按状态文件代报。
-  //       本组开关只管「回合起止自动起停它」；哨兵脚本与状态文件都在项目根（见 src/progress-sentinel.js）。
-  sentinelEnabled: Schema.boolean().default(true)
-    .description('回合开始自动拉起进度哨兵、收尾自动收掉（项目根没有哨兵脚本时自动空转，不影响回合）'),
-  sentinelScript: Schema.string().description('进度哨兵脚本路径。不填 = 默认 <工作目录>/哨兵.mjs'),
-  sentinelStateFile: Schema.string().description('进度哨兵状态文件路径。不填 = 默认 <工作目录>/哨兵状态.json'),
-  sentinelIntervalMinutes: Schema.number().default(SENTINEL_DEFAULT_INTERVAL_MINUTES)
-    .description('哨兵代报间隔（分钟，默认 20；必须小于「有任务在跑每 25 分钟必须报一次」这条铁律）'),
 
   // ---- 语音转文字 ----
   // 默认走 ali（线上 qwen3-asr-flash 优先，~0.6s；网关不在/出错自动回落本地 sensevoice，
@@ -881,18 +870,6 @@ export function apply(ctx, config) {
       })
     : null;
 
-  // 进度哨兵：回合开始拉起、收尾收掉（老板 2026-10-19 定「第二条」——⛔ 不再靠主进程自觉）。
-  // 脚本与状态文件都在工作目录根；别人的机器上没有这个脚本时自动空转（不影响回合）。
-  // 关闭开关 = sentinelEnabled: false（出问题时可一键停，不必改代码）。
-  const 哨兵 = createProgressSentinel({
-    script: config.sentinelEnabled === false
-      ? null
-      : (config.sentinelScript || join(config.cwd || process.cwd(), '哨兵.mjs')),
-    stateFile: config.sentinelStateFile || join(config.cwd || process.cwd(), '哨兵状态.json'),
-    intervalMinutes: config.sentinelIntervalMinutes,
-    log,
-    error,
-  });
 
   // -------------------------------------------------------------------------
   // 各接入层
@@ -1286,10 +1263,6 @@ export function apply(ctx, config) {
     const status = makeLiveStatus(msg);
     if (status) await status.begin();
 
-    // 进度哨兵开工（老板 2026-10-19 定「第二条」）：写「在干活」开关 + 把哨兵拉起来。
-    //   ⛔ 它只发「⏳ 还在干活：<步骤>」那一句、只读状态文件；脚本不在就整体空转，回合照跑。
-    //   收工在下面每个返回点都收一次（含失败早退），⛔ 不许有「开了不收」的路径。
-    哨兵.start('正在处理你刚发来的消息');
 
     // 冷启动记忆：会话还不存在（即将新建）= 上一段已随 /new、/restart、切模型
     // 或进程重启断开 —— 把 handoff 塞进第一条消息前面，模型不用用户复述上文。
@@ -1332,8 +1305,8 @@ export function apply(ctx, config) {
     // ① 先挂事件订阅；②③ 的「发送 → 等回答」整轮放在循环里（回退重发共用这条订阅）。
 
     // 会话事件 → 活状态（工具动态 + 吐字速度采样），与软件版 onSessionEvent 同一套规则。
-    // 订阅条件带上哨兵：活状态造不出来（比如不是 TG）时，哨兵照样要知道「正在干什么」。
-    const offEvents = status || 哨兵.isReady()
+    // 活状态造不出来（比如不是 TG）时不订阅。
+    const offEvents = status
       ? runtime.onSessionEvent((payload) => {
           const sid = runtime.sessionIdOf(chatKey);
           if (sid === null || payload?.sessionId !== sid) return;
@@ -1341,7 +1314,6 @@ export function apply(ctx, config) {
           if (event?.type === 'tool/call') {
             const 描述 = describeTool(event.data?.name, event.data?.arguments);
             status?.addNote(描述, '工具');
-            哨兵.note(描述);                      // 哨兵那句「还在干活」用同一条描述，省得另编一套话
             return;
           }
           if (event?.type === 'assistant/message') {
@@ -1359,9 +1331,6 @@ export function apply(ctx, config) {
             status?.trackProgress(t.length, 正文流毫秒(event.data?.stream));
             status?.推正文(t);
             for (const 行 of 挑进度行(t)) status?.addNote(行, '进度');
-            // 哨兵取「我最新说的一句话」，与占位消息顶行同源（截断到 60 字，代报只给一行）。
-            const 末句 = t.split('\n').map((s) => s.trim()).filter(Boolean).pop() ?? '';
-            if (末句) 哨兵.note(末句.slice(0, 60));
           }
         })
       : null;
@@ -1379,7 +1348,6 @@ export function apply(ctx, config) {
       if (!sent.ok) {
         offEvents?.();
         await status?.fail(sent.error);
-        哨兵.stop();                     // 早退也要收：⛔ 不许留下「开着不收」的哨兵
         error(`交给 DSH 失败（${chatKey}）: ${sent.error}`);
         await ep.send({ text: `❌ 处理失败：${sent.error}` }).catch(() => {});
         return sent;
@@ -1411,7 +1379,6 @@ export function apply(ctx, config) {
     offEvents?.();
     if (!answer.ok) {
       await status?.fail(answer.error);
-      哨兵.stop();                       // 超时/失败也是回合结束：收了才不会再代报
       error(`等回答失败（${chatKey}）: ${answer.error}`);
       await ep.send({ text: `❌ ${answer.error}` }).catch(() => {});
       return { ok: false, error: answer.error };
@@ -1427,7 +1394,7 @@ export function apply(ctx, config) {
     // ⛔ 不要再让 status.finish() 把回答编辑进 TG 那条占位消息：那样同一条消息上有
     //    两个写者（进度编辑 / 收尾回答），迟到的进度编辑会把回答盖回去，而日志里
     //    看不出任何异常 —— 2026-10-19 线上丢件就是这么丢的。现在的分工：
-    //    占位消息只报进度（收尾留一行「✅ 已回复」），回答只有节点这一个出口。
+    //    占位消息只报进度，收尾时**删掉**（2026-10-20 起 ⛔ 不再留「✅ 已回复」），回答只有节点这一个出口。
     // ⛔ 也不要在这里对来源端单独 ep.send()：出口只有一个，否则同一条回答会发两遍。
     // [DSH] 前缀与主程序 bot.js:1143 对齐，由本处加上（节点只转发，不改正文）。
     // ---------------------------------------------------------------------
@@ -1439,10 +1406,12 @@ export function apply(ctx, config) {
     if (投递.failed.some((f) => f.id === 'tg')) {
       const 文件 = await 落盘未送达(outText, '广播到 tg 失败', { 记日志: error, 渠道: 'tg' });
       await status?.标未送达('广播到 tg 失败', 文件);
+    } else {
+      // 回答已进窗口 → 把占位进度气泡删掉（2026-10-20 老板定「去掉气泡收尾」）。
+      //   ⛔ 不再在原文下留一行「✅ 已回复」（没意义）；也免得气泡顶行那句「我最新一句话」
+      //   跟回答尾巴重复。没送达那一支保留气泡并标「未送达」（上面那支），⛔ 不删。
+      await status?.清气泡();
     }
-    // 回合到此结束：收掉哨兵（⛔ 再代报就成了对着空气说话）。
-    //   ⚠️ 放在广播之后：答案已经进窗口，哨兵那点「还在干活」的话就不需要了。
-    哨兵.stop();
     return { ok: true };
   }
 
@@ -2809,7 +2778,6 @@ export function apply(ctx, config) {
     herd?.stop(); // 看门狗定时器 + .herd.lock + 管理回合拍子 + 汇报巡检拍子（两者均无自有定时器/锁，随 herd 停；非 master 实例未挂 = 空转）
     taskTriggers?.stop(); // 触发器定时器 + .trigger.lock（没 start 过则空转）
     mailboxWatcher?.stop(); // 报错箱 watch + 保险巡检 + .mailbox.lock（没 start 过则空转）
-    哨兵.stop(); // 进度哨兵：⛔ 卸载了就别再代报（进程随回合起停，卸载时不收会一直报到 3 小时上限）
     approvalBridge?.dispose();
     pollAbort?.abort();
     wxAbort?.abort();
