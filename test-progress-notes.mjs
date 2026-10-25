@@ -50,11 +50,11 @@ console.log('② 没有标记的思考段落 → 零动态');
   断言(挑进度行('[进度]').length === 0 && 挑进度行('[进度]   ').length === 0, '只有标记没内容 → 丢掉');
 }
 
-console.log('③ 单条出全文（⛔ 不掐字数）');
+console.log('③ 操作行照旧掐到 120 字（顶行才出全文）');
 {
   const 长 = `[进度] ${'字'.repeat(300)}`;
   const 行 = 挑进度行(长);
-  断言(行.length === 1 && 行[0].length === 300, '长行原样出全文（300 字一字不少）');
+  断言(行.length === 1 && 行[0].length === 120, '操作行照旧掐到 120 字');
 }
 
 console.log('④ 工具行＝动作标签：具体在干什么（真命令／真文件名）');
@@ -70,6 +70,7 @@ console.log('④ 工具行＝动作标签：具体在干什么（真命令／真
   断言(describeTool('web_fetch', { url: 'https://example.com/a' }).includes('example.com'), 'web_fetch 带网址');
   断言(describeTool('web_search', { queries: ['口径整改'] }).endsWith('口径整改'), 'web_search 带首个搜索词');
   断言(describeTool('subagent', { description: '查文档' }).endsWith('查文档'), 'subagent 带任务名');
+  断言(describeTool('bash', { command: `echo ${'字'.repeat(200)}` }).length <= '🏃 跑命令：'.length + 90, '工具行的真命令照旧掐到 90 字（⛔ 不再出全文）');
 }
 
 console.log('⑤ 口令打码、抠不出细节就只留标签');

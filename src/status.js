@@ -3,7 +3,7 @@
  *
  *   TG   ：①「⏳ 正在处理…」占位消息：**只在我出新话 / 新操作时才编辑一次**（⛔ 不做定时刷新——
  *             内容没变也照刷，白撞 Telegram 限流）。版式（2026-10-19 定）：
- *             **顶行 ＝ 我最新说的那句**（我还没开口时才是「⏳ 正在处理…」占位语，⛔ 不显示已耗时），
+ *             **顶行 ＝ 我最新说的那句**（**出全文、不掐字数**；我还没开口时才是「⏳ 正在处理…」占位语，⛔ 不显示已耗时），
  *             底下滚动的是**操作**（工具标签 / 📌 进度行），两下互不影响；有实测吐字时顶行下缀一行速度
  *          ② sendChatAction('typing') 每 4.5s 续期
  *          ③ 收尾**把占位气泡删掉**（2026-10-20 起：⛔ 不再留「✅ 已回复」那行）——
@@ -23,7 +23,7 @@
  * 进度口径（2026-10-18 定、2026-10-19 修订）：进度消息回答「我正在做什么」，分两路、互不影响——
  * ① **顶行 ＝ 我在回合里说的话**（正文按行取最新那句顶上去；一条消息送一次、重复送达不重刷，
  *    代码块与空行不进，见 推正文）；
- * ② **下面滚动的是操作**：带 `[进度]` 标记的行（带 📌，⛔ 不在顶行重复）＋ 认得出的工具中文标签；
+ * ② **下面滚动的是操作**：带 `[进度]` 标记的行（带 📌，⛔ 不在顶行重复）＋ 认得出的工具中文标签（**这一路照旧掐字**：单条 120 字、工具细节 90／60／80／40／20——2026-10-25 厘清「底下那三条操作提示不变」）；
  * 标签后面接**具体在干什么**（跑哪条命令、看哪个文件），否则「跑命令」四个字等于没说话。
  * 思考原文（reasoning 块）一律不上屏，口令类字面量打码（见 遮口令）。
  * 工具标签可用 DSH_BOTPLUGIN_PROGRESS_TOOLS=0 关掉。
@@ -57,7 +57,7 @@ const TOOL_LABELS = {
 
 export function truncate(text, max) {
   const value = String(text ?? '').replace(/\s+/g, ' ').trim();
-  if (!(max > 0)) return value;              // max ≤ 0 ＝ 不掐、出全文（见 PROGRESS_NOTE_MAX）
+  if (!(max > 0)) return value;              // max ≤ 0 ＝ 不掐、出全文（见 顶行_MAX／操作行_MAX）
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
@@ -93,28 +93,28 @@ function 摘要(name, 参) {
   const 首行 = (文) => String(文 ?? '').split('\n').map((x) => x.trim()).filter(Boolean)[0] ?? '';
   switch (name) {
     case 'bash':
-      return truncate(遮口令(首行(参.command ?? 参.cmd)), 0);
+      return truncate(遮口令(首行(参.command ?? 参.cmd)), 90);
     case 'read':
     case 'edit':
     case 'write':
     case 'present':
       return 文件名(参.file_path ?? 参.path);
     case 'glob':
-      return truncate(String(参.pattern ?? ''), 0);
+      return truncate(String(参.pattern ?? ''), 60);
     case 'grep':
-      return truncate(String(参.pattern ?? ''), 0);
+      return truncate(String(参.pattern ?? ''), 60);
     case 'web_search': {
       const 问 = Array.isArray(参.queries) ? 参.queries[0] : 参.query;
-      return truncate(String(问 ?? ''), 0);
+      return truncate(String(问 ?? ''), 60);
     }
     case 'web_fetch':
-      return truncate(String(参.url ?? ''), 0);
+      return truncate(String(参.url ?? ''), 80);
     case 'subagent':
     case 'subagent_fork':
-      return truncate(String(参.description ?? ''), 0);
+      return truncate(String(参.description ?? ''), 40);
     case 'job_output':
     case 'job_kill':
-      return truncate(String(参.job_id ?? ''), 0);
+      return truncate(String(参.job_id ?? ''), 20);
     default:
       return '';
   }
@@ -131,9 +131,14 @@ export function describeTool(name, 入参) {
   return 尾 ? `${标}：${尾}` : 标;
 }
 
-/** 单条进度动态与会话顶行的字数上限：**0 ＝ 不掐、出全文**
- *  （2026-10-25 老板定「对话框里你的输出不要截断 120 字，出全文」——顶行原只留前 120 字，长句被腰斩）。 */
-const PROGRESS_NOTE_MAX = 0;
+/** 底下**操作行**（📌 进度行 ＋ 工具标签）的单条字数上限。⚠️ 与顶行**分开两个常量**：
+ *  口径是「上面顶行出全文、底下那三条操作行照旧掐字」——同日早些时候那次「一律出全文」把这一路
+ *  也放开了，底下三条被撑成一大段，故此处照旧收回 120 字（工具细节那几个数见 `摘要()`）。 */
+const 操作行_MAX = 120;
+
+/** **顶行**（＝我最新说的那句）的字数上限：**0 ＝ 不掐、出全文**
+ *  （2026-10-25 定「对话框里你的输出不要截断 120 字，出全文」——顶行原只留前 120 字，长句被腰斩）。 */
+const 顶行_MAX = 0;
 
 /** 进度行标记：我（助手）在回合里主动报的一句「正在做什么」。中括号全半角都认。 */
 const 进度标记 = /^[\[【［]\s*进度\s*[\]】］]\s*(.*)$/;
@@ -142,7 +147,7 @@ const 进度标记 = /^[\[【［]\s*进度\s*[\]】］]\s*(.*)$/;
 const 显示工具标签 = process.env.DSH_BOTPLUGIN_PROGRESS_TOOLS !== '0';
 
 /**
- * 从一段助手正文里挑出进度行。入参：正文（可空）。出参：进度文本数组（已去标记、按 PROGRESS_NOTE_MAX 掐——0＝不掐，空行丢掉）。
+ * 从一段助手正文里挑出进度行。入参：正文（可空）。出参：进度文本数组（已去标记、按 操作行_MAX 掐——操作行照旧 120 字，空行丢掉）。
  * 副作用：无。口径：只认 `[进度] …` 这类显式标记——其余正文（含思考）一律不进进度消息。
  */
 export function 挑进度行(text) {
@@ -150,7 +155,7 @@ export function 挑进度行(text) {
     .split('\n')
     .map((行) => 行.trim().match(进度标记))
     .filter(Boolean)
-    .map((m) => truncate(m[1], PROGRESS_NOTE_MAX))
+    .map((m) => truncate(m[1], 操作行_MAX))
     .filter(Boolean);
 }
 
@@ -354,7 +359,7 @@ export class LiveStatus {
    *  连着两条一样的不重复上屏。副作用：排一次进度消息编辑。 */
   addNote(note, 类型 = '工具') {
     if (类型 === '工具' && !显示工具标签) return;
-    const 文本 = truncate(note, PROGRESS_NOTE_MAX);
+    const 文本 = truncate(note, 操作行_MAX);
     if (!文本) return;
     const 行 = 类型 === '进度' ? `📌 ${文本}` : 文本;
     if (this.notes[this.notes.length - 1] === 行) return;
@@ -376,7 +381,7 @@ export class LiveStatus {
    *     （流式 chunk 只走瞬时帧，不进会话事件）；`正文已读` 游标兜住重复送达与前缀重复；
    *   · 代码块（``` / ~~~ 包着的）与空行不占顶行；
    *   · 带 `[进度]` 标记的行走 📌 那条路（进下面的操作区），⛔ 不在顶行重复。
-   * 一句按 PROGRESS_NOTE_MAX 掐（0＝不掐、出全文）。副作用：换了顶行就排一次进度消息编辑。
+   * 顶行一句按 顶行_MAX 掐（0＝不掐、出全文——顶行是「我说的话」，整句露出来）。副作用：换了顶行就排一次进度消息编辑。
    *
    * @param {string} 整段正文
    */
@@ -396,7 +401,7 @@ export class LiveStatus {
       }
       if (this.在代码块里) continue;
       if (进度标记.test(行)) continue;
-      this.最新一句 = truncate(行, PROGRESS_NOTE_MAX);   // 顶行只有一格：新的一句把前一句顶掉
+      this.最新一句 = truncate(行, 顶行_MAX);   // 顶行只有一格：新的一句把前一句顶掉
       换了 = true;
     }
     if (换了) this.#scheduleEdit();
