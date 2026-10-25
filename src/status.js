@@ -57,6 +57,7 @@ const TOOL_LABELS = {
 
 export function truncate(text, max) {
   const value = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!(max > 0)) return value;              // max ≤ 0 ＝ 不掐、出全文（见 PROGRESS_NOTE_MAX）
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
@@ -92,28 +93,28 @@ function 摘要(name, 参) {
   const 首行 = (文) => String(文 ?? '').split('\n').map((x) => x.trim()).filter(Boolean)[0] ?? '';
   switch (name) {
     case 'bash':
-      return truncate(遮口令(首行(参.command ?? 参.cmd)), 90);
+      return truncate(遮口令(首行(参.command ?? 参.cmd)), 0);
     case 'read':
     case 'edit':
     case 'write':
     case 'present':
       return 文件名(参.file_path ?? 参.path);
     case 'glob':
-      return truncate(String(参.pattern ?? ''), 60);
+      return truncate(String(参.pattern ?? ''), 0);
     case 'grep':
-      return truncate(String(参.pattern ?? ''), 60);
+      return truncate(String(参.pattern ?? ''), 0);
     case 'web_search': {
       const 问 = Array.isArray(参.queries) ? 参.queries[0] : 参.query;
-      return truncate(String(问 ?? ''), 60);
+      return truncate(String(问 ?? ''), 0);
     }
     case 'web_fetch':
-      return truncate(String(参.url ?? ''), 80);
+      return truncate(String(参.url ?? ''), 0);
     case 'subagent':
     case 'subagent_fork':
-      return truncate(String(参.description ?? ''), 40);
+      return truncate(String(参.description ?? ''), 0);
     case 'job_output':
     case 'job_kill':
-      return truncate(String(参.job_id ?? ''), 20);
+      return truncate(String(参.job_id ?? ''), 0);
     default:
       return '';
   }
@@ -130,8 +131,9 @@ export function describeTool(name, 入参) {
   return 尾 ? `${标}：${尾}` : 标;
 }
 
-/** 单条进度动态的字数上限。 */
-const PROGRESS_NOTE_MAX = 120;
+/** 单条进度动态与会话顶行的字数上限：**0 ＝ 不掐、出全文**
+ *  （2026-10-25 老板定「对话框里你的输出不要截断 120 字，出全文」——顶行原只留前 120 字，长句被腰斩）。 */
+const PROGRESS_NOTE_MAX = 0;
 
 /** 进度行标记：我（助手）在回合里主动报的一句「正在做什么」。中括号全半角都认。 */
 const 进度标记 = /^[\[【［]\s*进度\s*[\]】］]\s*(.*)$/;
@@ -140,7 +142,7 @@ const 进度标记 = /^[\[【［]\s*进度\s*[\]】］]\s*(.*)$/;
 const 显示工具标签 = process.env.DSH_BOTPLUGIN_PROGRESS_TOOLS !== '0';
 
 /**
- * 从一段助手正文里挑出进度行。入参：正文（可空）。出参：进度文本数组（已去标记、掐到 120 字，空行丢掉）。
+ * 从一段助手正文里挑出进度行。入参：正文（可空）。出参：进度文本数组（已去标记、按 PROGRESS_NOTE_MAX 掐——0＝不掐，空行丢掉）。
  * 副作用：无。口径：只认 `[进度] …` 这类显式标记——其余正文（含思考）一律不进进度消息。
  */
 export function 挑进度行(text) {
@@ -374,7 +376,7 @@ export class LiveStatus {
    *     （流式 chunk 只走瞬时帧，不进会话事件）；`正文已读` 游标兜住重复送达与前缀重复；
    *   · 代码块（``` / ~~~ 包着的）与空行不占顶行；
    *   · 带 `[进度]` 标记的行走 📌 那条路（进下面的操作区），⛔ 不在顶行重复。
-   * 一句掐到 PROGRESS_NOTE_MAX 字。副作用：换了顶行就排一次进度消息编辑。
+   * 一句按 PROGRESS_NOTE_MAX 掐（0＝不掐、出全文）。副作用：换了顶行就排一次进度消息编辑。
    *
    * @param {string} 整段正文
    */
