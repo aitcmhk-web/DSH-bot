@@ -40,7 +40,6 @@ import { createHerdWatchdog, HERD_GROUP_FALLBACK } from './herd.js';
 import { makeMgmtState, mgmtRoundTick, fireMgmtRound, MGMT_CHAT_KEY } from './mgmt-round.js';
 import { progressReportTick } from './progress-report.js';
 import { createTaskTriggers, TRIGGER_CHECK_MS } from './triggers.js';
-import { createFeedbackWatch } from './反馈区.js';
 import { createMailboxWatcher } from './mailbox.js';
 import { createFinalReview } from './final-review.mjs'; // 终审卡：DSH 侧宿主接线
 import { installHardRules } from './hard-rules.js';
@@ -89,14 +88,6 @@ export const Config = Schema.object({
   memoryDir: Schema.string().description('记忆目录（每项目独占）。不填 = 默认 <工作目录>/memory；显式填空串 = 关闭记忆'),
   memoryScript: Schema.string().description('共享的 cache-manager.mjs 路径。不填 = 用插件自带的 vendor/conversation-cache/cache-manager.mjs'),
   restartCommand: Schema.string().description('重启用的启动器 .command 路径。不填 = 自动找工作目录里的 `start.command`（兼容老的「启动-<工作区名>.command」/启动-mybot.command）；找不到且拿不到原始命令行时，/restart 退化为只重开会话'),
-
-  // ---- 反馈区看门狗 ----
-  // 盯几个目录，内容一变就把「📣 反馈区有更新」注入本会话（2026-10-26 加）。
-  // 由来：两边原先靠会话里的 sleep 循环盯反馈区，循环一退出就没人重挂、会永久哑掉。
-  反馈区盯: Schema.array(Schema.object({
-    名称: Schema.string().description('给人看的名字（注入话里用）'),
-    目录: Schema.string().description('盯哪个目录（绝对路径）'),
-  })).default([]).description('反馈区看门狗：配了就开，每 5 分钟扫一次，变了注入本会话。留空 = 不开'),
 
   // ---- 行为 ----
   backlogMaxAgeSeconds: Schema.number().default(2 * 60 * 60)
@@ -2773,26 +2764,6 @@ export function apply(ctx, config) {
     log('[报错箱] 本实例非 master（BOT_ROLE 未设 = 审核模式）—— 报错箱监听不开（归主 bot 实例）');
   }
 
-  // ---- 反馈区看门狗：配了 `反馈区盯` 就开（不认 BOT_ROLE，谁配谁开）----
-  // 与报错箱同一节拍（5 分钟）、同一注入腿；.feedback.lock 选主兜底双实例误配。
-  let feedbackWatcher = null;
-  if (config.反馈区盯?.length) {
-    feedbackWatcher = createFeedbackWatch({
-      dirs: config.反馈区盯,
-      statePath: join(herdDir, '.feedback.state.json'),
-      lockPath: join(herdDir, '.feedback.lock'),
-      intervalMs: TRIGGER_CHECK_MS,
-      inject: (chatId, text) => enqueue(`tg:${chatId}`, () => promptFromHub({ source: 'tg', chatId, text, raw: null })),
-      chatId: () => {
-        const g = groupChatIdFromTable();
-        return g ? Number(g) : state.ownerUserId; // 兜底与 taskTriggers 相同：群 id 缺失时发私聊
-      },
-      log,
-      error,
-    });
-    feedbackWatcher.start();
-  }
-
   // [hb] 心跳只作人工排查用的日志活性信号，不参与保活/判死判定：
   //   互为保活（互相 kickstart）会把健康实例反复勒死，所以不做。
 
@@ -2807,7 +2778,6 @@ export function apply(ctx, config) {
     herd?.stop(); // 看门狗定时器 + .herd.lock + 管理回合拍子 + 汇报巡检拍子（两者均无自有定时器/锁，随 herd 停；非 master 实例未挂 = 空转）
     taskTriggers?.stop(); // 触发器定时器 + .trigger.lock（没 start 过则空转）
     mailboxWatcher?.stop(); // 报错箱 watch + 保险巡检 + .mailbox.lock（没 start 过则空转）
-    feedbackWatcher?.stop(); // 反馈区巡检 + .feedback.lock（没配 `反馈区盯` 则空转）
     approvalBridge?.dispose();
     pollAbort?.abort();
     wxAbort?.abort();
