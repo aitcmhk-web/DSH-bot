@@ -56,10 +56,10 @@
 dsh plugin --profile mybot add file:/绝对路径/dsh-botplugin
 ```
 
-例如源码在 `~/DSH/BOT/botplugin`：
+例如源码在 `~/DSH/botplugin`：
 
 ```
-dsh plugin --profile mybot add file:$HOME/DSH/BOT/botplugin
+dsh plugin --profile mybot add file:$HOME/DSH/botplugin
 ```
 
 > ⚠️ `file:` 后面**不能写 `~`** —— 它不会展开波浪号，会当成字面路径找不到。用 `$HOME/` 或完整绝对路径。
