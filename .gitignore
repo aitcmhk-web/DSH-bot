@@ -9,6 +9,7 @@ weixin-account.json
 .DS_Store
 *.bak.*
 .backups/
+.备份/
 probe-resolution.mjs
 test-telegram-parity.mjs
 .staging/
