@@ -2198,9 +2198,37 @@ export function apply(ctx, config) {
     if (allowWx && fromUserId !== allowWx) return;
 
     const text = extractWxText(message);
-    if (!text) return;
+    const imageItem = extractWxImage(message);
+    // 纯图片没有文字，从前在这里整条丢掉；现在有图就往下走。
+    if (!text && !imageItem) return;
 
-    await hub.inbound(makeMessage({ source: 'wx', chatId: fromUserId, text, raw: message }));
+    const blocks = [];
+    if (text) blocks.push({ type: 'text', text });
+    if (imageItem) {
+      try {
+        const 图 = await weixin.getImage(imageItem);
+        blocks.push({
+          type: 'image',
+          data: 图.data.toString('base64'),
+          mediaType: 图.mediaType,
+        });
+      } catch (err) {
+        error(`微信图片下载失败: ${err.message}`);
+        // 纯图片失败要回一句，否则用户只看到没反应；带文字的照常把文字送下去。
+        if (!text) {
+          await weixin.sendText(fromUserId, '图片没收到，请再发一次。', message.context_token)
+            .catch((e) => error(`微信图片失败提示发送失败: ${e.message}`));
+          return;
+        }
+      }
+    }
+
+    await hub.inbound(makeMessage({
+      source: 'wx',
+      chatId: fromUserId,
+      text: text || '[图片]',
+      raw: { blocks },
+    }));
   }
 
   /** 取微信消息的正文：优先文字 item，其次服务端已转好的语音文字。 */
@@ -2211,6 +2239,11 @@ export function apply(ctx, config) {
     // 微信 iLink 服务端已经做了语音转文字，结果在 voice_item.text
     const voiceItem = items.find((it) => it?.type === 3);
     return voiceItem?.voice_item?.text ?? null;
+  }
+
+  /** 取微信图片 item；没有就回 null。 */
+  function extractWxImage(message) {
+    return (message?.item_list ?? []).find((it) => it?.type === 2) ?? null;
   }
 
   // -------------------------------------------------------------------------

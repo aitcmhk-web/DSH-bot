@@ -12,9 +12,10 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createDecipheriv, randomUUID } from 'node:crypto';
 
 const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com';
+const DEFAULT_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 
 // 与官方 openclaw-weixin@2.4.8 对齐的报头。
 const CHANNEL_VERSION = '2.4.8';
@@ -54,6 +55,25 @@ export function extractVoiceText(message) {
 /** 判断一条消息是否来自用户（message_type=1 表示 USER）。 */
 export function isUserMessage(message) {
   return message?.message_type === 1;
+}
+
+/** 图片 AES key：兼容 base64(16 字节) 与 base64(32 位十六进制串) 两种。 */
+function 解图片钥匙(钥, 标签) {
+  const 解 = Buffer.from(String(钥 || ''), 'base64');
+  if (解.length === 16) return 解;
+  if (解.length === 32 && /^[0-9a-fA-F]{32}$/.test(解.toString('ascii'))) {
+    return Buffer.from(解.toString('ascii'), 'hex');
+  }
+  throw new Error(`${标签}: aes_key 不是 16 字节或 32 位十六进制`);
+}
+
+/** 按文件头认图片类型；认不出按 JPEG，交给上层模型兜底。 */
+function 认图片类型(buf) {
+  if (buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.length >= 6 && buf.subarray(0, 3).toString('ascii') === 'GIF') return 'image/gif';
+  if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  return 'image/jpeg';
 }
 
 /**
@@ -257,6 +277,38 @@ export class Weixin {
       }),
       'sendTyping',
     );
+  }
+
+  /**
+   * 下载并解密一条图片消息。入参：`image_item`（或含它的 item）。
+   * 出参：{ data: Buffer, mediaType: string }。副作用：一次 CDN 下载；失败抛错。
+   */
+  async getImage(item) {
+    const 图 = item?.image_item ?? item;
+    const 媒 = 图?.media ?? null;
+    if (!媒 || (!媒.encrypt_query_param && !媒.full_url)) {
+      throw new Error('图片消息没有 CDN 地址');
+    }
+    // `aeskey` 是十六进制，`media.aes_key` 是 base64；统一成 base64 再解。
+    const 钥 = 图.aeskey
+      ? Buffer.from(String(图.aeskey), 'hex').toString('base64')
+      : 媒.aes_key;
+    if (!钥) throw new Error('图片消息没有解密钥匙');
+    const 址 = 媒.full_url
+      || `${DEFAULT_CDN_BASE_URL}/download?encrypted_query_param=${encodeURIComponent(媒.encrypt_query_param)}`;
+    const r = await fetch(址, { signal: AbortSignal.timeout(30_000) });
+    if (!r.ok) throw new Error(`图片 CDN 下载失败 HTTP ${r.status}`);
+    const 密 = Buffer.from(await r.arrayBuffer());
+    if (密.length > 20 * 1024 * 1024) throw new Error('图片超过 20MB');
+    let 明;
+    try {
+      const 解 = createDecipheriv('aes-128-ecb', 解图片钥匙(钥, '图片'), null);
+      明 = Buffer.concat([解.update(密), 解.final()]);
+    } catch (e) {
+      throw new Error(`图片解密失败：${e.message}`);
+    }
+    if (!明.length) throw new Error('图片解密后是空的');
+    return { data: 明, mediaType: 认图片类型(明) };
   }
 
   /**
