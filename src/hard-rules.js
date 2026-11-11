@@ -177,10 +177,12 @@ const RESULT_RULES = [
 const COMMAND_RULES = [
   {
     id: 'suicide',
-    label: './bot.sh stop|restart',
-    test: (c) => /\bbot\.sh\s+(stop|restart)\b/.test(c),
+    label: '自启 / 自杀',
+    test: (c) =>
+      /\bbot\.sh\s+(stop|restart)\b/.test(c) ||
+      /\b(?:kickstart|bootout|bootstrap)\b[^\n]*com\.local\.dshbot\.dshbot/.test(c),
     lessons: [8],
-    hint: '⛔ 自杀禁令：在 bot 自己的会话里跑 stop / restart 会把自己杀掉 —— 换 Telegram 菜单 `/restart`，或双击 `重启.command`。',
+    hint: '⛔ 不许自启：在自己会话里停／重启本进程会把自己杀掉，旧的长轮询还没断、新的立刻起 → Telegram 409。要重启等主人发话，由主人在外部发起。',
   },
   {
     id: 'force-push',
