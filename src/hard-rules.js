@@ -182,7 +182,7 @@ const COMMAND_RULES = [
       /\bbot\.sh\s+(stop|restart)\b/.test(c) ||
       /\b(?:kickstart|bootout|bootstrap)\b[^\n]*com\.local\.dshbot\.dshbot/.test(c),
     lessons: [8],
-    hint: '⛔ 不许自启：在自己会话里停／重启本进程会把自己杀掉，旧的长轮询还没断、新的立刻起 → Telegram 409。要重启等主人发话，由主人在外部发起。',
+    hint: '⛔ 不许自启：在自己会话里 stop／restart 等于自杀（旧的长轮询没断、新的就起 → Telegram 409）。要重启只提醒主人：请他从 TG 菜单点 `/restart`，或双击 `重启.command`。',
   },
   {
     id: 'force-push',
