@@ -4,12 +4,13 @@
  * 建会话、投递消息、把回答转成事件，全部通过宿主的 `ctx.agents` 服务完成
  * （调用顺序与官方 dsh-sdk-jsonrpc-server 一致）。
  *
- * 切模型：模型在 agents.create({agentOptions}) 时定死，宿主接口只提供
- * resume(resumeSessionId) 续已持久化的会话，没有「给活着的 agent 换模型」，
- * 因此切档 = dispose 旧句柄 → 用同一个会话 ID 重建。
- * dispose 只关句柄、不删日志（persistence 对 session/disposed 只做最后冲刷），
- * 所以重建时 create 抛 already exists → 走 resume：完整历史回放给新模型接着聊，
- * 上下文跨档保留；handoff 只是记忆兜底，不是衔接必需。
+ * 切模型：会话当前用哪档记在会话日志里（`model/selection` 事件），宿主装配请求时
+ * 先认这条记录，agentOptions 只是兜底。所以切档 = 往活会话追加一条 `model/selection`，
+ * 下一条请求就用新档，句柄与历史都不动（见 {@link BotRuntime#switchRoute}）。
+ * 反过来「关句柄 + resume」只会沿用日志里记的旧档 —— v1.1.11 就是这么切的，切了等于没切。
+ * dispose 仍用于 /new、/restart 这类真要换会话的场景：它只关句柄、不删日志
+ * （persistence 对 session/disposed 只做最后冲刷），所以重建时 create 抛
+ * already exists → resume 回放历史；handoff 只是记忆兜底，不是衔接必需。
  *
  * 会话 id：`/new` 必须真的换一个新 id。若沿用固定的 `botplugin:<chatKey>`，
  * `/new` 只关句柄，下一条消息 create 又撞 `already exists` → resume 回同一份
@@ -279,22 +280,43 @@ export class BotRuntime {
   }
 
   /**
-   * 切档位：关掉这个 chat 的旧句柄，按新档位重建同一会话。
+   * 切档位：往当前会话追加一条 `model/selection`，下一条请求即用新档。
    *
-   * ⚠️ 宿主没有「给活着的 agent 换模型」，只能走 dispose → 重建；
-   *    重建会命中 already exists → resume，历史保留、新模型接着聊（见文件头）。
-   *    dispose 失败也必须重建：旧句柄还挂在登记里就照投旧模型（2026-11-15 实测缺陷）。
+   * 宿主装配请求时读的就是这条事件（恢复会话后照样读得到），所以不关句柄、
+   * 不重建、历史不动。重建 + resume 会把日志里记的旧档抬回来，切了等于没切。
+   * 老宿主没有 `session.append` 时才退回 dispose → 重建（兜底，模型可能仍是旧的）。
    *
    * @param {string} chatKey
    * @param {{provider:string, model:string, reasoningEffort?:string}} route
+   * @returns {Promise<{ok:true, route:object} | {ok:false, error:string}>}
    */
   async switchRoute(chatKey, route) {
     this.#defaultRoute = route;
     const rec = this.#sessions.get(chatKey);
-    if (rec) {
-      this.#sessions.delete(chatKey);
-      await this.#dispose(chatKey, rec);
+    if (!rec) return { ok: true, route };
+
+    const effort = normalizeEffort(route.reasoningEffort);
+    const selection = {
+      provider: route.provider,
+      model: route.model,
+      ...(effort === undefined ? {} : { reasoningEffort: effort }),
+    };
+    if (typeof rec.handle?.agent?.session?.append === 'function') {
+      try {
+        rec.handle.agent.session.append('model/selection', selection);
+        rec.routeKey = route.key ?? null;
+        log(`switch model for ${chatKey} → ${selection.provider}/${selection.model}（session/append）`);
+        return { ok: true, route };
+      } catch (err) {
+        // 追加失败只降级，不把切档整个判死：下面重建至少还能跑起来。
+        logErr(`model/selection append failed for ${chatKey}: ${err.message}`);
+      }
     }
+    // 兜底：老宿主没有 session.append —— 关句柄重建。模型可能仍沿用旧档，
+    // 至少保证切档后还有会话可用；日志里带「rebuild」便于区分。
+    log(`switch model for ${chatKey} → ${route.provider}/${route.model}（rebuild 兜底）`);
+    this.#sessions.delete(chatKey);
+    await this.#dispose(chatKey, rec);
     // 直走 #create：此时若登记又被填回（并发 ensure），不能复用旧模型的活句柄——
     // 本方法刚设的默认档必须真的建出来。等同一 chat 在途的创建完成再重建。
     const pending = this.#creating.get(chatKey);

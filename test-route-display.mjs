@@ -109,7 +109,9 @@ await new Promise((r) => tg.listen(TG_PORT, '127.0.0.1', r));
 const sessionListeners = [];
 let createdCount = 0;
 let billingFailNext = false;
-const agent = { id: 'botplugin:tg:4242' };
+// 假会话：切档时插件会往它身上追加 model/selection —— 记下来供断言。
+const session = { id: 'botplugin:tg:4242', events: [], append(type, data) { this.events.push({ type, data }); } };
+const agent = { id: 'botplugin:tg:4242', session };
 agent.followup = () => {
   setTimeout(() => {
     for (const fn of sessionListeners) {
@@ -305,13 +307,15 @@ ok(
   `连续刷新后 /status 不被默认档冲回（实际：${modelLine2}）`,
 );
 
-// ── 场景 6：切换必须真的落到会话上（显示对了不能是"只改显示"）────────────
-//    断言取 runtime 真实建会话时打的日志行 —— 直接看它换没换 provider/model，
-//    比数 create() 次数可靠：假 agent 的 id 是固定的，不会因为切档位就多建一个。
-const sessionLines = logs.filter((l) => l.includes('session created for'));
+// ── 场景 6：切完档，第一条消息必须按新档建会话（不能只改显示）────────────
+//    没有活会话时切档只记默认档、不白建一个；断言落在下一条消息真建出来的档上。
+const sessionMark = logs.filter((l) => l.includes('session created for')).length;
+updateQueue.push(userMsg(60, '你好'));
+await wait(600);
+const sessionLines = logs.filter((l) => l.includes('session created for')).slice(sessionMark);
 ok(
   sessionLines.some((l) => l.includes('zhipu/glm-4.7-flash')),
-  `⭐ 切换真的把会话建到了 glm-4.7-flash 上（实际日志：${JSON.stringify(sessionLines)}）`,
+  `⭐ 切档后第一条消息按新档建会话（实际日志：${JSON.stringify(sessionLines)}）`,
 );
 
 // ── 场景 6b：欠费必须自动跳到下一个档 ──────────────────────────────────
@@ -339,9 +343,10 @@ ok(
   `⭐⭐ 不再是干巴巴一句报错（实际：${JSON.stringify(failoverMsgs)}）`,
 );
 const afterSessionCount = logs.filter((l) => l.includes('session created for')).length;
+const appendedSwitches = session.events.filter((e) => e.type === 'model/selection');
 ok(
-  afterSessionCount > beforeSessionCount,
-  `⭐⭐ 换档真的重建了会话（重试前 ${beforeSessionCount} 次 → 重试后 ${afterSessionCount} 次）`,
+  afterSessionCount > beforeSessionCount || appendedSwitches.length > 0,
+  `⭐⭐ 换档真的落到会话上（重建 ${beforeSessionCount}→${afterSessionCount}，追加 ${appendedSwitches.length} 条）`,
 );
 ok(
   logs.some((l) => l.includes('自动切到')),

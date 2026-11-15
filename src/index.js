@@ -1999,8 +1999,8 @@ export function apply(ctx, config) {
           return true;
         }
         await reply(`⏳ 正在切换到「${wanted.label}」…`);
-        // 切模型 = 重建句柄并 resume 同一会话（历史保留、新模型接着聊），handoff 照写作记忆兜底：
-        // 本次会话 ≥20 条才写，调试期间反复切模型不会覆盖已有记忆。
+        // 切模型 = 往会话日志追加 model/selection（不重建、历史不动，下一条请求即用新档）；
+        // handoff 照写作记忆兜底：本次会话 ≥20 条才写，调试期间反复切模型不会覆盖已有记忆。
         if (memory) {
           memory.maybeWriteHandoff({
             sessionId: runtime.sessionIdOf(chatKey) ?? chatKey,

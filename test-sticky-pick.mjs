@@ -101,7 +101,7 @@ async function runScenario({ port, providers, label, pickKey }) {
     failed++;
     return { modelLine: '(子进程失败)', label };
   }
-  return { modelLine: payload.modelLine, afterPick: payload.afterPick, error: payload.error, label };
+  return { modelLine: payload.modelLine, afterPick: payload.afterPick, switch: payload.switch, error: payload.error, label };
 }
 
 /** 把 providers 对象渲染成 patch 的极简 YAML（只要插件解析得出来即可）。 */
@@ -202,6 +202,15 @@ function renderPatch(providers) {
     ok(
       readState()?.hostPickedKey === 'zhipu:glm-5.3-flash',
       `${r.label} → 记忆位跟着手点改写（实际：${JSON.stringify(readState())}）`,
+    );
+    // 真修没修到模型，就看这两条：切档不许再重建，且必须往会话里落下新档。
+    ok(
+      r.switch?.creates === 1 && r.switch?.resumes === 0,
+      `${r.label} → 切档没有重建会话（create=${r.switch?.creates} resume=${r.switch?.resumes}）`,
+    );
+    ok(
+      r.switch?.picked?.model === 'glm-5.3-flash',
+      `${r.label} → 会话里落下了新档（实际：${JSON.stringify(r.switch?.picked)}）`,
     );
   }
 }

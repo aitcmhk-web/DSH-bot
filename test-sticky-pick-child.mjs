@@ -50,7 +50,15 @@ const tg = createServer(async (req, res) => {
 await new Promise((r) => tg.listen(port, '127.0.0.1', r));
 
 const sessionListeners = [];
-const agent = { id: 'botplugin:tg:4242' };
+// 假会话：插件切档时会往它身上追加 model/selection —— 记录事件，供断言用。
+const session = {
+  id: 'botplugin:tg:4242',
+  events: [],
+  append(type, data) {
+    this.events.push({ type, data });
+  },
+};
+const agent = { id: 'botplugin:tg:4242', session };
 agent.followup = () => {
   setTimeout(() => {
     for (const fn of sessionListeners) {
@@ -70,8 +78,20 @@ const llmService = {
   //   （内置 ds 档现在只照 web 端声明出，看 test-menu-web-follow.mjs）。
   listModels: async () => [],
 };
+// 记录建/恢复次数：切档若还在重建，这两个数会变 —— 断言就盯它。
+let creates = 0;
+let resumes = 0;
 const ctx = {
-  agents: { create: async () => ({ agent }) },
+  agents: {
+    create: async () => {
+      creates += 1;
+      return { agent };
+    },
+    resume: async () => {
+      resumes += 1;
+      return { agent };
+    },
+  },
   get: (name) => (name === 'settings' ? settingsService : name === 'llm' ? llmService : undefined),
   on: () => {},
 };
@@ -112,6 +132,17 @@ const modelLine = text0.split('\n').find((l) => l.startsWith('模型:')) ?? `(�
 const pickKey = process.argv[4];
 let afterPick = null;
 if (pickKey) {
+  // 先真发一句话，把会话建出来 —— 只有活着的会话才谈得上「切档」，
+  //   没有会话时切档只是记默认档，测不出重建那个 bug。
+  updateQueue.push({
+    update_id: 80,
+    message: { message_id: 80, from: { id: 101 }, chat: { id: 101 }, text: '你好' },
+  });
+  const d0 = Date.now() + 4000;
+  while (Date.now() < d0) {
+    if (creates > 0) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
   // ⚠️ `/status` 是纯文本，不带按钮 —— 要先发 `/model` 才会拿到可选档位菜单。
   sent.length = 0;
   updateQueue.push({
@@ -165,5 +196,6 @@ if (pickKey) {
 console.log = realLog;
 tg.close();
 
-process.stdout.write(JSON.stringify({ modelLine, afterPick }) + '\n');
+const picked = session.events.filter((e) => e.type === 'model/selection').pop()?.data ?? null;
+process.stdout.write(JSON.stringify({ modelLine, afterPick, switch: { creates, resumes, picked } }) + '\n');
 process.exit(0);
