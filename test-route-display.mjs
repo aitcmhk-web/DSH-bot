@@ -15,9 +15,17 @@
  */
 
 import { createServer } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// ⚠️ 档位表优先读 `${DSH_HOME:-$HOME/.dsh}/profiles/web/cordis.patch.yml`（src/web-patch.js）：
+//    不隔离就吃到真机配置，假宿主的 zhipu 两档被顶掉，断言全错位。
+process.env.HOME = mkdtempSync(join(tmpdir(), 'botplugin-routedisplay-home-'));
+delete process.env.DSH_HOME; // webPatchPath 先认 DSH_HOME，只改 HOME 挡不住
+// ⚠️ 关掉启动时的「web→本 profile」自愈同步（src/model-sync.js:207）：
+//    开着它会扫描真 ~/.dsh/profiles/*/node_modules 并把 web 模型块写进真机 profile。
+process.env.MODELSYNC_DISABLE = '1';
 
 let failed = 0;
 // ⚠️ 走 stderr：本测试会临时接管 console.log 来收插件日志，用 console.log 报结果
@@ -105,8 +113,12 @@ const agent = { id: 'botplugin:tg:4242' };
 agent.followup = () => {
   setTimeout(() => {
     for (const fn of sessionListeners) {
-      // 欠费闸门：打开时这一轮以「余额不足」失败，用来验自动换档。
+      // 欠费闸门：true/'once' = 本轮以「余额不足」失败；'once' 只挡第一轮
+      //    （标志在这里就地关掉，验自动换档后的重试轮能正常收）。
       if (billingFailNext) {
+        const failThisTurn = billingFailNext === true || billingFailNext === 'once';
+        if (billingFailNext === 'once') billingFailNext = false;
+        if (failThisTurn) {
         fn(
           { id: agent.id },
           {
@@ -117,6 +129,7 @@ agent.followup = () => {
           },
         );
         return;
+        }
       }
       fn({ id: agent.id }, { type: 'turn/end', data: { reason: 'completed' } });
     }
@@ -309,7 +322,9 @@ ok(
 //       不是"代码里有没有那段逻辑"。
 const beforeFailover = sent.length;
 const beforeSessionCount = logs.filter((l) => l.includes('session created for')).length;
-billingFailNext = true;
+// 闸门只挡第一轮：failover 循环在几毫秒内就重发第二轮，
+//    旧写法 `billingFailNext=false` 排在 wait(1200) 之后，重试也被打成欠费 → 断言必挂。
+billingFailNext = 'once';
 updateQueue.push(userMsg(102, '这笔多少钱？'));
 await wait(1200);
 billingFailNext = false;

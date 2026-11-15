@@ -76,7 +76,15 @@ async function runScenario({ port, providers, label, pickKey }) {
   const args = [runner.pathname, String(port), label];
   if (pickKey) args.push(pickKey);
   const r = spawnSync(process.execPath, args, {
-    env: { ...process.env, HOME: home, BOTPLUGIN_TEST_CWD: WORKDIR },
+    // ⚠️ 只改 HOME 不够：webPatchPath/model-sync 先认 DSH_HOME（本机 shell 常导出它），
+    //    且启动自愈同步会把真机 web 块写进真 profile —— 两个都得挡。
+    env: {
+      ...process.env,
+      HOME: home,
+      DSH_HOME: '',
+      MODELSYNC_DISABLE: '1',
+      BOTPLUGIN_TEST_CWD: WORKDIR,
+    },
     encoding: 'utf8',
   });
   rmSync(home, { recursive: true, force: true });

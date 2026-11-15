@@ -783,7 +783,11 @@ export function apply(ctx, config) {
     return { list, defaultKey };
   };
   /** 每次派发前刷新（web 端加减模型/换默认，下一条消息就生效）。 */
-  const refreshHostRoute = async () => {
+  /**
+   * @param {string} [chatKey] 派发口的会话标识：传了才判「该 chat 有活动会话」，
+   *   不传（挂载//status//菜单）只按记忆位与默认档刷新。
+   */
+  const refreshHostRoute = async (chatKey) => {
     if (!useHostRoutes) return activeRoute;
     const table = await hostModelTable();
     // 记忆位最先判、且无条件生效：
@@ -794,10 +798,20 @@ export function apply(ctx, config) {
       const inTable = table.list.find((r) => r.key === hostPickedKey);
       // 表里没有，但本轮运行里它已经解析好了（上一次刷新就建好了）→ 沿用，别丢。
       const alreadyResolved = activeRoute?.key === hostPickedKey ? activeRoute : null;
-      // 表里没有、且本轮还没解析过它 —— 必须自己把档位重建出来，
-      //    否则 activeRoute = null，用户手选的档位在重启后等于凭空消失
-      //    （表现就是「重启又回第一档 / 显示(未配置)」）。
-      //    routeFromPickedKey 就是这步重建；漏了它，本函数会从「回第一档」变成「没有档」。
+      // ⚠️ 这个 chat 的会话还活着时，⛔ 不许拿记忆位盖回 activeRoute：
+      //    /model 刚切过档、句柄已按新档重建，下一条消息前若照旧记忆刷新，
+      //    会把在用档盖回去——切换当场显示成功、实际照旧跑（2026-11-15 实测缺陷）。
+      //    只在派发口判（传了 chatKey）；挂载//status//菜单那几处没有指定 chat，照旧走记忆位。
+      const liveSid = chatKey ? runtime?.sessionIdOf(chatKey) : null;
+      if (liveSid && activeRoute && activeRoute.key !== hostPickedKey) {
+        // 会话在用、档位与记忆不一致 ⇒ 以在用档为准，并把记忆对齐过去
+        //   （用户在菜单里点的选择就是最新意愿，旧记忆不该再反过来盖它）。
+        rememberPickedKey(activeRoute.key);
+        runtime?.setDefaultRoute(activeRoute);
+        return activeRoute;
+      }
+      // 没有活动会话（重启后/新会话）才用记忆位；表里没有且本轮也没解析过，
+      //    必须 routeFromPickedKey 重建，否则 activeRoute=null、手选档位凭空消失。
       activeRoute = inTable ?? alreadyResolved ?? routeFromPickedKey(hostPickedKey, activeRoute);
       runtime?.setDefaultRoute(activeRoute);
       return activeRoute;
@@ -1264,8 +1278,9 @@ export function apply(ctx, config) {
     if (!sessionCreatedAt.has(chatKey)) sessionCreatedAt.set(chatKey, Date.now());
     memory?.ledgerRecord('user', text, chatKey);
 
-    // 宿主模式下先刷新默认档 —— web 端加减模型/换默认，下一条消息就生效。
-    await refreshHostRoute();
+    // 宿主模式下先刷新档位 —— web 端加减模型/换默认，下一条消息就生效；
+    //    带 chatKey：这个 chat 会话在用且刚切过档时，⛔ 拿旧记忆盖回在用档。
+    await refreshHostRoute(chatKey);
 
     const ep = msg.source === 'tg' ? tgEndpoint : wxEndpoint;
 
@@ -1886,7 +1901,8 @@ export function apply(ctx, config) {
         const sid = runtime.sessionIdOf(chatKey);
         const createdAt = sessionCreatedAt.get(chatKey) ?? 0;
         const ageMinutes = createdAt ? Math.round((Date.now() - createdAt) / 60000) : null;
-        const current = useHostRoutes ? await refreshHostRoute() : activeRoute;
+        // 带 chatKey：显示的「模型」跟着这个 chat 的在用档走，⛔ 被旧记忆位拉回。
+        const current = useHostRoutes ? await refreshHostRoute(chatKey) : activeRoute;
         const effort = current ? reasoningEffortFor(current, undefined) : undefined;
         const effortText = effort === 'off' ? ' (思考已关闭)' : effort ? ` (思考强度 ${effort})` : '';
         const lines = [
@@ -1905,7 +1921,9 @@ export function apply(ctx, config) {
       case '/model': {
         // 宿主模式下实时重建表单：web 端刚加的模型立刻能看到。
         const table = useHostRoutes ? await hostModelTable() : { list: routeList };
-        const current = useHostRoutes ? await refreshHostRoute() : activeRoute;
+        // 带 chatKey：✅ 标记与「当前已经是」判定跟着这个 chat 的在用档走，
+        //    ⛔ 被旧记忆位拉回（否则切完再开菜单，✅ 还指着旧档）。
+        const current = useHostRoutes ? await refreshHostRoute(chatKey) : activeRoute;
         const picks = table.list;
         if (!arg) {
           if (source === 'tg') {

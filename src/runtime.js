@@ -283,6 +283,7 @@ export class BotRuntime {
    *
    * ⚠️ 宿主没有「给活着的 agent 换模型」，只能走 dispose → 重建；
    *    重建会命中 already exists → resume，历史保留、新模型接着聊（见文件头）。
+   *    dispose 失败也必须重建：旧句柄还挂在登记里就照投旧模型（2026-11-15 实测缺陷）。
    *
    * @param {string} chatKey
    * @param {{provider:string, model:string, reasoningEffort?:string}} route
@@ -294,7 +295,18 @@ export class BotRuntime {
       this.#sessions.delete(chatKey);
       await this.#dispose(chatKey, rec);
     }
-    const next = await this.#ensureSession(chatKey);
+    // 直走 #create：此时若登记又被填回（并发 ensure），不能复用旧模型的活句柄——
+    // 本方法刚设的默认档必须真的建出来。等同一 chat 在途的创建完成再重建。
+    const pending = this.#creating.get(chatKey);
+    if (pending) await pending.catch(() => {});
+    const task = this.#create(chatKey);
+    this.#creating.set(chatKey, task);
+    let next;
+    try {
+      next = await task;
+    } finally {
+      this.#creating.delete(chatKey);
+    }
     return next.ok
       ? { ok: true, route }
       : next;

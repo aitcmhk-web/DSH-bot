@@ -24,7 +24,12 @@ import { join } from 'node:path';
 
 /** web profile 的 patch（web 端「设置 → 模型」实际写的那份）。 */
 export function webPatchPath() {
-  return join(homedir(), '.dsh', 'profiles', 'web', 'cordis.patch.yml');
+  // 与 model-sync.js 同一套根：DSH_HOME ＞ HOME ＞ homedir()。
+  //    ⛔ 直接读 homedir() 会让集成测试吃到真机 ~/.dsh 配置（实测假宿主的
+  //    zhipu 档位被真机 opencode-go 顶掉）。
+  const env = process.env;
+  const root = env.DSH_HOME || (env.HOME ? join(env.HOME, '.dsh') : null);
+  return join(root ?? join(homedir(), '.dsh'), 'profiles', 'web', 'cordis.patch.yml');
 }
 
 // ── 极简 YAML 读取（与 BOT/sync-from-web.mjs:98 同源，保持同构）────────────
