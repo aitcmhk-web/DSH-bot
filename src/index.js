@@ -39,6 +39,7 @@ import { installApprovalBridge } from './approval-bridge.js';
 import { createHerdWatchdog, HERD_GROUP_FALLBACK } from './herd.js';
 import { makeMgmtState, mgmtRoundTick, fireMgmtRound, MGMT_CHAT_KEY } from './mgmt-round.js';
 import { progressReportTick } from './progress-report.js';
+import { runSetupdshUpgrade, isSetupdshRunning } from './setupdsh-progress.js';
 import { createTaskTriggers, TRIGGER_CHECK_MS } from './triggers.js';
 import { createFeedbackWatch } from './反馈区.js';
 import { createMailboxWatcher } from './mailbox.js';
@@ -2100,22 +2101,18 @@ export function apply(ctx, config) {
       case '/setupdsh': {
         // 升级 DSH + bot（调用 setupdsh.sh）
         const helper = join(dirname(fileURLToPath(import.meta.url)), '..', 'setupdsh-helper.sh');
-        if (existsSync(helper)) {
-          // 先 spawn 再回执：回执若写死走 telegram.sendMessage(chatId)，
-          //    微信入站时 chatId 是微信用户 id → 必报 chat not found，
-          //    异常又发生在 spawn 之前 → 升级脚本根本没被拉起。
-          //    所以回执走 reply（微信走微信、TG 走 TG），且失败只当没回执，不挡升级。
-          const child = spawn('bash', [helper], {
-            detached: true,
-            stdio: 'ignore',
-            env: { ...process.env },
-          });
-          child.on('error', (err) => error(`setupdsh 升级脚本拉起失败: ${err.message}`));
-          child.unref();
-          await reply('⬆️ 正在启动 SetupDSH&BOT 升级…').catch(() => {});
+        if (!existsSync(helper)) {
+          await reply('⚠️ 未找到 setupdsh-helper.sh，无法执行升级。').catch(() => {});
           return true;
         }
-        await reply('⚠️ 未找到 setupdsh-helper.sh，无法执行升级。').catch(() => {});
+        if (isSetupdshRunning()) {
+          await reply('⚠️ 升级已在进行中，请等它结束。').catch(() => {});
+          return true;
+        }
+        // 后台跑升级，只回三条状态；不能 await，否则升级会卡住消息轮询。
+        void runSetupdshUpgrade({ helper, reply, log, error }).catch((err) => {
+          error(`setupdsh 升级进度上报失败: ${err?.message ?? err}`);
+        });
         return true;
       }
 
