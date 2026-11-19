@@ -189,7 +189,7 @@ const COMMAND_RULES = [
       /\bnohup\b[^\n]*\bdsh\b[^\n]*--profile\s+dshbot/.test(c),
     lessons: [8],
     hint: '⛔ 不许自启：在自己会话里 stop／restart 等于自杀（旧的长轮询没断、新的就起 → Telegram 409）。要重启只提醒主人：请他从 TG 菜单点 `/restart`，或双击 `重启.command`。',
-    ask: '⛔ 这是「把自己杀掉再拉起」的命令。重启只能由主人在外部发起（TG 菜单 /restart 或双击 重启.command）；点允许＝真会把自己干掉。',
+    deny: '拒绝：这是「把自己杀掉再拉起」的命令，模型无权执行，也不设审批。重启只能由主人在外部发起（TG 菜单 /restart 或双击 重启.command）。',
   },
   {
     id: 'force-push',
@@ -414,16 +414,18 @@ export function installHardRules(ctx, config = {}) {
   //    根 ctx 通常收得到，但被挂到不相关 scope 下就会漏。
   //    waterfall 在第一个返回决定值的监听者处终止；同一步 / 同一次调用的重复挂载用对象身份去重。
   /**
-   * 事前闸：挂在 `tools/pre-execute` —— 自杀 / 自启类命令执行前先要一次许可；
-   * 没有审批通道时框架按失败关闭处理。重启只能由主人在外部发起。
+   * 事前闸：挂在 `tools/pre-execute` —— 自杀 / 自启类命令直接拒绝（deny），
+   * 不弹审批卡：模型本来就不该杀自己，没有「允许」这一档。
+   * 带 `ask` 的规则仍走审批；重启只能由主人在外部发起。
    */
   const askGate = (exec, next) => {
     const toolName = String(exec?.name ?? '');
     const 入参 = toolName === 'bash' ? String(exec?.arguments?.command ?? exec?.arguments?.cmd ?? '') : '';
     if (!入参) return next();
-    const hit = COMMAND_RULES.find((rule) => rule.ask && rule.test(入参, toolName));
+    const hit = COMMAND_RULES.find((rule) => (rule.deny || rule.ask) && rule.test(入参, toolName));
     if (!hit) return next();
     count(`gate:${hit.id}`);
+    if (hit.deny) return { kind: 'deny', reason: hit.deny };
     return { kind: 'ask', reason: hit.ask };
   };
 
