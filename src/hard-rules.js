@@ -179,10 +179,17 @@ const COMMAND_RULES = [
     id: 'suicide',
     label: '自启 / 自杀',
     test: (c) =>
-      /\bbot\.sh\s+(stop|restart)\b/.test(c) ||
-      /\b(?:kickstart|bootout|bootstrap)\b[^\n]*com\.local\.dshbot\.dshbot/.test(c),
+      /\bbot\.sh\s+(stop|restart|start)\b/.test(c) ||
+      /botctl\.sh\s+(stop|restart|start)\b/.test(c) ||
+      /\b(?:restart|start|stop)\.command\b/.test(c) ||
+      /(?:重启|启动|停止)\.command/.test(c) ||
+      /restart-helper\.sh/.test(c) ||
+      /\blaunchctl\s+(?:kickstart|bootout|bootstrap|unload|load)\b[^\n]*com\.local\.dshbot/.test(c) ||
+      /\b(?:pkill|killall)\b[^\n]*\bdsh\b/.test(c) ||
+      /\bnohup\b[^\n]*\bdsh\b[^\n]*--profile\s+dshbot/.test(c),
     lessons: [8],
     hint: '⛔ 不许自启：在自己会话里 stop／restart 等于自杀（旧的长轮询没断、新的就起 → Telegram 409）。要重启只提醒主人：请他从 TG 菜单点 `/restart`，或双击 `重启.command`。',
+    ask: '⛔ 这是「把自己杀掉再拉起」的命令。重启只能由主人在外部发起（TG 菜单 /restart 或双击 重启.command）；点允许＝真会把自己干掉。',
   },
   {
     id: 'force-push',
@@ -406,6 +413,20 @@ export function installHardRules(ctx, config = {}) {
   // ⚠️ 两个事件都挂两份（ctx + ctx.root）—— 它们都是 agent 作用域事件，
   //    根 ctx 通常收得到，但被挂到不相关 scope 下就会漏。
   //    waterfall 在第一个返回决定值的监听者处终止；同一步 / 同一次调用的重复挂载用对象身份去重。
+  /**
+   * 事前闸：挂在 `tools/pre-execute` —— 自杀 / 自启类命令执行前先要一次许可；
+   * 没有审批通道时框架按失败关闭处理。重启只能由主人在外部发起。
+   */
+  const askGate = (exec, next) => {
+    const toolName = String(exec?.name ?? '');
+    const 入参 = toolName === 'bash' ? String(exec?.arguments?.command ?? exec?.arguments?.cmd ?? '') : '';
+    if (!入参) return next();
+    const hit = COMMAND_RULES.find((rule) => rule.ask && rule.test(入参, toolName));
+    if (!hit) return next();
+    count(`gate:${hit.id}`);
+    return { kind: 'ask', reason: hit.ask };
+  };
+
   const targets = ctx.root && ctx.root !== ctx ? [ctx, ctx.root] : [ctx];
   let mounted = 0;
   for (const target of targets) {
@@ -413,6 +434,7 @@ export function installHardRules(ctx, config = {}) {
     try {
       target.on('agent/pre-step', rulesHandler);
       target.on('tools/post-execute', handler);
+      target.on('tools/pre-execute', askGate);
       mounted += 1;
     } catch (err) {
       console.error(`[hard-rules] 挂载失败: ${err?.message ?? err}`);
