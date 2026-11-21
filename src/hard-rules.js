@@ -45,6 +45,13 @@ const DEFAULT_HIT_LOG = '/tmp/hard-rules-hits.log';
  */
 const DEFAULT_EVERY_N = 10;
 
+/**
+ * 最高指令每多少**轮**兜底注入一次：步数只在实际动手时才涨，
+ * 纯聊天一轮一步，长对话里规则会被埋到几万 token 之前。
+ * 计数单位是「一条新的真人来信」（插件自己塞的那条不算），1、N+1、2N+1…
+ */
+const DEFAULT_EVERY_TURNS = 10;
+
 /** 单条教训注入的正文上限（字符），超了截断 —— 防 token 爆炸。 */
 const LESSON_CAP = 1000;
 
@@ -247,10 +254,11 @@ function loadRules(path) {
  * 把最高指令 + 教训钩子挂到 ctx 上。
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx 插件上下文
- * @param {{cwd?:string, lessonsPath?:string, tools?:string[], everyN?:number, hitLog?:string, triggers?:boolean}} [config]
+ * @param {{cwd?:string, lessonsPath?:string, tools?:string[], everyN?:number, everyTurns?:number, hitLog?:string, triggers?:boolean}} [config]
  *   cwd        工作目录（教训档相对它找），默认 process.cwd()
  *   lessonsPath 教训档路径，默认 `<cwd>/memory/lessons-bot.md`
  *   everyN     最高指令每多少步注入一次，默认 10
+ *   everyTurns 最高指令每多少轮兜底注入一次，默认 10（0＝关掉按轮兜底）
  *   hitLog     注入计数日志，默认 /tmp/hard-rules-hits.log
  *   triggers   false = 只顶最高指令、不开教训钩子
  */
@@ -269,8 +277,18 @@ export function installHardRules(ctx, config = {}) {
 
   const hitLog = config.hitLog ?? DEFAULT_HIT_LOG;
   const everyN = Math.max(1, Number(config.everyN ?? DEFAULT_EVERY_N) || DEFAULT_EVERY_N);
+  /** 轮数兜底：0 或负数＝关掉。 */
+  const everyTurns = Math.max(0, Number(config.everyTurns ?? DEFAULT_EVERY_TURNS) || 0);
   /** 步数计数（进程级）—— 最高指令的节奏按「步」算。 */
   let steps = 0;
+  /** 轮数计数（进程级）—— 一条新的真人来信算一轮，兜住「只聊天不动手」的长对话。 */
+  let turns = 0;
+  /** 上一轮真人来信的 id（变了＝新来一条）。 */
+  let lastTurnId = null;
+  /** 已经数过轮的那一步（同一步的两次挂载只数一次）。 */
+  let countedTurnPayload = null;
+  /** 上一次按「轮」注入时的轮号——同一轮里不许反复注。 */
+  let lastTurnInjected = 0;
   /** ⚠️ 同一个 `agent/pre-step` 事件会被 ctx 与 ctx.root 两个挂载**各触发一次** ——
    *  这里按 payload 对象身份去重，保证「一步只计 1、只注 1」。 */
   let lastRulesPayload = null;
@@ -394,6 +412,22 @@ export function installHardRules(ctx, config = {}) {
    * 节奏：第 1 步注入，之后每 everyN 步一次（1, N+1, 2N+1…）。
    * ⚠️ payload 的 messages 必须**原样保留**，我们只在末尾追加一条；丢了它 = 用户消息不见了。
    */
+  /** 认最后一条真人来信：插件自己塞的（source.kind）不算轮。 */
+  const 数轮 = (messages) => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const m = messages[i];
+      if (!m || m.role !== 'user') continue;
+      const 源 = m.source?.kind ?? '';
+      if (源 === 'hard-rules' || 源 === 'lessons') continue;
+      const 号 = m.id ?? `${m.content?.length ?? 0}:${JSON.stringify(m.content ?? '').slice(0, 80)}`;
+      if (号 !== lastTurnId) {
+        lastTurnId = 号;
+        turns += 1;
+      }
+      return;
+    }
+  };
+
   const rulesHandler = (payload, next) => {
     if (payload !== lastRulesPayload) {
       lastRulesPayload = payload;
@@ -401,11 +435,18 @@ export function installHardRules(ctx, config = {}) {
     }
     // 同一步的第二次挂载：放行（外层拿到原始决策后再追加，保证只追加一次）。
     if (injectedRulesPayload === payload) return next();
-    if (steps % everyN !== 1) return next();
-    injectedRulesPayload = payload;
-    count('pre-step');
     return Promise.resolve(next()).then((decision) => {
       if (!decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision;
+      if (countedTurnPayload !== payload) {
+        countedTurnPayload = payload;
+        数轮(decision.messages);
+      }
+      const 按步 = steps % everyN === 1;
+      const 按轮 = everyTurns > 0 && turns % everyTurns === 1 && turns !== lastTurnInjected;
+      if (!按步 && !按轮) return decision;
+      if (按轮) lastTurnInjected = turns;
+      injectedRulesPayload = payload;
+      count(按步 ? 'pre-step' : 'pre-turn');
       return { ...decision, messages: [...decision.messages, contextMessage(text, 'hard-rules')] };
     });
   };
@@ -442,5 +483,5 @@ export function installHardRules(ctx, config = {}) {
       console.error(`[hard-rules] 挂载失败: ${err?.message ?? err}`);
     }
   }
-  console.error(`[hard-rules] 已挂载（${mounted} 处 / ${text.length} 字）：${rulesPath}｜最高指令 第 1 步 + 每 ${everyN} 步｜教训钩子 ${triggersOn ? `开（${lessonsPath}）` : '关'}`);
+  console.error(`[hard-rules] 已挂载（${mounted} 处 / ${text.length} 字）：${rulesPath}｜最高指令 第 1 步 + 每 ${everyN} 步${everyTurns > 0 ? ` / 每 ${everyTurns} 轮兜底` : ''}｜教训钩子 ${triggersOn ? `开（${lessonsPath}）` : '关'}`);
 }

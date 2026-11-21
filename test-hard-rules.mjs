@@ -124,6 +124,27 @@ try {
   );
   const body5 = r5?.additionalContexts?.[0]?.content?.[0]?.text ?? '';
   check(body5.includes('教训档读不到'), '文件不在时才说「读不到」');
+
+  // ⑥ 按轮兜底：把「按步」调成 1000（只第 1 步触发），看换轮能不能自己补上
+  const h4 = {};
+  installHardRules(
+    { on(e, f) { h4[e] = f; } },
+    { cwd: join(TMP, 'ws'), hitLog: join(TMP, 'hits4.log'), everyN: 1000, everyTurns: 2 },
+  );
+  const 轮步 = h4['agent/pre-step'];
+  const 走一步 = async (来信号) => {
+    const messages = [
+      { id: 来信号, role: 'user', content: [{ type: 'text', text: '问一句' }] },
+      { id: `a-${来信号}`, role: 'assistant', content: [{ type: 'text', text: '答一句' }] },
+    ];
+    const d = await 轮步({ messages }, () => ({ kind: 'enter', messages }));
+    return d.messages.length - messages.length; // 1＝注入了
+  };
+  check((await 走一步('u1')) === 1, '第 1 轮：按轮兜底注入');
+  check((await 走一步('u1')) === 0, '同一轮第 2 步：不重复注入');
+  check((await 走一步('u2')) === 0, '第 2 轮：还没到兜底轮次，不注');
+  check((await 走一步('u2')) === 0, '第 2 轮第 2 步：不注');
+  check((await 走一步('u3')) === 1, '第 3 轮：兜底到了，补一次');
 } finally {
   rmSync(TMP, { recursive: true, force: true });
 }
