@@ -46,9 +46,9 @@ const DEFAULT_HIT_LOG = '/tmp/hard-rules-hits.log';
 const DEFAULT_EVERY_N = 10;
 
 /**
- * 最高指令每多少**轮**兜底注入一次：步数只在实际动手时才涨，
- * 纯聊天一轮一步，长对话里规则会被埋到几万 token 之前。
- * 计数单位是「一条新的真人来信」（插件自己塞的那条不算），1、N+1、2N+1…
+ * 最高指令每累计多少**个单位**注入一次。单位口径（2026-11-21 定）：
+ *   一条新的真人来信 = 1 个单位；调用一次工具 = 1 个单位。
+ * 聊天和干活用同一个计数器，不各算各的——纯聊天久了也会攒到，动手时涨得快。
  */
 const DEFAULT_EVERY_TURNS = 10;
 
@@ -254,11 +254,10 @@ function loadRules(path) {
  * 把最高指令 + 教训钩子挂到 ctx 上。
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx 插件上下文
- * @param {{cwd?:string, lessonsPath?:string, tools?:string[], everyN?:number, everyTurns?:number, hitLog?:string, triggers?:boolean}} [config]
+ * @param {{cwd?:string, lessonsPath?:string, tools?:string[], everyN?:number, hitLog?:string, triggers?:boolean}} [config]
  *   cwd        工作目录（教训档相对它找），默认 process.cwd()
  *   lessonsPath 教训档路径，默认 `<cwd>/memory/lessons-bot.md`
- *   everyN     最高指令每多少步注入一次，默认 10
- *   everyTurns 最高指令每多少轮兜底注入一次，默认 10（0＝关掉按轮兜底）
+ *   everyN     最高指令每累计多少单位注入一次，默认 10（单位＝新来信 1、工具调用 1）
  *   hitLog     注入计数日志，默认 /tmp/hard-rules-hits.log
  *   triggers   false = 只顶最高指令、不开教训钩子
  */
@@ -277,21 +276,14 @@ export function installHardRules(ctx, config = {}) {
 
   const hitLog = config.hitLog ?? DEFAULT_HIT_LOG;
   const everyN = Math.max(1, Number(config.everyN ?? DEFAULT_EVERY_N) || DEFAULT_EVERY_N);
-  /** 轮数兜底：0 或负数＝关掉。 */
-  const everyTurns = Math.max(0, Number(config.everyTurns ?? DEFAULT_EVERY_TURNS) || 0);
-  /** 步数计数（进程级）—— 最高指令的节奏按「步」算。 */
-  let steps = 0;
-  /** 轮数计数（进程级）—— 一条新的真人来信算一轮，兜住「只聊天不动手」的长对话。 */
-  let turns = 0;
-  /** 上一轮真人来信的 id（变了＝新来一条）。 */
+  /** 统一计数：新来信 +1、每次工具调用 +1（进程级）。 */
+  let 已走 = 0;
+  /** 上次注入时的计数；null＝还没注过。 */
+  let 上次注入 = null;
+  /** 上一轮真人来信的 id（变了＝新来一条，+1）。 */
   let lastTurnId = null;
   /** 已经数过轮的那一步（同一步的两次挂载只数一次）。 */
   let countedTurnPayload = null;
-  /** 上一次按「轮」注入时的轮号——同一轮里不许反复注。 */
-  let lastTurnInjected = 0;
-  /** ⚠️ 同一个 `agent/pre-step` 事件会被 ctx 与 ctx.root 两个挂载**各触发一次** ——
-   *  这里按 payload 对象身份去重，保证「一步只计 1、只注 1」。 */
-  let lastRulesPayload = null;
   /** 已经塞过规则的那一步的 payload（同一步的第二次挂载只放行，不重复注入）。 */
   let injectedRulesPayload = null;
   /** 已触发过的特征 id（进程内只注入一次，不刷屏）。 */
@@ -422,17 +414,13 @@ export function installHardRules(ctx, config = {}) {
       const 号 = m.id ?? `${m.content?.length ?? 0}:${JSON.stringify(m.content ?? '').slice(0, 80)}`;
       if (号 !== lastTurnId) {
         lastTurnId = 号;
-        turns += 1;
+        已走 += 1;
       }
       return;
     }
   };
 
   const rulesHandler = (payload, next) => {
-    if (payload !== lastRulesPayload) {
-      lastRulesPayload = payload;
-      steps += 1;
-    }
     // 同一步的第二次挂载：放行（外层拿到原始决策后再追加，保证只追加一次）。
     if (injectedRulesPayload === payload) return next();
     return Promise.resolve(next()).then((decision) => {
@@ -441,12 +429,12 @@ export function installHardRules(ctx, config = {}) {
         countedTurnPayload = payload;
         数轮(decision.messages);
       }
-      const 按步 = steps % everyN === 1;
-      const 按轮 = everyTurns > 0 && turns % everyTurns === 1 && turns !== lastTurnInjected;
-      if (!按步 && !按轮) return decision;
-      if (按轮) lastTurnInjected = turns;
+      // 头一次先注一条（开工先看到规则），之后每满 everyN 个单位注一次。
+      const 该注 = 上次注入 === null || 已走 - 上次注入 >= everyN;
+      if (!该注) return decision;
+      上次注入 = 已走;
       injectedRulesPayload = payload;
-      count(按步 ? 'pre-step' : 'pre-turn');
+      count(`unit:${已走}`);
       return { ...decision, messages: [...decision.messages, contextMessage(text, 'hard-rules')] };
     });
   };
@@ -460,6 +448,7 @@ export function installHardRules(ctx, config = {}) {
    * 带 `ask` 的规则仍走审批；重启只能由主人在外部发起。
    */
   const askGate = (exec, next) => {
+    已走 += 1; // 调一次工具算一个单位（与「新来信算一个单位」同一个计数器）
     const toolName = String(exec?.name ?? '');
     const 入参 = toolName === 'bash' ? String(exec?.arguments?.command ?? exec?.arguments?.cmd ?? '') : '';
     if (!入参) return next();
@@ -483,5 +472,5 @@ export function installHardRules(ctx, config = {}) {
       console.error(`[hard-rules] 挂载失败: ${err?.message ?? err}`);
     }
   }
-  console.error(`[hard-rules] 已挂载（${mounted} 处 / ${text.length} 字）：${rulesPath}｜最高指令 第 1 步 + 每 ${everyN} 步${everyTurns > 0 ? ` / 每 ${everyTurns} 轮兜底` : ''}｜教训钩子 ${triggersOn ? `开（${lessonsPath}）` : '关'}`);
+  console.error(`[hard-rules] 已挂载（${mounted} 处 / ${text.length} 字）：${rulesPath}｜最高指令 每 ${everyN} 个单位（来信 1／工具 1）｜教训钩子 ${triggersOn ? `开（${lessonsPath}）` : '关'}`);
 }

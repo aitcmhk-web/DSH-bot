@@ -125,26 +125,31 @@ try {
   const body5 = r5?.additionalContexts?.[0]?.content?.[0]?.text ?? '';
   check(body5.includes('教训档读不到'), '文件不在时才说「读不到」');
 
-  // ⑥ 按轮兜底：把「按步」调成 1000（只第 1 步触发），看换轮能不能自己补上
+  // ⑥ 统一计数：新来信 +1、工具调用 +1，每满 3 个单位注一次
   const h4 = {};
   installHardRules(
     { on(e, f) { h4[e] = f; } },
-    { cwd: join(TMP, 'ws'), hitLog: join(TMP, 'hits4.log'), everyN: 1000, everyTurns: 2 },
+    { cwd: join(TMP, 'ws'), hitLog: join(TMP, 'hits4.log'), everyN: 3 },
   );
-  const 轮步 = h4['agent/pre-step'];
-  const 走一步 = async (来信号) => {
+  const 步 = h4['agent/pre-step'];
+  const 调工具 = h4['tools/pre-execute'];
+  const 来信 = async (号) => {
     const messages = [
-      { id: 来信号, role: 'user', content: [{ type: 'text', text: '问一句' }] },
-      { id: `a-${来信号}`, role: 'assistant', content: [{ type: 'text', text: '答一句' }] },
+      { id: 号, role: 'user', content: [{ type: 'text', text: '问一句' }] },
+      { id: `a-${号}`, role: 'assistant', content: [{ type: 'text', text: '答一句' }] },
     ];
-    const d = await 轮步({ messages }, () => ({ kind: 'enter', messages }));
+    const d = await 步({ messages }, () => ({ kind: 'enter', messages }));
     return d.messages.length - messages.length; // 1＝注入了
   };
-  check((await 走一步('u1')) === 1, '第 1 轮：按轮兜底注入');
-  check((await 走一步('u1')) === 0, '同一轮第 2 步：不重复注入');
-  check((await 走一步('u2')) === 0, '第 2 轮：还没到兜底轮次，不注');
-  check((await 走一步('u2')) === 0, '第 2 轮第 2 步：不注');
-  check((await 走一步('u3')) === 1, '第 3 轮：兜底到了，补一次');
+  const 用工具 = () => 调工具({ name: 'read', arguments: { file_path: '/tmp/x' } }, () => 'ok');
+
+  check((await 来信('u1')) === 1, '单位 1（第一封来信）：注入');
+  check((await 来信('u1')) === 0, '同一封来信的下一趟：不注');
+  check((await 来信('u2')) === 0, '单位 2：还没满 3，不注');
+  用工具(); // 单位 3
+  check((await 来信('u2')) === 0, '单位 3：还差一步到阈值，不注');
+  用工具(); // 单位 4
+  check((await 来信('u2')) === 1, '累计满 3 个单位：补一次');
 } finally {
   rmSync(TMP, { recursive: true, force: true });
 }
