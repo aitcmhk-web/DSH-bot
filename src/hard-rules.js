@@ -213,6 +213,16 @@ const COMMAND_RULES = [
     hint: '删除不可逆 —— 先确认解析出来的**绝对路径**就是你要删的那个。',
   },
   {
+    id: 'ssh-remote',
+    label: 'ssh / scp / sftp / rsync 远程',
+    test: (c) =>
+      /(?:^|[;&|]\s*|\s)(ssh|scp|sftp)\s+\S/.test(c) ||
+      /\brsync\b[^\n]*\b[^\s@]+@[^\s:]+:/.test(c),
+    lessons: [],
+    hint: '⛔ 未经主人明确指令，严禁登录 SSH、云端服务器及远程服务 —— 要上机先问一句，点头再连。',
+    ask: '⛔ 要连远程（ssh / scp / sftp / rsync）。先说清「连哪台、做什么」，等主人点头再点允许。',
+  },
+  {
     id: 'cordis-patch',
     label: '改 cordis.patch.yml',
     test: (c, tool) =>
