@@ -82,6 +82,8 @@ export class WecomBridgeEndpoint {
     this.error = error ?? ((line) => console.error(line));
     this.server = null;
     this.handler = null;
+    /** sidecar 重试去重：`${chatId}:${id}` → 时间。 */
+    this.seen = new Map();
   }
 
   /**
@@ -168,8 +170,24 @@ export class WecomBridgeEndpoint {
       return;
     }
 
+    // sidecar 断线重试可能重复投递：同一个 id 10 分钟内只接一次。
+    const messageId = String(body?.id ?? '').trim();
+    if (messageId) {
+      const key = `${chatId}:${messageId}`;
+      const now = Date.now();
+      for (const [k, at] of this.seen) {
+        if (now - at > 10 * 60 * 1000) this.seen.delete(k);
+      }
+      if (this.seen.has(key)) {
+        json(res, 202, { ok: true, duplicate: true });
+        return;
+      }
+      this.seen.set(key, now);
+      if (this.seen.size > 3000) this.seen.delete(this.seen.keys().next().value);
+    }
+
     // 202 立即回 sidecar：DSH 一轮可能跑很久，不能让企微回调等在这里。
-    json(res, 202, { ok: true });
+    json(res, 202, { ok: true, id: messageId || undefined });
     const msg = makeMessage({
       source: 'wecom',
       chatId,

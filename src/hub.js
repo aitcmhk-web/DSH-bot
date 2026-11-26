@@ -9,9 +9,10 @@
  *
  *   出站：DSH ─→ [节点] ─→ 所有端点
  *
- * 两条规则，都是「同步到所有」：
- *   1. 端点到节点 → 这条同步给 ① DSH ② 其他所有端点
- *   2. DSH 到节点 → 这条同步发到所有端点
+ * 两条规则：
+ *   1. 端点到节点 → 先启动“镜像给其他端点”（单端点限时、后台跑），
+ *      再把消息交给 DSH；镜像慢不能拖住宿主。
+ *   2. DSH 到节点 → 同步发到所有端点（每个端点独立限时，失败只影响自己）。
  *
  * ⛔ 不要在这里加「去重」「合并」「判断是不是同一条」——
  *    进来几条就是几条，是两次真实输入。节点不判断，收到就转发。
@@ -80,12 +81,17 @@ export class Hub {
    *   投递失败时回调（成功不调）。当前调用方不传 → 完全不触发，钩子为将来复用保留。
    *   若重新启用：必须「失败才叫」，每条回答都回执会把聊天刷爆。
    */
-  constructor({ onInbound = null, log = null, onDeliveryFailure = null } = {}) {
+  constructor({ onInbound = null, log = null, onDeliveryFailure = null, sendTimeoutMs = 5000 } = {}) {
     /** @type {Map<string, object>} id → 端点适配器 */
     this.endpoints = new Map();
     this.onInbound = onInbound;
     this.log = log ?? ((line) => console.log(line));
     this.onDeliveryFailure = onDeliveryFailure;
+    /**
+     * 单端点发送上限。必须短于一轮对话的耐心：
+     * 一个通道网络烂掉时，不能让另外两个通道等它。
+     */
+    this.sendTimeoutMs = Math.max(500, Number(sendTimeoutMs) || 5000);
     /**
      * 同一端点的告警去重：id → 上次告警时间。
      * 为什么要去重：微信通道挂掉时是**每条**回答都失败，不去重会变成刷屏告警，
@@ -137,13 +143,18 @@ export class Hub {
 
     this.log(`[hub] 入站 ← ${msg.source}:${msg.chatId} (${String(msg.text).slice(0, 40)}…)`);
 
-    // ① 先镜像给其他所有端点
+    // ① 先启动镜像，但只给它一个很短的抢跑窗口。
     //
-    // ⛔ 顺序不能反：DSH 的回答是在 onInbound 里跑完才产生的，
-    //    先 await onInbound 的话镜像只能排在回答后面 —— 别人的微信里就成了
-    //    「回答在上面、问话在下面」。broadcast 内部每个端点各自 try/catch、
-    //    只把失败记进 failed 不往外抛，所以放前面不会卡住 DSH。
-    await this.broadcast(msg, { exclude: msg.source, label: `${msg.source} 入站` });
+    // 不能像旧版那样 await 到镜像全部完成：某个通道网络卡住时，DSH
+    // （尤其是最稳的企微）会被它拖住。镜像本身继续在后台跑，单端点
+    // 超时由 broadcast() 负责；这里最多等 250ms，保证“问话在回答前”
+    // 的大致顺序，又不把入站变成同步依赖。
+    const mirror = this.broadcast(msg, { exclude: msg.source, label: `${msg.source} 入站` })
+      .catch((err) => {
+        console.error(`[hub] 入站镜像失败(已忽略，不影响 DSH): ${err?.message ?? err}`);
+        return { sent: [], failed: [] };
+      });
+    await Promise.race([mirror, sleep(250)]);
 
     // ② 再交给 DSH
     if (this.onInbound) {
@@ -171,6 +182,29 @@ export class Hub {
   }
 
   /**
+   * 带超时的单端点发送。
+   *
+   * 超时只表示「这个端点这一条没送成」，绝不能取消其他端点：
+   * 底层 fetch/长连接可能还在跑，但 Hub 不再等它。
+   */
+  async #sendWithin(ep, msg) {
+    let timer = null;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(() => ep.send(msg)),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`发送超时(>${this.sendTimeoutMs}ms)`)),
+            this.sendTimeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
    * 广播一条消息到端点们。
    *
    * ⚠️ exclude 只用于「端点 → 节点」那一半（不把消息原样发回给发信人自己）。
@@ -186,7 +220,7 @@ export class Hub {
     // 并行发，且**单点失败不影响其他端点**（很重要：微信坏了不能拖垮 TG）。
     await Promise.all(targets.map(async (ep) => {
       try {
-        await ep.send(msg);
+        await this.#sendWithin(ep, msg);
         sent.push(ep.id);
       } catch (err) {
         failed.push({ id: ep.id, error: err.message });
@@ -250,4 +284,9 @@ export class Hub {
       }
     }));
   }
+}
+
+/** 小睡；只给入站镜像的短抢跑窗口用。 */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

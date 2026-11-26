@@ -1254,8 +1254,9 @@ export function apply(ctx, config) {
   /**
    * 会话键。微信消息并入 owner 的 TG 会话（owner anchor 同一套规则）：
    * TG 和微信聊的是同一段上下文，微信里 /new、/model 操作的也是同一个会话。
-   * owner 还没认领时各归各（wx:xxx）。队列键在 hub.onInbound 里仍按源分开排，
-   * 两个入口不会互相阻塞。
+   * owner 还没认领时各归各（wx:xxx）。队列键统一用这个会话键：三个入口
+   * 共用同一个会话队列，避免同时 prompt 同一个 agent；单通道的网络慢由
+   * Hub 的单端点超时兜底，不拖累其他通道。
    */
   function hubChatKey(msg) {
     // 微信、企微都并入 owner 的 TG 会话：三个入口共用同一段上下文。
