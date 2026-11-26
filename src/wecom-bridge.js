@@ -82,6 +82,8 @@ export class WecomBridgeEndpoint {
     this.error = error ?? ((line) => console.error(line));
     this.server = null;
     this.handler = null;
+    /** 审批回调：sidecar 报告「企微里点了允许/拒绝」时调用。 */
+    this.approvalHandler = null;
     /** sidecar 重试去重：`${chatId}:${id}` → 时间。 */
     this.seen = new Map();
   }
@@ -142,9 +144,35 @@ export class WecomBridgeEndpoint {
     }
   }
 
+  /** 注册审批回调处理（由 index.js 接到 approvalBridge）。 */
+  setApprovalHandler(fn) {
+    this.approvalHandler = typeof fn === 'function' ? fn : null;
+  }
+
+  /** 出站：请 sidecar 在企微里发一张审批卡（回 1 允许 / 2 拒绝）。 */
+  async sendApprovalAsk({ id, text }) {
+    const 编号 = String(id ?? '').trim();
+    if (!编号) throw new Error('审批 id 不能为空');
+    const res = await fetch(`${this.bridgeUrl}/hub/approval/ask`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-dsh-wecom-token': this.token,
+      },
+      body: JSON.stringify({ chatId: this.userId, id: 编号, text: String(text ?? '') }),
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`企微审批卡发送失败 HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ''}`);
+    }
+  }
+
   async #handle(req, res) {
     const url = new URL(req.url ?? '/', `http://${this.host}:${this.port}`);
-    if (req.method !== 'POST' || url.pathname !== '/hub/inbound') {
+    const 是入站 = url.pathname === '/hub/inbound';
+    const 是审批 = url.pathname === '/hub/approval';
+    if (req.method !== 'POST' || (!是入站 && !是审批)) {
       json(res, 404, { ok: false, error: 'not found' });
       return;
     }
@@ -159,6 +187,18 @@ export class WecomBridgeEndpoint {
       body = JSON.parse(raw);
     } catch {
       json(res, 400, { ok: false, error: 'bad json' });
+      return;
+    }
+
+    if (是审批) {
+      const id = String(body?.id ?? '').trim();
+      const action = String(body?.action ?? '').trim();
+      if (!id || !action) {
+        json(res, 400, { ok: false, error: 'id/action required' });
+        return;
+      }
+      const handled = Boolean(this.approvalHandler?.({ id, action }));
+      json(res, 200, { ok: true, handled });
       return;
     }
 

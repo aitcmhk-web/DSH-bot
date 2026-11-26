@@ -1143,9 +1143,22 @@ export function apply(ctx, config) {
       if (!telegram) return null;
       return state.ownerUserId !== null ? state.ownerUserId : null;
     },
+    // 企微这一路：sidecar 通了就发，不依赖 telegram / owner 是否认领。
+    wecom: wecom
+      ? {
+          ask: ({ id, text }) => wecom.sendApprovalAsk({ id, text }),
+        }
+      : null,
     log,
     error,
   });
+
+  // 企微点了「允许/拒绝」→ sidecar 回调 → 这里结算同一条审批。
+  try {
+    wecom?.setApprovalHandler?.((决定) => approvalBridge?.handleWecomApproval?.(决定) ?? false);
+  } catch (err) {
+    error(`企微审批回调注册失败（其余通道照常）: ${err?.stack ?? err?.message ?? err}`);
+  }
 
 
   // 最高指令 + 失败特征教训注入：实现随插件走（src/hard-rules.js），

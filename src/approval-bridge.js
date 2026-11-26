@@ -246,6 +246,7 @@ function cardText(request, status, note = null) {
  * @param {object}   deps.ctx       插件上下文（会挂 approval/request 监听）
  * @param {object}   deps.telegram  Telegram 客户端实例（不可用 → 完全不接管）
  * @param {() => (string|number|null)} deps.getChatId 卡片发往哪个会话 id；拿不到返回 null → 本模块让位给下一个应答者
+ * @param {{ask:Function, update?:Function}|null} [deps.wecom] 企微审批通道；给了就在企微也发一张，谁先点谁生效
  * @param {(msg: string) => void} [deps.log]
  * @param {(msg: string) => void} [deps.error]
  * @param {number}   [deps.timeoutMs] 审批超时，默认 10 分钟
@@ -255,6 +256,7 @@ export function installApprovalBridge({
   ctx,
   telegram,
   getChatId,
+  wecom = null,
   log = () => {},
   error = () => {},
   timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -358,6 +360,11 @@ export function installApprovalBridge({
       where.messageId ?? entry.messageId,
       cardText(entry.request, status, detailNote(entry)),
     );
+    if (entry.wecomUsed && wecom && typeof wecom.update === 'function') {
+      void Promise.resolve()
+        .then(() => wecom.update(id, status))
+        .catch((err) => error(`企微审批卡更新失败（结果不受影响）: ${err?.message ?? err}`));
+    }
     return true;
   }
 
@@ -368,12 +375,19 @@ export function installApprovalBridge({
    * 一旦接手（已返回 Promise），就只能 resolve，不能再 next()。
    */
   function onApprovalRequest(request, next) {
-    let chatId;
+    let chatId = null;
+    let canTg = false;
+    let canWe = false;
     try {
       if (disposed) return next();
-      if (!telegram || typeof telegram.sendMessage !== 'function') return next();
       chatId = typeof getChatId === 'function' ? getChatId() : null;
-      if (chatId === null || chatId === undefined) return next();
+      canTg =
+        Boolean(telegram && typeof telegram.sendMessage === 'function') &&
+        chatId !== null &&
+        chatId !== undefined;
+      // 企微这一路不依赖 TG：TG 挂了/没认领，只要 sidecar 通了照样能审批。
+      canWe = Boolean(wecom && typeof wecom.ask === 'function');
+      if (!canTg && !canWe) return next();
       if (claimed.has(request)) return next(); // 双注册去重：另一个监听点已接手
       claimed.add(request);
     } catch (err) {
@@ -396,6 +410,8 @@ export function installApprovalBridge({
       signal: null,
       onAbort: null,
       status: null,
+      tgUsed: false,
+      wecomUsed: false,
     };
     pending.set(id, entry);
 
@@ -422,53 +438,81 @@ export function installApprovalBridge({
       }
     }
 
-    // 发卡片。发送失败 → 退回下一个应答者（还没承诺任何结果，可以 next()）。
+    // 发卡片：TG 与企微各自独立，一路失败不影响另一路。
     return (async () => {
       // 竞态：在发卡片之前就已被 abort/超时/dispose 收尾 → 不再发过期卡片。
       if (!pending.has(id)) return decision;
-      try {
-        const body = cardText(request, WAITING);
-        // Telegram 单条上限 4096：用 telegram.js 现成的分条器，正文 ≤4000 时
-        // 只会得到 1 条（按钮照旧挂上去），超长则自动分多条。
-        const chunks = splitMessage(body);
-        const keyboard = {
-          inline_keyboard: [[
-            { text: '✅ 允许一次', callback_data: `${OK_PREFIX}${id}` },
-            { text: '❌ 拒绝', callback_data: `${NO_PREFIX}${id}` },
-          ]],
-        };
-        // `reply_markup` 只挂在**最后一条**；记住最后一条的 message_id，
-        // 之后的终态 editMessageText 只改这一条。
-        let lastMessageId = null;
-        for (let i = 0; i < chunks.length; i += 1) {
-          const isLast = i === chunks.length - 1;
-          // 唯一换成重试版的调用点 —— 卡片发不出去 = 通道秒断，值得等限流过去；
-          // 其余（编辑卡片/应答按钮）失败只影响观感，保持原样不重试。
-          const sent = await callTelegramWithRetry(
-            'sendMessage',
-            chatId,
-            chunks[i],
-            isLast ? { reply_markup: keyboard } : {},
-          );
-          if (isLast) lastMessageId = sent?.message_id ?? null;
+
+      let tgOk = false;
+      let weOk = false;
+
+      if (canTg) {
+        try {
+          const body = cardText(request, WAITING);
+          // Telegram 单条上限 4096：用 telegram.js 现成的分条器，正文 ≤4000 时
+          // 只会得到 1 条（按钮照旧挂上去），超长则自动分多条。
+          const chunks = splitMessage(body);
+          const keyboard = {
+            inline_keyboard: [[
+              { text: '✅ 允许一次', callback_data: `${OK_PREFIX}${id}` },
+              { text: '❌ 拒绝', callback_data: `${NO_PREFIX}${id}` },
+            ]],
+          };
+          // `reply_markup` 只挂在**最后一条**；记住最后一条的 message_id，
+          // 之后的终态 editMessageText 只改这一条。
+          let lastMessageId = null;
+          for (let i = 0; i < chunks.length; i += 1) {
+            const isLast = i === chunks.length - 1;
+            // 唯一换成重试版的调用点 —— 卡片发不出去 = 通道秒断，值得等限流过去；
+            // 其余（编辑卡片/应答按钮）失败只影响观感，保持原样不重试。
+            const sent = await callTelegramWithRetry(
+              'sendMessage',
+              chatId,
+              chunks[i],
+              isLast ? { reply_markup: keyboard } : {},
+            );
+            if (isLast) lastMessageId = sent?.message_id ?? null;
+          }
+          entry.parts = chunks.length;
+          entry.messageId = lastMessageId;
+          tgOk = true;
+        } catch (err) {
+          error(`审批卡片发送失败（TG 这一路）: ${err?.stack ?? err?.message ?? err}`);
         }
-        entry.parts = chunks.length;
-        entry.messageId = lastMessageId;
-        // 竞态：卡片发送途中被收尾 → 补一次编辑，确保按钮不会被留在那里。
-        if (!pending.has(id)) {
-          await rewriteCard(
-            chatId,
-            entry.messageId,
-            cardText(request, entry.status ?? '已取消', detailNote(entry)),
-          );
+      }
+
+      if (canWe) {
+        try {
+          await wecom.ask({ id, text: cardText(request, WAITING) });
+          weOk = true;
+        } catch (err) {
+          error(`企微审批卡发送失败（不影响其它通道）: ${err?.stack ?? err?.message ?? err}`);
         }
-      } catch (err) {
-        error(`审批卡片发送失败（交回下一个应答者）: ${err?.stack ?? err?.message ?? err}`);
+      }
+
+      entry.tgUsed = tgOk;
+      entry.wecomUsed = weOk;
+
+      // 两路都没发出去 → 交回下一个应答者（还没承诺任何结果，可以 next()）。
+      if (!tgOk && !weOk) {
         pending.delete(id);
         release(entry);
-        // 已经 resolve 过（极端竞态）就不再 next()，避免出现两个结果。
-        // 正常路径下不会发生，这里只是防御。
         return next();
+      }
+
+      // 竞态：卡片发送途中被收尾 → 补一次收尾，确保按钮不会被留在那里。
+      if (!pending.has(id)) {
+        const 终态 = entry.status ?? '已取消';
+        if (tgOk) {
+          await rewriteCard(chatId, entry.messageId, cardText(request, 终态, detailNote(entry)));
+        }
+        if (weOk && typeof wecom.update === 'function') {
+          try {
+            await wecom.update(id, 终态);
+          } catch (err) {
+            error(`企微审批卡收尾失败（结果不受影响）: ${err?.message ?? err}`);
+          }
+        }
       }
       return decision;
     })();
@@ -538,6 +582,23 @@ export function installApprovalBridge({
     return true;
   }
 
+  /**
+   * 处理企微那一路的审批决定（由企微端点收到回调后调用）。
+   * 同步返回 boolean：true = 命中一条挂起项。
+   *
+   * @param {{id?: string, action?: string}} 决定 action: ok/allow/allowed-once 或 no/deny/rejected
+   */
+  function handleWecomApproval(决定 = {}) {
+    if (disposed) return false;
+    const 动 = String(决定?.action ?? '').toLowerCase();
+    const 是允许 = 动 === 'ok' || 动 === 'allow' || 动 === 'allowed-once' || 动 === 'yes' || 动 === '1';
+    const 是拒绝 = 动 === 'no' || 动 === 'deny' || 动 === 'rejected' || 动 === '2';
+    if (!是允许 && !是拒绝) return false;
+    const id = String(决定?.id ?? '');
+    if (!id) return false;
+    return finalize(id, 是允许 ? 'allowed-once' : 'rejected', 是允许 ? '已允许' : '已拒绝', 'wecom');
+  }
+
   /** 卸载：清所有挂起项（一律 cancelled）+ 注销监听。 */
   function dispose() {
     if (disposed) return;
@@ -563,5 +624,5 @@ export function installApprovalBridge({
     log('审批桥已卸载');
   }
 
-  return { handleApprovalCallback, dispose };
+  return { handleApprovalCallback, handleWecomApproval, dispose };
 }
