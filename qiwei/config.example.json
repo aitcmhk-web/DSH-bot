@@ -1,0 +1,13 @@
+{
+  "corpId": "ww...",
+  "agentId": 1000003,
+  "secret": "应用Secret",
+  "token": "回调Token",
+  "encodingAesKey": "43位EncodingAESKey",
+  "allowedUserIds": ["你的企微UserID"],
+  "port": 8790,
+  "path": "/qiwei/callback",
+  "publicUrl": "https://你的域名/qiwei/callback",
+  "hubToken": "与主 bot wecomBridgeToken 一致",
+  "hubUrl": "http://127.0.0.1:8793"
+}

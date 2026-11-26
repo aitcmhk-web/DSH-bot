@@ -24,3 +24,5 @@ AGENTS-plugin.md
 memory/
 .githooks/
 .opencode-go.key
+
+qiwei/config.json
