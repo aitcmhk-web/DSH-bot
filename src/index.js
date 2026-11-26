@@ -30,6 +30,7 @@ import { Weixin } from './weixin.js';
 import { Memory } from './memory.js';
 import { BotRuntime } from './runtime.js';
 import { Hub, makeMessage, markAsHubOutput } from './hub.js';
+import { WecomBridgeEndpoint } from './wecom-bridge.js';
 import { buildRoutes, routeByKey, routeFor, describeRoute, isRouteFailure, reasoningEffortFor } from './models.js';
 import { readWebLlmPiAi, readWebLlmDeepseek, readWebLlmDeepseekAccount, webPatchPath } from './web-patch.js';
 import { syncOwnProfileFromWeb } from './model-sync.js';
@@ -79,6 +80,18 @@ export const Config = Schema.object({
   weixinApiRoot: Schema.string().description('微信 API 根地址，一般不用改'),
   weixinAccountFile: Schema.string().description('凭据文件路径（不想把 token 写进配置时用）'),
   weixinAllowedUserId: Schema.string().description('只接受这个微信用户的消息'),
+
+  // ---- 企微（sidecar 端点） ----
+  wecomBridgeUrl: Schema.string()
+    .description('企微 sidecar 的本地地址，如 http://127.0.0.1:8790。留空 = 不启用企微入口'),
+  wecomBridgeToken: Schema.string()
+    .description('与企微 sidecar 共用的本地令牌（只走 127.0.0.1）'),
+  wecomUserId: Schema.string()
+    .description('企微 owner 的 userid（出站目标）'),
+  wecomListenHost: Schema.string().default('127.0.0.1')
+    .description('企微入站监听地址，默认只监听本机'),
+  wecomListenPort: Schema.number().default(8793)
+    .description('企微入站监听端口，默认 8793'),
 
   // ---- 模型路由 ----
   routes: Schema.array(Schema.any()).default([])
@@ -961,6 +974,28 @@ export function apply(ctx, config) {
     ? weixin.adopt({ token: config.weixinToken, baseUrl: config.weixinApiRoot })
     : weixin.load();
 
+  // 企微 sidecar：只有三项都配了才启用。缺一项就当成“没配”，
+  // 不让半套配置把主 bot 启动拖死。
+  let wecom = null;
+  if (config.wecomBridgeUrl && config.wecomBridgeToken && config.wecomUserId) {
+    try {
+      wecom = new WecomBridgeEndpoint({
+        bridgeUrl: config.wecomBridgeUrl,
+        token: config.wecomBridgeToken,
+        userId: config.wecomUserId,
+        host: config.wecomListenHost,
+        port: config.wecomListenPort,
+        log,
+        error,
+      });
+    } catch (err) {
+      error(`企微端点配置无效，已跳过：${err?.message}`);
+      wecom = null;
+    }
+  } else if (config.wecomBridgeUrl || config.wecomBridgeToken || config.wecomUserId) {
+    error('企微端点配置不完整（wecomBridgeUrl / wecomBridgeToken / wecomUserId 必须同时给），已跳过。');
+  }
+
   // -------------------------------------------------------------------------
   // 模型运行时
   // -------------------------------------------------------------------------
@@ -1022,7 +1057,10 @@ export function apply(ctx, config) {
         submitTurn(msg);
         return;
       }
-      await enqueue(`${msg.source}:${msg.chatId}`, () => promptFromHub(msg));
+      // 非 TG 入口也排进**共享会话键**的队列：微信/企微都映射到 tg:owner，
+      // 不能再用 `${source}:${chatId}` 各自排队，否则三条通道会同时 prompt
+      // 同一个 agent，回答交错。
+      await enqueue(hubChatKey(msg), () => promptFromHub(msg));
     },
   });
 
@@ -1080,6 +1118,17 @@ export function apply(ctx, config) {
 
   if (telegram) hub.add(tgEndpoint);
   if (weixinReady) hub.add(wxEndpoint);
+  if (wecom) hub.add(wecom);
+  // TG/微信端点自己起轮询，没有 start 方法；企微端点需要这里真正监听。
+  // Hub.start 对没有 start 的端点会跳过，所以可以无条件调。
+  // apply 是同步函数，不能 await；启动失败只记日志，不能拖垮主 bot。
+  void hub.start()
+    .then((results) => {
+      for (const r of results ?? []) {
+        if (r && r.ok === false) error(`[hub] ${r.id} 端点启动失败: ${r.error}`);
+      }
+    })
+    .catch((err) => error(`[hub] 端点启动异常: ${err?.stack ?? err?.message}`));
 
   // -------------------------------------------------------------------------
   // 审批桥：DSH 的 approval/request → Telegram 内联按钮
@@ -1173,7 +1222,7 @@ export function apply(ctx, config) {
     try {
       while (box.pending.length > 0) {
         const batch = box.pending.splice(0);
-        log(`[tg] 忙时合包：本轮合并 ${batch.length} 条消息为一次提问`);
+        log(`[hub] 忙时合包：本轮合并 ${batch.length} 条消息为一次提问`);
         await enqueue(key, () => promptFromHub(mergeMsgs(batch)));
       }
     } finally {
@@ -1183,7 +1232,8 @@ export function apply(ctx, config) {
   }
 
   function submitTurn(msg) {
-    const key = `${msg.source}:${msg.chatId}`;
+    // 与 onInbound 的非 TG 分支共用同一个共享会话键（wx/企微 → tg:owner）。
+    const key = hubChatKey(msg);
     let box = tgMailboxes.get(key);
     if (!box) {
       box = { running: false, pending: [] };
@@ -1208,7 +1258,11 @@ export function apply(ctx, config) {
    * 两个入口不会互相阻塞。
    */
   function hubChatKey(msg) {
-    if (msg.source === 'wx' && state.ownerUserId !== null) return `tg:${state.ownerUserId}`;
+    // 微信、企微都并入 owner 的 TG 会话：三个入口共用同一段上下文。
+    // owner 还没被 TG 认领时各归各，避免把陌生人的消息塞进同一会话。
+    if ((msg.source === 'wx' || msg.source === 'wecom') && state.ownerUserId !== null) {
+      return `tg:${state.ownerUserId}`;
+    }
     return `${msg.source}:${msg.chatId}`;
   }
 
@@ -1233,6 +1287,9 @@ export function apply(ctx, config) {
           error,
         });
       }
+      // 企微侧暂时没有「正在输入/进度编辑」接口；返回 null，退回干等，
+      // 不伪造一个假的 LiveStatus。
+      if (msg.source === 'wecom') return null;
     } catch (err) {
       error(`活状态初始化失败(本轮没有进度显示,不影响回答): ${err.message}`);
     }
@@ -1256,14 +1313,20 @@ export function apply(ctx, config) {
     const inboundBlocks = Array.isArray(msg.raw?.blocks) ? msg.raw.blocks : null;
     if (!text && !inboundBlocks) return { ok: false, error: '空消息' };
 
-    // 微信侧的命令解析：TG 在自己的入口里解析过了，这里补微信这一半
-    // （与软件版的 handleWeixinCommand 一致）。命令不进模型、不进流水账。
-    if (msg.source === 'wx' && text.startsWith('/')) {
+    // 微信/企微侧的命令解析：TG 在自己的入口里解析过了，这里补另外两半。
+    // 命令不进模型、不进流水账。
+    if ((msg.source === 'wx' || msg.source === 'wecom') && text.startsWith('/')) {
       const parts = text.split(/\s+/);
-      const reply = (t) =>
-        weixin
-          .sendText(String(msg.chatId), t, wxContextTokens.get(String(msg.chatId)) ?? undefined)
-          .catch((err) => error(`微信命令回话失败: ${err.message}`));
+      const reply = (t) => {
+        if (msg.source === 'wx') {
+          return weixin
+            .sendText(String(msg.chatId), t, wxContextTokens.get(String(msg.chatId)) ?? undefined)
+            .catch((err) => error(`微信命令回话失败: ${err.message}`));
+        }
+        return wecom
+          ? wecom.send({ text: t }).catch((err) => error(`企微命令回话失败: ${err.message}`))
+          : Promise.resolve();
+      };
       const handled = await handleCommand(
         reply,
         msg.chatId,
@@ -1271,7 +1334,7 @@ export function apply(ctx, config) {
         chatKey,
         parts[0].toLowerCase().split('@')[0],
         parts.slice(1).join(' '),
-        'wx',
+        msg.source,
       );
       if (handled) return { ok: true };
     }
@@ -1283,7 +1346,9 @@ export function apply(ctx, config) {
     //    带 chatKey：这个 chat 会话在用且刚切过档时，⛔ 拿旧记忆盖回在用档。
     await refreshHostRoute(chatKey);
 
-    const ep = msg.source === 'tg' ? tgEndpoint : wxEndpoint;
+    // 按来源找端点，不能写死 tg/wx 二选一：加了企微后，企微消息错用
+    // 微信端点会把回答发到微信，而不是回企微。
+    const ep = hub.get(msg.source) ?? (msg.source === 'tg' ? tgEndpoint : wxEndpoint);
 
     // 回合内的「活状态」：TG = 占位消息 + 打字续期 + 进度编辑；
     // 微信 = 只有「正在输入」。造不出来就返回 null，退回干等（不影响回答）。
@@ -2043,7 +2108,7 @@ export function apply(ctx, config) {
         //    旧会话 id 还在的话，下一条消息会 resume 回去，「新会话」是假的。
         await runtime.resetSession(chatKey);
         sessionCreatedAt.set(chatKey, Date.now());
-        await telegram.sendMessage(chatId, '🆕 已开新会话（上一段进展已存进 handoff）。');
+        await reply('🆕 已开新会话（上一段进展已存进 handoff）。');
         return true;
       }
 
@@ -2075,8 +2140,7 @@ export function apply(ctx, config) {
             env: { ...process.env, ...planEnv },
           });
           child.unref();
-          await telegram.sendMessage(
-            chatId,
+          await reply(
             [
               '♻️ 已收到重启指令（上一段进展已留档）。',
               `约 ${planEnv.RESTART_DELAY_SECONDS} 秒后重启进程，以加载新代码。`,
@@ -2090,8 +2154,7 @@ export function apply(ctx, config) {
         // 绝不能让 bot 凭空消失。
         await runtime.resetSession(chatKey);
         sessionCreatedAt.set(chatKey, Date.now());
-        await telegram.sendMessage(
-          chatId,
+        await reply(
           '🔄 已重开会话，上一段进展已留档（下一条消息自动带回）。\n'
           + '⚠️ 没找到重启接力脚本/启动器，进程没法自动拉起 —— 加载新代码请手动重启。',
         );
@@ -2264,8 +2327,8 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------------------
   // 启动
   // -------------------------------------------------------------------------
-  if (!telegram && !weixinReady) {
-    error('⚠️ Telegram 和微信都没配，插件不会收任何消息（只保留了 handoff 能力）。');
+  if (!telegram && !weixinReady && !wecom) {
+    error('⚠️ Telegram、微信、企微都没配，插件不会收任何消息（只保留了 handoff 能力）。');
   }
 
   if (telegram) {
@@ -2873,10 +2936,10 @@ export function apply(ctx, config) {
   // 「装上了但没配」必须显式报错，不能静默假装挂载成功：
   //    插件类产品最常见也最难排查的失败 —— 装好了却没配，发消息石沉大海，
   //    日志里只有一行「已挂载」，看不出缺什么。
-  if (!config.telegramToken && !weixinReady) {
+  if (!config.telegramToken && !weixinReady && !wecom) {
     error(
-      '两个入口都没有配置 —— 插件不会有任何反应。' +
-        '请至少填 telegramToken（Telegram）或 weixinToken（微信）。',
+      '三个入口都没有配置 —— 插件不会有任何反应。' +
+        '请至少填 telegramToken（Telegram）、weixinToken（微信）或 wecomBridgeUrl（企微）。',
     );
   }
   if (useHostRoutes) {
