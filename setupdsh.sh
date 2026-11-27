@@ -227,13 +227,42 @@ ensure_dsh() {
 # ⚠️ 这里写死的 tag 必须是**本次发布自己的 tag**（发新版本时同步改，别漏）。
 #    走 TG 菜单那条路会先上网拉最新这份脚本再跑，所以实际生效的永远是网上最新的 tag；
 #    没网时才退回包里这份 —— 那时它也只能装这个 tag。
-SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.1.36}"
+SPEC="${BOTPLUGIN_SPEC:-github:aitcmhk-web/DSH-bot#v1.1.37}"
 # ⚠️ 版本号只从装好的插件里读（package.json 是唯一版本源）；读不到就返回空、显示「?」，
 #    ⛔ 绝不拿日期或路径冒充版本号。
 plugin_version() {
   [ -n "${1:-}" ] || return 0
   [ -f "$1/package.json" ] || return 0
   sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1/package.json" | head -1
+}
+# restart_qiwei_sidecar — 企微 sidecar 是独立进程（launchd / systemd 各管一只），
+# ⛔ 装完新包不重启它，它就一直在内存里跑旧代码（2026-11-27 实证：装了 1.1.33／1.1.34，
+# 进程还是 16:47 起的 1.1.32，卡片报错也一直按旧代码走）。找不到就跳过，不算错。
+restart_qiwei_sidecar() {
+  QW_LABEL="com.local.dsh.qiwei"
+  if command -v launchctl >/dev/null 2>&1; then
+    if launchctl print "gui/$(id -u)/${QW_LABEL}" >/dev/null 2>&1; then
+      if launchctl kickstart -k "gui/$(id -u)/${QW_LABEL}" >/dev/null 2>&1; then
+        say "✅ 企微 sidecar 已重启（${QW_LABEL}），新代码生效"
+      else
+        say "⚠️ 企微 sidecar 重启失败，手动跑：launchctl kickstart -k gui/$(id -u)/${QW_LABEL}"
+      fi
+      return 0
+    fi
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    QW_UNIT="$(systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -m1 -i qiwei || true)"
+    if [ -n "${QW_UNIT}" ]; then
+      if systemctl --user restart "${QW_UNIT}" >/dev/null 2>&1 || systemctl restart "${QW_UNIT}" >/dev/null 2>&1; then
+        say "✅ 企微 sidecar 已重启（${QW_UNIT}）"
+      else
+        say "⚠️ 企微 sidecar 重启失败，手动看：systemctl status ${QW_UNIT}"
+      fi
+      return 0
+    fi
+  fi
+  say "（这台机器没装企微 sidecar，跳过重启）"
+  return 0
 }
 upgrade_plugins() {
   [ -n "${DSHBIN:-}" ] || return 0
@@ -294,6 +323,9 @@ upgrade_plugins() {
     if [ -f "${LOCKFILE}.setupdsh-bak" ]; then mv "${LOCKFILE}.setupdsh-bak" "$LOCKFILE"; fi
   done < "$PLUGLIST_FILE"
   rm -f "$PLUGLIST_FILE" 2>/dev/null || true
+  # 装完新包必须重启企微 sidecar：它是独立进程，⛔ 不重启就一直跑内存里的旧代码
+  # （2026-11-27 实证：包装了 1.1.33／1.1.34，进程还是 16:47 起的 1.1.32）。
+  if [ "${PLUG_CHANGED:-0}" = "1" ]; then restart_qiwei_sidecar; fi
 }
 
 # strip_legacy_hardrules — 退役 profile patch 里的 hard-rules file:// 挂载块。
