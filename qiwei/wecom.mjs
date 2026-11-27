@@ -140,6 +140,52 @@ export class 企微应用 {
     return 果;
   }
 
+  /**
+   * 把卡片上被点的那颗按钮换成新文案，并置灰不可再点（2026-11-27 老板定 A 方案）。
+   *
+   * 企微没有独立的「禁用」字段：更新模板卡片时传 `button.replace_name`，
+   *    客户端就渲染成灰色、点不动的按钮。response_code 与 task_id 都取自
+   *    回调 XML（<ResponseCode> / <TaskId>）；response_code 一次性、72 小时内有效。
+   *
+   * @param {string} 用户ID
+   * @param {{responseCode:string, taskId:string}} 回调
+   * @param {string} 新文案 如「✅ 已允许」
+   * @param {boolean} [重试] 令牌失效时重试一次
+   */
+  async 更新卡片按钮(用户ID, { responseCode, taskId } = {}, 新文案, 重试 = true) {
+    if (!responseCode || !taskId) throw new Error('缺 response_code / task_id，无法更新卡片');
+    const 令牌 = await this.#取令牌();
+    const 回 = await fetch(
+      `https://qyapi.weixin.qq.com/cgi-bin/message/update_template_card?access_token=${encodeURIComponent(令牌)}`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({
+          userids: [用户ID],
+          agentid: Number(this.配置.agentId),
+          response_code: responseCode,
+          template_card: {
+            card_type: 'button_interaction',
+            task_id: taskId,
+            button: { replace_name: 新文案 },
+          },
+        }),
+        signal: AbortSignal.timeout(15000),
+      },
+    );
+    const 果 = await 回.json().catch(() => ({}));
+    const 码 = Number(果?.errcode);
+    if (重试 && (码 === 42001 || 码 === 40014)) {
+      this.#令牌 = '';
+      return this.更新卡片按钮(用户ID, { responseCode, taskId }, 新文案, false);
+    }
+    if (!回.ok || 码 !== 0) {
+      throw new Error(`企微更新卡片失败：${码 || 回.status} ${果?.errmsg || ''}`.trim());
+    }
+    记({ 已更新卡片: true });
+    return 果;
+  }
+
   /** 取企微临时图片，返回可供 DSH 使用的 base64 图片块数据。 */
   async 取图片(媒体ID, 重试 = true) {
     if (!媒体ID) throw new Error('图片缺少 MediaId');

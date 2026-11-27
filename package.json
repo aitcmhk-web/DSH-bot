@@ -67,6 +67,7 @@
     "test-hard-rules-gate.mjs",
     "test-memory-handoff.mjs",
     "test-turn-guards.mjs",
+    "test-wecom-card-settle.mjs",
     "run-tests.mjs",
     "打包安装包.sh",
     "packaging/"
