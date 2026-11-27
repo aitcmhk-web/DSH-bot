@@ -49,7 +49,10 @@ try {
   // ---- ① 正常更新：端点和请求体 ----
   装假企微(0);
   const 应用 = new 企微应用({ corpId: 'corp', secret: 'sec', agentId: 1000011 });
-  await 应用.更新卡片按钮('zhangsan', { responseCode: 'RC-1', taskId: 'TASK-1' }, '✅ 已允许');
+  await 应用.更新卡片按钮('zhangsan', { responseCode: 'RC-1', taskId: 'TASK-1' }, '✅ 已允许', [
+    { text: '允许一次', style: 1, type: 0, key: 'qiwei_appr_ok_A' },
+    { text: '拒绝', style: 3, type: 0, key: 'qiwei_appr_no_A' },
+  ]);
 
   check(调用.length === 1, '只发了一次请求（不是发消息、也没重复）');
   const { 址, 体 } = 调用[0] ?? {};
@@ -63,6 +66,12 @@ try {
   check(体?.template_card?.main_title?.title === 'DSH 等待审批', 'main_title 必填带上（缺了会 41016）');
   check(体?.template_card?.task_id === 'TASK-1', 'task_id 与发卡时一致');
   check(体?.template_card?.button?.replace_name === '✅ 已允许', '按钮文案走 button.replace_name（企微据此置灰）');
+  // 整卡替换：button_list 必填，漏传企微回 40016 invalid button size（2026-11-27 实证）
+  check(
+    Array.isArray(体?.template_card?.button_list) && 体.template_card.button_list.length === 2,
+    'button_list 必填带上（缺了会 40016）',
+  );
+  check(体?.template_card?.button_list?.[0]?.key === 'qiwei_appr_ok_A', 'button_list 的 key 与发卡时一致');
 
   // ---- ② 拒绝文案同样能走 ----
   装假企微(0);

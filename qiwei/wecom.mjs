@@ -150,9 +150,12 @@ export class 企微应用 {
    * @param {string} 用户ID
    * @param {{responseCode:string, taskId:string}} 回调
    * @param {string} 新文案 如「✅ 已允许」
+   * @param {Array<{text:string, style:number, key:string}>} [按钮列] 发卡时那两颗按钮
+   *        更新接口是「整卡替换」，漏传 button_list 企微回 40016 invalid button size
+   *        （2026-11-27 实证：卡不变灰、按钮还能再点）。
    * @param {boolean} [重试] 令牌失效时重试一次
    */
-  async 更新卡片按钮(用户ID, { responseCode, taskId } = {}, 新文案, 重试 = true) {
+  async 更新卡片按钮(用户ID, { responseCode, taskId } = {}, 新文案, 按钮列 = [], 重试 = true) {
     if (!responseCode || !taskId) throw new Error('缺 response_code / task_id，无法更新卡片');
     const 令牌 = await this.#取令牌();
     const 回 = await fetch(
@@ -170,6 +173,7 @@ export class 企微应用 {
             //    41016 missing title（2026-11-27 实证），卡就不变灰、看着像没点上。
             main_title: { title: 'DSH 等待审批' },
             task_id: taskId,
+            button_list: 按钮列,
             button: { replace_name: 新文案 },
           },
         }),
@@ -180,7 +184,7 @@ export class 企微应用 {
     const 码 = Number(果?.errcode);
     if (重试 && (码 === 42001 || 码 === 40014)) {
       this.#令牌 = '';
-      return this.更新卡片按钮(用户ID, { responseCode, taskId }, 新文案, false);
+      return this.更新卡片按钮(用户ID, { responseCode, taskId }, 新文案, 按钮列, false);
     }
     if (!回.ok || 码 !== 0) {
       throw new Error(`企微更新卡片失败：${码 || 回.status} ${果?.errmsg || ''}`.trim());
