@@ -59,6 +59,8 @@ try {
   check(体?.agentid === 1000011, 'agentid 是数字');
   check(体?.response_code === 'RC-1', 'response_code 原样带上（一次性，不能编）');
   check(体?.template_card?.card_type === 'button_interaction', 'card_type 是按钮交互型');
+  // 更新接口是整卡替换，按钮交互型缺 main_title 会被企微回 41016 missing title（2026-11-27 实证）
+  check(体?.template_card?.main_title?.title === 'DSH 等待审批', 'main_title 必填带上（缺了会 41016）');
   check(体?.template_card?.task_id === 'TASK-1', 'task_id 与发卡时一致');
   check(体?.template_card?.button?.replace_name === '✅ 已允许', '按钮文案走 button.replace_name（企微据此置灰）');
 

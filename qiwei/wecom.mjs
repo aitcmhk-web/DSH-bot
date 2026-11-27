@@ -166,6 +166,9 @@ export class 企微应用 {
           response_code: responseCode,
           template_card: {
             card_type: 'button_interaction',
+            // ⚠️ 更新接口是「整卡替换」：按钮交互型的 main_title 必填，不传企微回
+            //    41016 missing title（2026-11-27 实证），卡就不变灰、看着像没点上。
+            main_title: { title: 'DSH 等待审批' },
             task_id: taskId,
             button: { replace_name: 新文案 },
           },
