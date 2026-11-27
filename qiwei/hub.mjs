@@ -52,9 +52,7 @@ const 企微 = new 企微应用(配置);
 /** 点「切换模型」后，下一条纯数字自动变成 /model N。 */
 const 待选模型 = new Map();
 
-/** 打 0 弹菜单；5 分钟内回 1-5 执行对应项。菜单回复不进会话，不占轮次。 */
-const 待选菜单 = new Map();
-const 菜单存活毫秒 = 300_000;
+/** 数字键 0-5 = 常驻指令菜单（2026-11-27 老板定：永久生效，⛔ 不用先按 0）。 */
 /** 升级这类动作要二次审核：点了只发确认，回 y 才真投。 */
 const 待确认 = new Map();
 const 待确认毫秒 = 120_000;
@@ -70,6 +68,7 @@ const 菜单项 = {
   5: { 命令: '/restart', 说明: '重启 BOT' },
 };
 const 菜单文字 = [
+  '0 . 显示菜单',
   '1 . 开启会话',
   '2 . 切换模型',
   '3 . 查看状态',
@@ -344,14 +343,6 @@ async function 处理消息(用户ID, 正文) {
   if (类型 === 'text') {
     let 文字 = 取标签(正文, 'Content').trim();
 
-    // 0 = 弹菜单（本地回，不进会话）
-    if (文字 === '0') {
-      待选菜单.set(用户ID, Date.now() + 菜单存活毫秒);
-      待选模型.delete(用户ID);
-      await 企微.发文字(用户ID, 菜单文字).catch(() => {});
-      记({ 菜单: '已弹出', 用户: 用户ID });
-      return;
-    }
     // 审核窗口：只有 y 才真投，n 或其它文字都作废
     const 确认 = 待确认.get(用户ID);
     if (确认) {
@@ -373,10 +364,22 @@ async function 处理消息(用户ID, 正文) {
       }
     }
 
-    // 菜单窗口内的 1-5 = 对应命令
-    const 菜单到期 = 待选菜单.get(用户ID) ?? 0;
-    if (菜单到期 > Date.now() && /^[1-5]$/.test(文字)) {
-      待选菜单.delete(用户ID);
+    // 先看「刚发过模型清单」：那串数字是回答上一个问题，归模型选择
+    const 模型到期 = 待选模型.get(用户ID) ?? 0;
+    if (模型到期 > Date.now() && /^\d{1,2}$/.test(文字.trim())) {
+      文字 = `/model ${文字.trim()}`;
+      待选模型.delete(用户ID);
+    } else if (/^\/model(?:\s|$)/i.test(文字.trim())) {
+      待选模型.delete(用户ID);
+    } else if (/^\/new(?:\s|$)/i.test(文字.trim())) {
+      待选模型.delete(用户ID);
+    } else if (/^[0-5]$/.test(文字)) {
+      // 数字键 = 常驻指令菜单（2026-11-27 老板定：永久生效，⛔ 不用先按 0）
+      if (文字 === '0') {
+        await 企微.发文字(用户ID, 菜单文字).catch(() => {});
+        记({ 菜单: '已弹出', 用户: 用户ID });
+        return;
+      }
       const 选 = 菜单项[文字];
       if (选?.确认) {
         待确认.set(用户ID, { 命令: 选.确认, 到期: Date.now() + 待确认毫秒 });
@@ -389,19 +392,8 @@ async function 处理消息(用户ID, 正文) {
         return;
       }
       文字 = 选.命令;
-    } else if (菜单到期 <= Date.now()) {
-      待选菜单.delete(用户ID);
     }
 
-    const 到期 = 待选模型.get(用户ID) ?? 0;
-    if (到期 > Date.now() && /^\d{1,2}$/.test(文字.trim())) {
-      文字 = `/model ${文字.trim()}`;
-      待选模型.delete(用户ID);
-    } else if (/^\/model(?:\s|$)/i.test(文字.trim())) {
-      待选模型.delete(用户ID);
-    } else if (/^\/new(?:\s|$)/i.test(文字.trim())) {
-      待选模型.delete(用户ID);
-    }
     if (文字) {
       const 送达 = await 发到Hub({ id: 投递ID, 用户ID, 正文: 文字 });
       if (!送达) await 企微.发文字(用户ID, '主 bot 暂时没接上，消息已排队，恢复后补投。').catch(() => {});
