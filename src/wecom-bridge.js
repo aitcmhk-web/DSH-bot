@@ -149,7 +149,7 @@ export class WecomBridgeEndpoint {
     this.approvalHandler = typeof fn === 'function' ? fn : null;
   }
 
-  /** 出站：请 sidecar 在企微里发一张审批卡（回 1 允许 / 2 拒绝）。 */
+  /** 出站：请 sidecar 在企微里发一张审批卡（点按钮结算；数字键归指令菜单）。 */
   async sendApprovalAsk({ id, text }) {
     const 编号 = String(id ?? '').trim();
     if (!编号) throw new Error('审批 id 不能为空');
