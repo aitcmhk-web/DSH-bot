@@ -445,7 +445,22 @@ export class BotRuntime {
    */
   waitForTurn(chatKey, timeoutMs = 90 * 60 * 1000) {
     const rec = this.#sessions.get(chatKey);
-    const sessionId = rec ? String(rec.handle.agent.id) : null;
+    // ⚠️ 等的时候会话可能还没建：index.js 的回合体是「先 waitForTurn 再 prompt」，
+    //    为的是不丢掉「发送→第一声」之间的那几毫秒事件。原来这里 rec 没有就留 null，
+    //    判断写成 `sessionId !== null && sid !== sessionId` —— 等于 null 时不设防，
+    //    谁的 turn/end 都能把这一轮收掉（/new 之后首条消息必踩，并发时串话、
+    //    答案被别的会话收走）。会话 id 本身是确定的：`#sessionIdFor()` 先读落盘口、
+    //    没有才现造，与随后 `#create()` 用的是同一个，所以这里先把它定死。
+    let sessionId = rec ? String(rec.handle.agent.id) : null;
+    if (sessionId === null) {
+      try {
+        sessionId = this.#sessionIdFor(chatKey);
+      } catch (err) {
+        // 落盘口坏了不能把「等待」整个判死：退回 #create() 的同一条兜底 id。
+        logErr(`waitForTurn 取会话 id 失败（${chatKey}）: ${err.message}`);
+        sessionId = `${SESSION_PREFIX}:${chatKey}`;
+      }
+    }
 
     return new Promise((resolve) => {
       let text = '';
@@ -465,7 +480,12 @@ export class BotRuntime {
 
       const off = this.onSessionEvent((payload) => {
         const { sessionId: sid, event } = payload ?? {};
-        if (sessionId !== null && sid !== sessionId) return;
+        // 只认本会话：sid 空、或不是这一个，一律当别人的事件（2026-11-27 修）。
+        //    两种 id 都算「本会话」：预分配的会话 id（prompt 尚未建好时），
+        //    以及建好之后的活句柄 id —— 宿主若是自己另发 id，活句柄这条兜住。
+        const live = this.#sessions.get(chatKey);
+        const 活id = live ? String(live.handle.agent.id) : null;
+        if (!sid || (sid !== sessionId && sid !== 活id)) return;
 
         // 一轮结束
         if (event?.type === 'turn/end') {

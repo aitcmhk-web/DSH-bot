@@ -29,6 +29,7 @@ import { Telegram } from './telegram.js';
 import { Weixin } from './weixin.js';
 import { Memory } from './memory.js';
 import { BotRuntime } from './runtime.js';
+import { 要排队 } from './command-policy.js';
 import { Hub, makeMessage, markAsHubOutput } from './hub.js';
 import { WecomBridgeEndpoint } from './wecom-bridge.js';
 import { buildRoutes, routeByKey, routeFor, describeRoute, isRouteFailure, reasoningEffortFor } from './models.js';
@@ -1377,7 +1378,16 @@ export function apply(ctx, config) {
     // 回合内的「活状态」：TG = 占位消息 + 打字续期 + 进度编辑；
     // 微信 = 只有「正在输入」。造不出来就返回 null，退回干等（不影响回答）。
     const status = makeLiveStatus(msg);
-    if (status) await status.begin();
+    // 回合体整体包进 try/catch/finally（2026-11-27 修 P0#5）：
+    //    begin() 之后任何 await 抛错，原来会被 enqueue() 的 .catch 吞掉 ——
+    //    气泡不删、typing 每 4.5 秒永久续期、订阅不退、用户零回复。
+    //    catch 保证「用户至少收到一句失败原因」，finally 保证「订阅必退、气泡必收」。
+    //    ⚠️ 缩进没重排：整段挪两格会让 diff 变成 150 行噪音，结构以 try 为准。
+    let offEvents = null; // 原先在段落中间 const 声明，挪到这里给 finally 用
+    let 已收尾 = false; // 正常收尾（清气泡 / 标未送达）已经做过了
+    let 已失败 = false; // 走的是 fail()，气泡里已是错误提示，⛔ 别再清掉
+    try {
+      if (status) await status.begin();
 
 
     // 冷启动记忆：会话还不存在（即将新建）= 上一段已随 /new、/restart、切模型
@@ -1422,7 +1432,7 @@ export function apply(ctx, config) {
 
     // 会话事件 → 活状态（工具动态 + 吐字速度采样），与软件版 onSessionEvent 同一套规则。
     // 活状态造不出来（比如不是 TG）时不订阅。
-    const offEvents = status
+    offEvents = status
       ? runtime.onSessionEvent((payload) => {
           const sid = runtime.sessionIdOf(chatKey);
           if (sid === null || payload?.sessionId !== sid) return;
@@ -1463,6 +1473,7 @@ export function apply(ctx, config) {
       const sent = await runtime.prompt(chatKey, promptPayload);
       if (!sent.ok) {
         offEvents?.();
+        已失败 = true;
         await status?.fail(sent.error);
         error(`交给 DSH 失败（${chatKey}）: ${sent.error}`);
         await ep.send({ text: `❌ 处理失败：${sent.error}` }).catch(() => {});
@@ -1494,6 +1505,7 @@ export function apply(ctx, config) {
     }
     offEvents?.();
     if (!answer.ok) {
+      已失败 = true;
       await status?.fail(answer.error);
       error(`等回答失败（${chatKey}）: ${answer.error}`);
       await ep.send({ text: `❌ ${answer.error}` }).catch(() => {});
@@ -1528,7 +1540,30 @@ export function apply(ctx, config) {
       //   跟回答尾巴重复。没送达那一支保留气泡并标「未送达」（上面那支），⛔ 不删。
       await status?.清气泡();
     }
-    return { ok: true };
+      已收尾 = true;
+      return { ok: true };
+    } catch (err) {
+      const 原因 = err?.message ?? String(err);
+      已失败 = true;
+      error(`回合异常（${chatKey}）: ${err?.stack ?? 原因}`);
+      // ⛔ 不许让用户零回复：抛错也要有一句人话（P0#5 的另一半）。
+      try {
+        await status?.fail(原因);
+      } catch { /* fail() 自己再出错也不能把收尾带崩 */ }
+      await ep.send({ text: `❌ 处理失败：${原因}` }).catch(() => {});
+      return { ok: false, error: 原因 };
+    } finally {
+      // 订阅必须退：否则每个坏回合都留一个监听器，越跑越慢、还会被别的会话事件带偏。
+      offEvents?.();
+      // 正常收尾（清气泡 / 标未送达）上面已经做过；fail() 那条气泡里已是错误提示，
+      //    ⛔ 别再清掉。剩下「既没收尾也没失败」= 提前 return 或抛在 begin() 之前，
+      //    这里兜底把「正在处理」气泡收走，不然它会一直转圈。
+      if (!已收尾 && !已失败 && status) {
+        try {
+          await status.清气泡();
+        } catch { /* 收不掉只影响观感，不影响回答 */ }
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1703,15 +1738,21 @@ export function apply(ctx, config) {
 
     if (rawText.startsWith('/')) {
       const parts = rawText.split(/\s+/);
-      const handled = await handleCommand(
-        (t) => telegram.sendMessage(chatId, t),
-        chatId,
-        userId,
-        `tg:${chatId}`,
-        parts[0].toLowerCase().split('@')[0],
-        parts.slice(1).join(' '),
-        'tg',
-      );
+      const cmd = parts[0].toLowerCase().split('@')[0];
+      const chatKey = `tg:${chatId}`;
+      const run = () =>
+        handleCommand(
+          (t) => telegram.sendMessage(chatId, t),
+          chatId,
+          userId,
+          chatKey,
+          cmd,
+          parts.slice(1).join(' '),
+          'tg',
+        );
+      // 改会话状态的命令一律排队；/restart 是白名单里的例外（见 command-policy.js）：
+      //    排队会让「卡死时自救」也卡死，所以它是唯一允许抢跑的命令。
+      const handled = await (要排队(cmd) ? enqueue(chatKey, run) : run());
       if (handled) return;
     }
 
