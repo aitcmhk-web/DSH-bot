@@ -15,6 +15,13 @@
  */
 
 import { createServer } from 'node:http';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// 记忆目录必须每次新建：默认落在 cwd/memory（即 /tmp/memory），
+// 跨次运行会把上一次的「[图片]」记进流水账 → 冷启动 handoff 又把它注回来 → 误报。
+const MEM_DIR = mkdtempSync(join(tmpdir(), 'image-e2e-mem-'));
 
 let failed = 0;
 const ok = (cond, msg) => {
@@ -118,6 +125,7 @@ plugin.apply(ctx, {
   telegramApiRoot: `http://127.0.0.1:${TG_PORT}`,
   telegramAllowedUsers: [],
   cwd: '/tmp',
+  memoryDir: MEM_DIR,
   turnTimeoutMs: 4000,
   routes: [{ key: 'k', provider: 'deepseek-official', model: 'deepseek-flash' }],
   defaultRouteKey: 'k',
@@ -166,10 +174,11 @@ ok(
   '没有裸露的 base64 图片块漏到 agent（这正是模型"看不见内容"的原因）',
 );
 ok(
-  !JSON.stringify(blocks).includes('[图片]'),
+  !blocks.some((b) => b?.type === 'text' && String(b.text ?? '').trim() === '[图片]'),
   '不会只把 "[图片]" 占位符送下去（0.0.11 的真实症状）',
 );
 
 tg.close();
+rmSync(MEM_DIR, { recursive: true, force: true });
 console.log(failed === 0 ? '\n全部通过' : `\n${failed} 项失败`);
 process.exit(failed === 0 ? 0 : 1);
