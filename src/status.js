@@ -635,3 +635,129 @@ export class LiveStatus {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// 企微：没有「编辑已发消息」接口，只能发新消息（见 index.js makeLiveStatus 的旧注释）。
+// 触发点与 TG 完全一致——换顶行、加一条操作；区别只在「落成一条新消息」而不是改同一条。
+// 条数靠三道闸压住，多的一律丢弃（不排队，免得收尾之后还在刷屏）：
+//   ① 去抖 2s（与 TG 同一个窗口）
+//   ② 最小间隔 WECOM_GAP_MS
+//   ③ 每轮上限 WECOM_MAX
+// 不单发「⏳ 正在处理…」占位：企微删不掉消息，留着就是垃圾；第一条一定是「有内容」的那条。
+// ---------------------------------------------------------------------------
+const WECOM_GAP_MS = 6000;
+const WECOM_MAX = 20;
+
+export class WecomStatus {
+  constructor({ send, log = () => {}, error = () => {} } = {}) {
+    this.kind = 'wecom';
+    this.send = send;
+    this.log = log;
+    this.error = error;
+    this.notes = [];
+    this.正文已读 = '';
+    this.在代码块里 = false;
+    this.最新一句 = '';
+    this.timer = null;
+    this.在飞 = null;
+    this.lastSentAt = 0;
+    this.sentCount = 0;
+    this.lastText = '';
+    this.closed = false;
+  }
+
+  /** 不发占位条：第一条进度等真有内容（换顶行或加操作）时再发。 */
+  async begin() {}
+
+  addNote(note, 类型 = '工具') {
+    const 文本 = truncate(note, 操作行_MAX);
+    if (!文本) return;
+    const 行 = 类型 === '进度' ? `📌 ${文本}` : 文本;
+    if (this.notes[this.notes.length - 1] === 行) return;
+    this.notes.push(行);
+    if (this.notes.length > 12) this.notes.splice(0, this.notes.length - 12);
+    this.#schedule();
+  }
+
+  /** 与 LiveStatus.推正文 同一套口径：顶行＝我最新说的那句；代码块与空行不上屏。 */
+  推正文(整段正文) {
+    const 段 = String(整段正文 ?? '');
+    if (!段) return;
+    const 增量 = 段.startsWith(this.正文已读) ? 段.slice(this.正文已读.length) : 段;
+    this.正文已读 = 段;
+    if (!增量) return;
+    let 换了 = false;
+    for (const 原始 of 增量.split('\n')) {
+      const 行 = 原始.trim();
+      if (!行) continue;
+      if (行.startsWith('```') || 行.startsWith('~~~')) {
+        this.在代码块里 = !this.在代码块里;
+        continue;
+      }
+      if (this.在代码块里) continue;
+      if (进度标记.test(行)) continue;
+      this.最新一句 = truncate(行, 顶行_MAX);
+      换了 = true;
+    }
+    if (换了) this.#schedule();
+  }
+
+  trackProgress() {}
+
+  render() {
+    const 文 = this.最新一句 || 占位语;
+    const recent = this.notes.slice(-3);
+    return recent.length === 0 ? 文 : `${文}\n\n${recent.join('\n')}`;
+  }
+
+  #schedule() {
+    if (this.closed || this.timer) return;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.#emit(this.render()).catch(() => {});
+    }, EDIT_DEBOUNCE_MS);
+    this.timer.unref?.();
+  }
+
+  async #emit(文本) {
+    if (this.closed) return;
+    const 文 = String(文本 ?? '');
+    if (!文 || 文 === this.lastText) return;
+    if (this.sentCount >= WECOM_MAX) return;
+    const now = Date.now();
+    if (now - this.lastSentAt < WECOM_GAP_MS) return;
+    this.lastSentAt = now;
+    this.sentCount += 1;
+    this.lastText = 文;
+    const 在飞 = (async () => {
+      try {
+        await this.send(文);
+      } catch (err) {
+        this.error(`企微进度发不出（不影响回答）: ${err?.message ?? err}`);
+      }
+    })();
+    this.在飞 = 在飞;
+    await 在飞;
+    if (this.在飞 === 在飞) this.在飞 = null;
+  }
+
+  /** 收尾：停定时器、等在飞落地；⛔ 不发「已完成」——回答本身就是完成。 */
+  async finish() {
+    this.#clear();
+    if (this.在飞) await this.在飞.catch(() => {});
+    this.closed = true;
+    return null;
+  }
+
+  async fail() {}
+  async 标未送达() {}
+  async 清气泡() {}
+  dispose() {
+    this.#clear();
+    this.closed = true;
+  }
+  #clear() {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+  }
+}

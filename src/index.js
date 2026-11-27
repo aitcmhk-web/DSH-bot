@@ -34,7 +34,7 @@ import { WecomBridgeEndpoint } from './wecom-bridge.js';
 import { buildRoutes, routeByKey, routeFor, describeRoute, isRouteFailure, reasoningEffortFor } from './models.js';
 import { readWebLlmPiAi, readWebLlmDeepseek, readWebLlmDeepseekAccount, webPatchPath } from './web-patch.js';
 import { syncOwnProfileFromWeb } from './model-sync.js';
-import { LiveStatus, describeTool, 挑进度行, 落盘未送达 } from './status.js';
+import { LiveStatus, WecomStatus, describeTool, 挑进度行, 落盘未送达 } from './status.js';
 import { transcribe, configure as configureAsr, currentBackend } from './asr.js';
 import { installApprovalBridge } from './approval-bridge.js';
 import { createHerdWatchdog, HERD_GROUP_FALLBACK } from './herd.js';
@@ -1301,9 +1301,19 @@ export function apply(ctx, config) {
           error,
         });
       }
-      // 企微侧暂时没有「正在输入/进度编辑」接口；返回 null，退回干等，
-      // 不伪造一个假的 LiveStatus。
-      if (msg.source === 'wecom') return null;
+      // 企微侧没有「编辑已发消息 / 正在输入」接口，只能发新消息：
+      // 触发点照搬 TG（换顶行、加操作），由 WecomStatus 折成一条条进度消息（自带去抖/间隔/上限）。
+      // 关掉：DSH_BOTPLUGIN_WECOM_PROGRESS=0 → 完全回到「干等」的老行为。
+      if (msg.source === 'wecom') {
+        const 开关 = String(process.env.DSH_BOTPLUGIN_WECOM_PROGRESS ?? '').trim().toLowerCase();
+        if (开关 === '0' || 开关 === 'false' || 开关 === 'off') return null;
+        if (!wecom) return null;
+        return new WecomStatus({
+          send: (text) => wecom.send({ text }),
+          log,
+          error,
+        });
+      }
     } catch (err) {
       error(`活状态初始化失败(本轮没有进度显示,不影响回答): ${err.message}`);
     }
