@@ -12,7 +12,10 @@
  * 宁可多留，不可误杀。将来要恢复过滤，注入一个 filterUserText 回调即可。
  */
 
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
+import {
+  existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync,
+  openSync, closeSync, fsyncSync, renameSync, copyFileSync, unlinkSync,
+} from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 
@@ -96,6 +99,33 @@ export class Memory {
       /* 目录不存在等 → 交给调用方按"读不到"处理 */
     }
     return null;
+  }
+
+  /**
+   * 取「够用」的账本正文：从本月往回拼，凑够 minEntries 条就停。
+   *
+   * 为什么需要：`readLedgerText()` 只读本月。月初头两天本月只有几条，
+   * handoff 会被这几条整个覆盖 —— 上个月的全部记忆当场丢。
+   * 拼接顺序是「旧月份在前、本月在后」，`readRecentLedgerEntries` 从末尾取 20 条，正好跨月接上。
+   */
+  readLedgerTextWithPrevious(minEntries = 20, d = new Date()) {
+    const curName = ledgerMonthFile(d);
+    let files = [];
+    try {
+      files = readdirSync(this.ledgerDir).filter((f) => /^\d{4}-\d{2}\.md$/.test(f)).sort();
+    } catch {
+      files = [];
+    }
+    const upto = files.filter((f) => f <= curName);
+    if (upto.length === 0) return this.readLedgerText(d); // 本机还没有任何账本
+    const picked = [];
+    let total = 0;
+    for (let i = upto.length - 1; i >= 0 && total < minEntries; i -= 1) {
+      const t = readFileSync(join(this.ledgerDir, upto[i]), 'utf8');
+      picked.unshift(t);
+      total += (t.match(/^## \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/gm) ?? []).length;
+    }
+    return picked.join('\n');
   }
 
   /**
@@ -253,8 +283,8 @@ export class Memory {
       const file = join(handoffDir, 'handoff.md');
 
       // handoff 不是模板，是「摘要之后 → 重启之前」这段的实录，从流水账取。
-      const ledgerText = this.readLedgerText();
-      const recent = this.readRecentLedgerEntries(ledgerText, 20); // 末尾往回 20 条
+      const ledgerText = this.readLedgerTextWithPrevious(20);
+      const recent = this.readRecentLedgerEntries(ledgerText, 20); // 末尾往回 20 条（本月不足时自动从上月接）
       const ledgerRel = `memory/conversation-cache/raw/ledger/${ledgerMonthFile()}`;
       const route = typeof currentRoute === 'function' ? currentRoute() : currentRoute;
 
@@ -293,8 +323,36 @@ export class Memory {
         ``,
       ].join('\n');
 
-      // 必须直接覆盖：带 { flag: 'wx' } 会在第二次写入时 EEXIST 拒绝。
-      writeFileSync(file, lines); // 固定单份，每次直接覆盖
+      // 原子写：同目录临时文件 → fsync → 备份旧文件 → rename 覆盖。
+      // 为什么不能直接 writeFileSync：写到一半断电／ENOSPC 会把旧 handoff 也毁掉，
+      // 而 handoff 是断线后唯一的上下文来源，毁了就真接不上了。
+      // 也不能用 { flag: 'wx' }：第二次写入会 EEXIST 拒绝（固定单份、每次覆盖）。
+      const tmp = `${file}.tmp-${process.pid}-${Date.now().toString(36)}`;
+      try {
+        writeFileSync(tmp, lines);
+        const fd = openSync(tmp, 'r+');
+        try {
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+        if (existsSync(file)) {
+          try {
+            copyFileSync(file, `${file}.prev`);
+          } catch {
+            /* 旧文件留底失败不阻塞覆盖 */
+          }
+        }
+        renameSync(tmp, file);
+      } finally {
+        if (existsSync(tmp)) {
+          try {
+            unlinkSync(tmp);
+          } catch {
+            /* 临时文件删不掉不影响结果 */
+          }
+        }
+      }
       this.log(`[handoff] (${reason}) 已写入 ${file}`);
       return file;
     } catch (err) {
@@ -333,7 +391,7 @@ export class Memory {
    */
   maybeWriteHandoff(opts) {
     try {
-      const n = this.countLedgerEntriesSince(this.readLedgerText(), opts.sessionCreatedAt);
+      const n = this.countLedgerEntriesSince(this.readLedgerTextWithPrevious(HANDOFF_MIN_TURNS), opts.sessionCreatedAt);
       if (n < HANDOFF_MIN_TURNS) {
         this.log(`[handoff] (${opts.reason}) 跳过 — 本次会话仅 ${n} 条(<${HANDOFF_MIN_TURNS}，视为调试)`);
         return 'skipped';
@@ -352,10 +410,12 @@ export class Memory {
    */
   catchUpHandoffOnBoot(opts) {
     try {
-      if (opts.ownerUserId === null || opts.ownerUserId === undefined) return; // owner 锚点还没解析出来
+      // ⚠️ 不能拿 ownerUserId 当闸：启动这一刻 owner 还没解析出来（state.ownerUserId 恒为 null），
+      //    旧写法等于「补写永远不执行」。改成按流水账有没有条目判断 —— 目的只是不写空壳。
       const handoffFile = join(this.memoryDir, 'handoff', 'handoff.md');
       const ledgerText = this.readLedgerText();
       if (ledgerText === null) return;
+      if (!/^## \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/m.test(ledgerText)) return; // 一条都没有 → 不写空壳
 
       // 流水账最后一条的时间（本地时间格式，与写入端一致）
       // 正则必须用 [ \t]+：写入端的时间后是两个空格，单个空格会恒判"已是最新"。
