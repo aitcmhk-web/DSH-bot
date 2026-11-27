@@ -304,12 +304,9 @@ async function 处理卡片按钮(用户ID, 键, 回调 = {}) {
   // 点完就把这颗按钮改成结果并置灰（企微的 button.replace_name 就是「灰 + 不可点」）。
   // ⛔ 更新失败只记日志：不补发文字、不指路去 TG（2026-11-27 老板定「失败了就失败了」）。
   const 文案 = 送达 ? (允许 ? '✅ 已允许' : '❌ 已拒绝') : '⚠️ 未生效';
-  // 更新接口是「整卡替换」：button_list 必填，漏传回 40016 invalid button size
-  //    （2026-11-27 实证：卡不变灰、按钮还能再点）。两颗按钮与发卡处（517 行）一致。
-  const 按钮列 = [
-    { text: '允许一次', style: 1, type: 0, key: `qiwei_appr_ok_${配[2]}` },
-    { text: '拒绝', style: 3, type: 0, key: `qiwei_appr_no_${配[2]}` },
-  ];
+  // 更新接口是「整卡替换」：直接把这颗按成结果（style 2 = 灰），不再靠 button.replace_name
+  //    —— 2026-11-27 实证：replace_name 返回 0，界面纹丝不动。
+  const 按钮列 = [{ text: 文案, style: 2, type: 0, key: `qiwei_appr_${允许 ? 'ok' : 'no'}_${配[2]}` }];
   try {
     await 企微.更新卡片按钮(用户ID, 回调, 文案, 按钮列);
     记({ 审批卡: '已置灰', id: 配[2], 文案 });

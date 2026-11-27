@@ -174,7 +174,6 @@ export class 企微应用 {
             main_title: { title: 'DSH 等待审批' },
             task_id: taskId,
             button_list: 按钮列,
-            button: { replace_name: 新文案 },
           },
         }),
         signal: AbortSignal.timeout(15000),

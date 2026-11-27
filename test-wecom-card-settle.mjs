@@ -65,7 +65,8 @@ try {
   // 更新接口是整卡替换，按钮交互型缺 main_title 会被企微回 41016 missing title（2026-11-27 实证）
   check(体?.template_card?.main_title?.title === 'DSH 等待审批', 'main_title 必填带上（缺了会 41016）');
   check(体?.template_card?.task_id === 'TASK-1', 'task_id 与发卡时一致');
-  check(体?.template_card?.button?.replace_name === '✅ 已允许', '按钮文案走 button.replace_name（企微据此置灰）');
+  check(体?.template_card?.button_list?.[0]?.text === '允许一次', '按钮列原样带上（结果靠那颗按钮的文案与 style）');
+  check(!体?.template_card?.button, '不再依赖 button.replace_name');
   // 整卡替换：button_list 必填，漏传企微回 40016 invalid button size（2026-11-27 实证）
   check(
     Array.isArray(体?.template_card?.button_list) && 体.template_card.button_list.length === 2,
@@ -75,8 +76,10 @@ try {
 
   // ---- ② 拒绝文案同样能走 ----
   装假企微(0);
-  await 应用.更新卡片按钮('zhangsan', { responseCode: 'RC-2', taskId: 'TASK-2' }, '❌ 已拒绝');
-  check(调用[0]?.体?.template_card?.button?.replace_name === '❌ 已拒绝', '拒绝文案同样按 replace_name 发');
+  await 应用.更新卡片按钮('zhangsan', { responseCode: 'RC-2', taskId: 'TASK-2' }, '❌ 已拒绝', [
+    { text: '❌ 已拒绝', style: 2, type: 0, key: 'qiwei_appr_no_B' },
+  ]);
+  check(调用[0]?.体?.template_card?.button_list?.[0]?.text === '❌ 已拒绝', '拒绝文案同样画进 button_list');
 
   // ---- ③ 缺 response_code / task_id：必须当场抛，不许白调一次接口 ----
   装假企微(0);
