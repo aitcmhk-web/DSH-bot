@@ -63,6 +63,29 @@ export function isHubOutput(msg) {
 }
 
 /**
+ * 来源通道的中文标：消息广播到**别的**端点时，正文前标出它是从哪个通道来的。
+ *
+ * 口径（2026-11-27 老板定）：
+ *   · 标识只有**一个**——来源。电报说的 → `[电报]`，DSH 说的 → `[DSH]`（回话自带，这里不碰）。
+ *   · ⛔ 来源端自己不加：刚在那边打的字，不用再标一遍。
+ *   · ⛔ 回话（viaHub）不加：它没有「通道来源」，`[DSH]` 就是它的标识。
+ */
+const 来源标 = { tg: '电报', wx: '微信', wecom: '企微' };
+
+/** 给「广播到非来源端」的消息加来源标；来源端／回话／无来源一律原样返回。 */
+export function withSourceTag(msg, endpointId) {
+  const 名 = 来源标[msg?.source];
+  if (!名 || msg.viaHub) return msg;
+  if (endpointId === msg.source) return msg;
+  const text = String(msg.text ?? '');
+  if (!text) return msg;
+  const 副本 = { ...msg, text: `[${名}] ${text}` };
+  // 结构标记是不可枚举的 Symbol，展开会丢；这里有就照抄，别把「本系统产出」弄丢。
+  if (isHubOutput(msg)) markAsHubOutput(副本);
+  return 副本;
+}
+
+/**
  * 节点。持有端点列表，负责广播。
  *
  * 用法：
@@ -220,7 +243,8 @@ export class Hub {
     // 并行发，且**单点失败不影响其他端点**（很重要：微信坏了不能拖垮 TG）。
     await Promise.all(targets.map(async (ep) => {
       try {
-        await this.#sendWithin(ep, msg);
+        // 非来源端加「[电报]/[微信]/[企微]」来源标（2026-11-27 老板定）；来源端与回话原样。
+        await this.#sendWithin(ep, withSourceTag(msg, ep.id));
         sent.push(ep.id);
       } catch (err) {
         failed.push({ id: ep.id, error: err.message });
