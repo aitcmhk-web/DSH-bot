@@ -45,13 +45,6 @@ const DEFAULT_HIT_LOG = '/tmp/hard-rules-hits.log';
  */
 const DEFAULT_EVERY_N = 10;
 
-/**
- * 最高指令每累计多少**个单位**注入一次。单位口径（2026-11-21 定）：
- *   一条新的真人来信 = 1 个单位；调用一次工具 = 1 个单位。
- * 聊天和干活用同一个计数器，不各算各的——纯聊天久了也会攒到，动手时涨得快。
- */
-const DEFAULT_EVERY_TURNS = 10;
-
 /** 单条教训注入的正文上限（字符），超了截断 —— 防 token 爆炸。 */
 const LESSON_CAP = 1000;
 
@@ -180,20 +173,55 @@ const RESULT_RULES = [
   },
 ];
 
+/**
+ * 命令归一：去掉引号、反斜杠、续行，把空格压平。
+ *
+ * 为什么必须做：闸是按文本匹配的，`bash -c 'ssh host'`、`eval "ssh host"`、
+ * `/usr/bin/ssh host` 这三种写法跟 `ssh host` 是同一件事，不归一就全漏。
+ * ⛔ 只做字符级处理，不执行任何东西；base64 之类解不开的编码，
+ *    靠「写文件那一层也看一眼」兜（见 FILE_DANGER）。
+ */
+function 归一命令(c) {
+  return String(c ?? '')
+    .replace(/\\\r?\n/g, ' ')
+    .replace(/['"`]/g, ' ')
+    .replace(/\\(.)/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * 写文件时的兜底：把「杀 bot / 停本机服务」写进脚本再执行，是绕开命令闸最短的一条路。
+ * 只认最要命的那几种，⛔ 不拿它扫普通文档（否则写 README 提到 ssh 也会被拦）。
+ */
+const FILE_DANGER = /(?:pkill|killall)[^\n]{0,60}\b(?:node|dsh|dshbot|botplugin|dsh-botplugin)\b|launchctl\s+(?:kickstart|bootout|bootstrap|unload|load|stop|kill)[^\n]{0,80}com\.local\.dsh|bot\.sh\s+(?:stop|restart)/;
+
+/** 会落盘的写工具 —— 命令闸之外，对这些工具的正文也看一眼（见 FILE_DANGER）。 */
+const WRITE_TOOLS = new Set(['write', 'edit', 'str-replace', 'str_replace']);
+
 /** 入参特征规则（扫工具入参，主要是 bash 的 command）。 */
 const COMMAND_RULES = [
   {
     id: 'suicide',
     label: '自启 / 自杀',
-    test: (c) =>
-      /\bbot\.sh\s+(stop|restart|start)\b/.test(c) ||
-      /botctl\.sh\s+(stop|restart|start)\b/.test(c) ||
-      /\b(?:restart|start|stop)\.command\b/.test(c) ||
-      /(?:重启|启动|停止)\.command/.test(c) ||
-      /restart-helper\.sh/.test(c) ||
-      /\blaunchctl\s+(?:kickstart|bootout|bootstrap|unload|load)\b[^\n]*com\.local\.dshbot/.test(c) ||
-      /\b(?:pkill|killall)\b[^\n]*\bdsh\b/.test(c) ||
-      /\bnohup\b[^\n]*\bdsh\b[^\n]*--profile\s+dshbot/.test(c),
+    test: (c) => {
+      const s = 归一命令(c);
+      return (
+        /\bbot\.sh\s+(stop|restart|start)\b/.test(s) ||
+        /botctl\.sh\s+(stop|restart|start)\b/.test(s) ||
+        /\b(?:restart|start|stop)\.command\b/.test(s) ||
+        /(?:重启|启动|停止)\.command/.test(s) ||
+        /restart-helper\.sh/.test(s) ||
+        // launchd：动本机 dsh 服务的（含 stop/kill/remove），以及域级 bootout（不带 label 也算）
+        /\blaunchctl\s+(?:kickstart|bootout|bootstrap|unload|load|stop|kill|remove|disable)\b[^\n]*com\.local\.dsh/.test(s) ||
+        /\blaunchctl\s+(?:bootout|stop|kill|remove)\s+(?:gui|user)\/[0-9]+(?:\s|$)/.test(s) ||
+        // 按名字杀：node / dsh / bot 一律拒（`pkill -f dshbot` 也算）
+        /\b(?:pkill|killall)\b[^\n]*\b(?:node|dsh|dshbot|botplugin|dsh-botplugin)\b/.test(s) ||
+        // 裸 kill 打到 1 / $$ / $PPID（自杀或打 init）
+        /\bkill\b[^\n]*\s(?:1|\$\$|\$PPID)(?:\s|$)/.test(s) ||
+        /\bnohup\b[^\n]*\bdsh(?:bot|botplugin)?\b[^\n]*--profile\s+dshbot/.test(s)
+      );
+    },
     lessons: [8],
     hint: '⛔ 不许自启：在自己会话里 stop／restart 等于自杀（旧的长轮询没断、新的就起 → Telegram 409）。要重启只提醒主人：请他从 TG 菜单点 `/restart`，或双击 `重启.command`。',
     deny: '拒绝：这是「把自己杀掉再拉起」的命令，模型无权执行，也不设审批。重启只能由主人在外部发起（TG 菜单 /restart 或双击 重启.command）。',
@@ -204,6 +232,7 @@ const COMMAND_RULES = [
     test: (c) => /git\s+push\b[^\n|;&]*(\s-f\b|--force)/.test(c),
     lessons: [8],
     hint: '⛔ 危险操作：动手前一句话说清「改什么、可不可逆」。',
+    ask: '⛔ 要强推远端（git push --force）。这会覆盖别人的提交且不可逆——先说清改了什么、为什么要强推，主人点头再允许。',
   },
   {
     id: 'rm-rf',
@@ -215,9 +244,16 @@ const COMMAND_RULES = [
   {
     id: 'ssh-remote',
     label: 'ssh / scp / sftp / rsync 远程',
-    test: (c) =>
-      /(?:^|[;&|]\s*|\s)(ssh|scp|sftp)\s+\S/.test(c) ||
-      /\brsync\b[^\n]*\b[^\s@]+@[^\s:]+:/.test(c),
+    test: (c) => {
+      const s = 归一命令(c);
+      // 读/搜类命令里出现 ssh 只是关键词（`grep -rn ssh src`），不算要连远程；
+      // 但只要接了管道（`cat x | ssh host`）就可能把内容喂给远程，照拦。
+      if (/^(?:grep|rg|sed|awk|cat|head|tail|less|more|find|ls|wc|diff|echo|printf)\b/.test(s) && !/\|/.test(s)) return false;
+      return (
+        /(?:^|[\s;&|()])(?:[\w.+-]*\/)*(?:ssh|scp|sftp|sshpass|telnet|nc)\s+\S/.test(s) ||
+        /\brsync\b[^\n]*\s(?:[^\s]+@)?[A-Za-z0-9_.-]+:[^\s]/.test(s)
+      );
+    },
     lessons: [],
     hint: '⛔ 未经主人明确指令，严禁登录 SSH、云端服务器及远程服务 —— 要上机先问一句，点头再连。',
     ask: '⛔ 要连远程（ssh / scp / sftp / rsync）。先说清「连哪台、做什么」，等主人点头再点允许。',
@@ -236,6 +272,17 @@ const COMMAND_RULES = [
     test: (c) => /weixin-login|--url-only|qrcode|二维码/.test(c),
     lessons: [17],
     hint: '⛔ 别再让用户反复扫码 —— 扫码前先确认真凶方向；二维码只出现在**执行命令的那个终端**。',
+  },
+  {
+    id: 'kill-proc',
+    label: 'kill 进程',
+    test: (c) => {
+      const s = 归一命令(c);
+      return /\bkill\b\s+(?:-[A-Za-z0-9]+\s+)*[0-9$]/.test(s) || /\b(?:pkill|killall)\b/.test(s);
+    },
+    lessons: [8],
+    hint: '⛔ 杀进程前先确认它是什么 —— 打错了可能杀掉 bot 自己或别的服务。',
+    ask: '⛔ 要杀进程。先说清「杀哪个、为什么」，确认不是 bot / harness 自己的进程再允许。',
   },
 ];
 
@@ -460,7 +507,24 @@ export function installHardRules(ctx, config = {}) {
   const askGate = (exec, next) => {
     已走 += 1; // 调一次工具算一个单位（与「新来信算一个单位」同一个计数器）
     const toolName = String(exec?.name ?? '');
-    const 入参 = toolName === 'bash' ? String(exec?.arguments?.command ?? exec?.arguments?.cmd ?? '') : '';
+    const 参数 = exec?.arguments ?? {};
+
+    // ① 写文件：把「杀 bot / 停本机服务」写进脚本再执行，是绕开命令闸最短的一条路。
+    //    只认最要命的那几种（FILE_DANGER），⛔ 不拿它扫普通文档。
+    if (WRITE_TOOLS.has(toolName)) {
+      const 文 = String(参数.content ?? 参数.new_string ?? 参数.newText ?? 参数.text ?? '');
+      if (文 && FILE_DANGER.test(归一命令(文))) {
+        count('gate:write-suicide');
+        return {
+          kind: 'ask',
+          reason: '⛔ 这段内容里有「杀 bot / 停本机服务」的命令。写进脚本再执行等于绕过闸——先说清用途，主人点头再写。',
+        };
+      }
+      return next();
+    }
+
+    // ② 命令：只认 bash 那条口（与宿主 tools/pre-execute 的入参对齐）。
+    const 入参 = toolName === 'bash' ? String(参数.command ?? 参数.cmd ?? '') : '';
     if (!入参) return next();
     const hit = COMMAND_RULES.find((rule) => (rule.deny || rule.ask) && rule.test(入参, toolName));
     if (!hit) return next();

@@ -527,7 +527,7 @@ const 服务 = createServer(async (req, res) => {
       const 卡片 = /^[A-Za-z0-9_-]{1,64}$/.test(编号)
         ? {
             card_type: 'button_interaction',
-            main_title: { title: 'DSH 等待审批', desc: '点按钮结算，或回 1 / 2' },
+            main_title: { title: 'DSH 等待审批' },
             sub_title_text: 截(正文, 120),
             button_list: [
               { text: '允许一次', style: 1, type: 0, key: `qiwei_appr_ok_${编号}` },

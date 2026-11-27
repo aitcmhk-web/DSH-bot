@@ -29,7 +29,7 @@ const 落盘目录 = join(临时根, '未送达'); // 故意不存在：验「�
 process.env.DSH_BOTPLUGIN_UNDELIVERED_DIR = 落盘目录;
 process.env.DSH_BOTPLUGIN_RATE_LIMIT_BUDGET_MS = '3000';
 
-const { LiveStatus, 落盘未送达 } = await import('./src/status.js');
+const { LiveStatus, WecomStatus, 落盘未送达 } = await import('./src/status.js');
 const { Telegram } = await import('./src/telegram.js');
 
 // 插件里的等待定时器统一 unref（不影响线上进程退出），故自测要自己保活，否则进程会提前退出。
@@ -209,6 +209,17 @@ console.log('— ⑦ 429 等不起（超预算）→ 抛出交调用方兜底 �
   await assert.rejects(() => t.sendRich(1, '你好'), /Too Many Requests/);
   过 += 1;
   console.log('  ✅ ⑦ 限流等不起就抛出（节点会记失败，回答另走落盘兜底）');
+}
+
+console.log('— ⑧ 企微进度只报「我在干什么」：工具动作不上屏 —');
+{
+  const 果 = new WecomStatus({ send: async () => {} });
+  果.addNote('跑命令：grep -rn 审批 src', '工具');
+  果.addNote('改文件：status.js', '工具');
+  断言(果.notes.length === 0, '⑧ 跑命令 / 改文件这类工具动作不落成企微消息');
+  果.addNote('正在核对审批链路', '进度');
+  断言(果.notes.length === 1 && 果.notes[0] === '📌 正在核对审批链路', '⑧ 📌 进度行照发');
+  果.dispose();
 }
 
 clearInterval(保活);
